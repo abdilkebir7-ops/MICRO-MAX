@@ -2,6 +2,9 @@ name: Build MICRO-MAX APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -12,81 +15,140 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       # 1. تحميل المشروع
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      # 2. إعداد Java 17
+      # 2. Java 17
       - name: Setup Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
-      # 3. إعداد Android SDK
+      # 3. Android SDK
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools'
+        uses: android-actions/setup-android@v3
 
-      # 4. تثبيت Gradle مباشرة
-      # لا يحتاج إلى gradlew
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '8.10'
+      # 4. تثبيت الأدوات المطلوبة
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools"
+          sdkmanager "platforms;android-35"
+          sdkmanager "build-tools;35.0.0"
 
-      # 5. إظهار الملفات للتأكد من بنية المشروع
+      # 5. التأكد من بنية المشروع
       - name: Check project structure
+        shell: bash
         run: |
-          echo "===== PROJECT ====="
-          ls -la
-          echo "===== APP ====="
-          ls -la app || true
-          echo "===== GRADLE ====="
-          gradle --version
+          echo "===== PROJECT ROOT ====="
+          pwd
+          echo
 
-      # 6. إعطاء صلاحيات للـ Gradle إن وُجد
-      - name: Prepare build
-        run: |
-          chmod +x gradlew 2>/dev/null || true
+          echo "===== FILES ====="
+          find . -maxdepth 3 -type f | sort | head -300
+          echo
 
-      # 7. بناء Debug APK
-      - name: Build Debug APK
+          echo "===== GRADLE FILES ====="
+          find . -maxdepth 4 \
+            \( -name "settings.gradle" \
+            -o -name "settings.gradle.kts" \
+            -o -name "build.gradle" \
+            -o -name "build.gradle.kts" \
+            -o -name "gradlew" \) \
+            -print
+
+      # 6. إيجاد مجلد Gradle الحقيقي
+      - name: Detect Gradle project
+        id: gradle_project
+        shell: bash
         run: |
-          if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug --no-daemon
+          if [ -f "./settings.gradle.kts" ] || [ -f "./settings.gradle" ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "Gradle project found in repository root."
+          elif [ -f "./app/settings.gradle.kts" ] || [ -f "./app/settings.gradle" ]; then
+            echo "dir=app" >> "$GITHUB_OUTPUT"
+            echo "Gradle project found in ./app"
           else
-            gradle assembleDebug --no-daemon
-          fi
-
-      # 8. البحث عن APK
-      - name: Find APK
-        id: find_apk
-        run: |
-          APK=$(find . -type f -name "*.apk" | head -n 1)
-
-          if [ -z "$APK" ]; then
-            echo "❌ APK not found"
-            echo "===== BUILD DIRECTORIES ====="
-            find . -type d -name build -print
+            echo "ERROR: No settings.gradle or settings.gradle.kts found."
             exit 1
           fi
 
-          echo "✅ APK found: $APK"
-          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+      # 7. إنشاء Gradle Wrapper إذا لم يكن موجودًا
+      - name: Prepare Gradle
+        working-directory: ${{ steps.gradle_project.outputs.dir }}
+        shell: bash
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            echo "Gradle wrapper already exists."
+          else
+            echo "Gradle wrapper not found."
+            echo "Downloading Gradle 8.10.2..."
 
-      # 9. إعادة تسمية APK
+            wget -q \
+              https://services.gradle.org/distributions/gradle-8.10.2-bin.zip \
+              -O /tmp/gradle.zip
+
+            unzip -q /tmp/gradle.zip -d /tmp/gradle
+
+            /tmp/gradle/gradle-8.10.2/bin/gradle wrapper \
+              --gradle-version 8.10.2
+
+            chmod +x ./gradlew
+          fi
+
+      # 8. فحص Gradle
+      - name: Verify Gradle
+        working-directory: ${{ steps.gradle_project.outputs.dir }}
+        run: |
+          ./gradlew --version
+          ./gradlew tasks --no-daemon
+
+      # 9. بناء APK
+      - name: Build Debug APK
+        working-directory: ${{ steps.gradle_project.outputs.dir }}
+        run: |
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      # 10. البحث عن APK
+      - name: Find APK
+        id: find_apk
+        shell: bash
+        run: |
+          echo "===== APK FILES ====="
+
+          find . -type f \
+            \( -name "*.apk" -o -name "*.aab" \) \
+            -print
+
+          APK=$(find . -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK=$APK" >> "$GITHUB_OUTPUT"
+
+      # 11. إعادة تسمية APK
       - name: Rename APK
+        shell: bash
         run: |
           mkdir -p release
-          cp "${{ steps.find_apk.outputs.apk }}" \
-             "release/MICRO-MAX-debug.apk"
 
-      # 10. رفع APK
+          cp "${{ steps.find_apk.outputs.APK }}" \
+            "release/MICRO-MAX-V2.16.0-debug.apk"
+
+          ls -lh release/
+
+      # 12. رفع APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MICRO-MAX-APK
-          path: release/MICRO-MAX-debug.apk
+          name: MICRO-MAX-V2.16.0-APK
+          path: release/MICRO-MAX-V2.16.0-debug.apk
           if-no-files-found: error
