@@ -8,11 +8,17 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build:
     name: Build MICRO-MAX APK
     runs-on: ubuntu-latest
+
+    env:
+      JAVA_VERSION: "17"
+      ANDROID_API: "35"
+      BUILD_TOOLS: "35.0.0"
 
     steps:
 
@@ -21,19 +27,16 @@ jobs:
       # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       # ============================================================
       # 2. Java 17
-      # IMPORTANT:
-      # No Gradle cache here.
       # ============================================================
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+          cache: gradle
 
       # ============================================================
       # 3. Android SDK
@@ -42,41 +45,291 @@ jobs:
         uses: android-actions/setup-android@v3
 
       # ============================================================
-      # 4. Install Android SDK components
-      # Do NOT install the old "tools" package.
+      # 4. Install Android SDK packages
+      # IMPORTANT: Do NOT install "tools".
       # ============================================================
       - name: Install Android SDK components
         shell: bash
         run: |
           set -euo pipefail
 
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          echo "======================================"
+          echo "Installing Android SDK components"
+          echo "======================================"
 
-          sdkmanager \
+          : "${ANDROID_HOME:?ANDROID_HOME is not set by setup-android}"
+
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+              -type f \
+              -name sdkmanager \
+              | head -n 1)"
+          fi
+
+          if [ -z "${SDKMANAGER:-}" ] || [ ! -f "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found"
+            exit 1
+          fi
+
+          echo "Using sdkmanager:"
+          echo "$SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${BUILD_TOOLS}"
+
+          echo "======================================"
+          echo "Android SDK ready"
+          echo "======================================"
 
       # ============================================================
-      # 5. Detect Android project
+      # 5. Find Android project
       # ============================================================
       - name: Detect Android project
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========================================"
-          echo "Searching for Android project..."
-          echo "========================================"
+          echo "======================================"
+          echo "Searching for Android project"
+          echo "======================================"
 
           PROJECT_DIR=""
 
-          # --------------------------------------------------------
-          # First: check repository root
-          # --------------------------------------------------------
-          if [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
+          # First: normal Gradle project at repo root
+          if [ -f "./gradlew" ]; then
             PROJECT_DIR="$GITHUB_WORKSPACE"
           fi
 
-          # --------------------------------------------------------
-          # Second
+          # Search directories containing gradlew
+          if [ -z "$PROJECT_DIR" ]; then
+            FOUND="$(find "$GITHUB_WORKSPACE" \
+              -type f \
+              -name "gradlew" \
+              -not -path "*/.git/*" \
+              -print \
+              -quit || true)"
+
+            if [ -n "$FOUND" ]; then
+              PROJECT_DIR="$(dirname "$FOUND")"
+            fi
+          fi
+
+          # Search for settings.gradle / settings.gradle.kts
+          if [ -z "$PROJECT_DIR" ]; then
+            FOUND="$(find "$GITHUB_WORKSPACE" \
+              -type f \
+              \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+              -not -path "*/.git/*" \
+              -print \
+              -quit || true)"
+
+            if [ -n "$FOUND" ]; then
+              PROJECT_DIR="$(dirname "$FOUND")"
+            fi
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::No Android Gradle project found."
+            echo ""
+            echo "Repository contents:"
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | sort | head -200
+            exit 1
+          fi
+
+          echo "Android project found:"
+          echo "$PROJECT_DIR"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # 6. Show project structure
+      # ============================================================
+      - name: Verify Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "======================================"
+          echo "PROJECT:"
+          echo "$PROJECT_DIR"
+          echo "======================================"
+
+          echo ""
+          echo "Files:"
+          find . -maxdepth 2 -type f | sort | head -200
+          echo ""
+
+          if [ ! -f "settings.gradle" ] && \
+             [ ! -f "settings.gradle.kts" ]; then
+            echo "::error::settings.gradle or settings.gradle.kts not found."
+            exit 1
+          fi
+
+          if [ ! -f "gradlew" ]; then
+            echo "::error::gradlew not found."
+            exit 1
+          fi
+
+          chmod +x gradlew
+          echo "Gradle wrapper found."
+
+      # ============================================================
+      # 7. Check Gradle
+      # ============================================================
+      - name: Check Gradle configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+          chmod +x gradlew
+          ./gradlew --version
+
+      # ============================================================
+      # 8. Clean old build files
+      # ============================================================
+      - name: Clean project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+          chmod +x gradlew
+
+          ./gradlew clean \
+            --no-daemon \
+            --stacktrace \
+            --console=plain
+
+      # ============================================================
+      # 9. Build Debug APK
+      # ============================================================
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+          chmod +x gradlew
+
+          echo "======================================"
+          echo "BUILDING MICRO-MAX APK"
+          echo "======================================"
+
+          ./gradlew \
+            :app:assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --console=plain \
+            --warning-mode=all
+
+      # ============================================================
+      # 10. Verify APK
+      # ============================================================
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "======================================"
+          echo "SEARCHING FOR GENERATED APK"
+          echo "======================================"
+
+          APK_COUNT="$(find app/build/outputs/apk \
+            -type f \
+            -name "*.apk" \
+            2>/dev/null \
+            | wc -l)"
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "::error::No APK was generated."
+
+            echo ""
+            echo "Build output:"
+            find app/build/outputs \
+              -type f \
+              -print 2>/dev/null || true
+
+            exit 1
+          fi
+
+          echo "APK COUNT: $APK_COUNT"
+          echo ""
+
+          find app/build/outputs/apk \
+            -type f \
+            -name "*.apk" \
+            -exec ls -lh {} \;
+
+      # ============================================================
+      # 11. Upload APK
+      # ============================================================
+      - name: Upload MICRO-MAX APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MICRO-MAX-debug
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # ============================================================
+      # 12. Success
+      # ============================================================
+      - name: Build successful
+        if: success()
+        shell: bash
+        run: |
+          echo ""
+          echo "======================================"
+          echo " MICRO-MAX BUILD SUCCESSFUL"
+          echo "======================================"
+          echo ""
+          echo "APK artifact: MICRO-MAX-debug"
+          echo ""
+
+      # ============================================================
+      # 13. Failure information
+      # ============================================================
+      - name: Build failed — show diagnostic info
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
+          echo ""
+          echo "======================================"
+          echo " MICRO-MAX BUILD FAILED"
+          echo "======================================"
+          echo ""
+
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
+            cd "$PROJECT_DIR" || exit 0
+
+            echo "--- Gradle build outputs ---"
+            find app/build/outputs -type f -print 2>/dev/null || true
+
+            echo ""
+            echo "--- Possible APK locations ---"
+            find . -type f -name "*.apk" -print 2>/dev/null || true
+
+            echo ""
+            echo "--- Gradle daemon logs (tail) ---"
+            if [ -d "$HOME/.gradle/daemon" ]; then
+              find "$HOME/.gradle/daemon" -type f -name "*.out.log" \
+                -exec sh -c 'echo "### $1"; tail -n 100 "$1"' _ {} \; 2>/dev/null || true
+            fi
+          else
+            echo "PROJECT_DIR is not set (failure happened before detection)."
+          fi
+
+          exit 0
