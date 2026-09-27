@@ -1,11 +1,10 @@
-name: Build MICRO-MAX APK
+name: Build MICRO-MAX Android APK
 
 on:
   workflow_dispatch:
   push:
     branches:
       - main
-      - master
 
 permissions:
   contents: read
@@ -15,9 +14,6 @@ jobs:
     name: Build MICRO-MAX APK
     runs-on: ubuntu-latest
 
-    env:
-      JAVA_VERSION: "17"
-
     steps:
 
       # ============================================================
@@ -25,25 +21,29 @@ jobs:
       # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       # ============================================================
       # 2. Java 17
-      # لا يوجد cache: gradle هنا
+      # IMPORTANT:
+      # No Gradle cache here.
       # ============================================================
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       # ============================================================
       # 3. Android SDK
       # ============================================================
-      - name: Set up Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
       # ============================================================
       # 4. Install Android SDK components
+      # Do NOT install the old "tools" package.
       # ============================================================
       - name: Install Android SDK components
         shell: bash
@@ -58,12 +58,7 @@ jobs:
             "build-tools;35.0.0"
 
       # ============================================================
-      # 5. Find Android project
-      #
-      # يدعم:
-      # - مشروع Android في جذر المستودع
-      # - مشروع داخل مجلد
-      # - مشروع داخل ZIP
+      # 5. Detect Android project
       # ============================================================
       - name: Detect Android project
         shell: bash
@@ -71,170 +66,17 @@ jobs:
           set -euo pipefail
 
           echo "========================================"
-          echo " Detecting Android project"
+          echo "Searching for Android project..."
           echo "========================================"
 
           PROJECT_DIR=""
 
           # --------------------------------------------------------
-          # أولاً: هل المشروع موجود مباشرة؟
+          # First: check repository root
           # --------------------------------------------------------
-          if [ -f "./settings.gradle" ] || \
-             [ -f "./settings.gradle.kts" ] || \
-             [ -f "./gradlew" ]; then
-
+          if [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
             PROJECT_DIR="$GITHUB_WORKSPACE"
-
-          else
-
-            # ------------------------------------------------------
-            # البحث عن مشروع Android موجود داخل مجلد
-            # ------------------------------------------------------
-            FOUND_SETTINGS="$(find "$GITHUB_WORKSPACE" \
-              -type f \
-              -name "settings.gradle" -o -name "settings.gradle.kts" \
-              -not -path "*/.gradle/*" \
-              -not -path "*/build/*" \
-              -print -quit || true)"
-
-            if [ -n "$FOUND_SETTINGS" ]; then
-              PROJECT_DIR="$(dirname "$FOUND_SETTINGS")"
-            fi
           fi
 
           # --------------------------------------------------------
-          # إذا لم نجد مشروعًا، ابحث عن ZIP
-          # --------------------------------------------------------
-          if [ -z "$PROJECT_DIR" ]; then
-
-            ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
-              -maxdepth 3 \
-              -type f \
-              -iname "*.zip" \
-              -print -quit || true)"
-
-            if [ -n "$ZIP_FILE" ]; then
-
-              echo "ZIP found:"
-              echo "$ZIP_FILE"
-
-              mkdir -p "$GITHUB_WORKSPACE/extracted"
-
-              unzip -q "$ZIP_FILE" \
-                -d "$GITHUB_WORKSPACE/extracted"
-
-              FOUND_SETTINGS="$(find "$GITHUB_WORKSPACE/extracted" \
-                -type f \
-                -name "settings.gradle" -o -name "settings.gradle.kts" \
-                -not -path "*/.gradle/*" \
-                -not -path "*/build/*" \
-                -print -quit || true)"
-
-              if [ -n "$FOUND_SETTINGS" ]; then
-                PROJECT_DIR="$(dirname "$FOUND_SETTINGS")"
-              fi
-            fi
-          fi
-
-          # --------------------------------------------------------
-          # فشل واضح إذا لم نجد المشروع
-          # --------------------------------------------------------
-          if [ -z "$PROJECT_DIR" ]; then
-
-            echo "::error::Android project was not found."
-
-            echo ""
-            echo "Repository files:"
-            find "$GITHUB_WORKSPACE" \
-              -maxdepth 3 \
-              -type f \
-              -not -path "*/.git/*" \
-              | sort \
-              | head -200
-
-            exit 1
-          fi
-
-          echo ""
-          echo "========================================"
-          echo " Android project found"
-          echo "========================================"
-          echo "$PROJECT_DIR"
-          echo ""
-
-          # --------------------------------------------------------
-          # حفظ المتغير للخطوات التالية
-          # --------------------------------------------------------
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      # ============================================================
-      # 6. Verify Gradle project
-      # ============================================================
-      - name: Verify Gradle project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR"
-
-          echo "========================================"
-          echo " Gradle project"
-          echo "========================================"
-
-          echo "Project:"
-          pwd
-
-          echo ""
-          echo "Files:"
-          ls -la
-
-          echo ""
-
-          if [ ! -f "settings.gradle" ] && \
-             [ ! -f "settings.gradle.kts" ]; then
-            echo "::error::settings.gradle or settings.gradle.kts was not found."
-            exit 1
-          fi
-
-          if [ ! -f "build.gradle" ] && \
-             [ ! -f "build.gradle.kts" ]; then
-            echo "::error::Root build.gradle or build.gradle.kts was not found."
-            exit 1
-          fi
-
-          if [ ! -f "gradlew" ]; then
-            echo "::error::gradlew was not found."
-            echo "The Android project must contain the Gradle wrapper."
-            exit 1
-          fi
-
-          chmod +x gradlew
-
-          echo ""
-          echo "Gradle wrapper:"
-          ./gradlew --version
-
-      # ============================================================
-      # 7. Verify app module
-      # ============================================================
-      - name: Verify Android app module
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR"
-
-          if [ ! -d "app" ]; then
-            echo "::error::The app module directory was not found."
-
-            echo ""
-            echo "Available directories:"
-            find . -maxdepth 2 -type d \
-              -not -path "./.gradle*" \
-              -not -path "./build*" \
-              | sort
-
-            exit 1
-          fi
-
-          if [ ! -f "app
+          # Second
