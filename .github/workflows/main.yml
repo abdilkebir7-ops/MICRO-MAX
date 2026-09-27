@@ -27,11 +27,10 @@ jobs:
       # 2. Java 17
       # ============================================================
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
       # ============================================================
       # 3. Android SDK
@@ -40,7 +39,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       # ============================================================
-      # 4. Install Android SDK components
+      # 4. Install Android SDK
       # ============================================================
       - name: Install Android SDK components
         shell: bash
@@ -66,67 +65,80 @@ jobs:
           sudo apt-get install -y unzip
 
       # ============================================================
-      # 6. Find MICRO-MAX ZIP
+      # 6. Find ZIP
       # ============================================================
       - name: Find MICRO-MAX ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== Repository files ==="
+          echo "=========================================="
+          echo "Repository contents"
+          echo "=========================================="
+
           find . -maxdepth 3 -type f -print | sort
 
           ZIP_FILE=""
 
-          # First: look specifically for MICRO-MAX ZIP files
-          ZIP_FILE="$(find . -maxdepth 3 -type f \
-            -iname 'MICRO-MAX*.zip' -o -iname 'micro-max*.zip' \
+          ZIP_FILE="$(find . \
+            -maxdepth 3 \
+            -type f \
+            \( \
+              -iname 'MICRO-MAX*.zip' \
+              -o \
+              -iname 'micro-max*.zip' \
+            \) \
             -print -quit || true)"
 
-          # Second: fallback to any ZIP
           if [ -z "$ZIP_FILE" ]; then
-            ZIP_FILE="$(find . -maxdepth 3 -type f \
+            ZIP_FILE="$(find . \
+              -maxdepth 3 \
+              -type f \
               -iname '*.zip' \
               -print -quit || true)"
           fi
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "::error::No ZIP file was found in the repository."
+            echo "::error::No ZIP file found."
             exit 1
           fi
 
-          echo "ZIP found:"
+          echo ""
+          echo "ZIP FOUND:"
           echo "$ZIP_FILE"
 
           echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 7. Extract Android project
+      # 7. Extract ZIP
       # ============================================================
       - name: Extract Android project
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf "$RUNNER_TEMP/micromax-project"
+          EXTRACT_DIR="$RUNNER_TEMP/micromax-project"
 
-          mkdir -p "$RUNNER_TEMP/micromax-project"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
 
           echo "Extracting:"
           echo "$ZIP_FILE"
 
-          unzip -q "$ZIP_FILE" \
-            -d "$RUNNER_TEMP/micromax-project"
+          unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
 
           echo ""
-          echo "=== Extracted files ==="
-          find "$RUNNER_TEMP/micromax-project" \
+          echo "=========================================="
+          echo "Extracted project"
+          echo "=========================================="
+
+          find "$EXTRACT_DIR" \
             -maxdepth 5 \
             -type f \
             -print | sort | head -300
 
       # ============================================================
-      # 8. Detect real Gradle project
+      # 8. Detect real Android project
       # ============================================================
       - name: Detect Android project root
         shell: bash
@@ -135,24 +147,22 @@ jobs:
 
           ROOT="$RUNNER_TEMP/micromax-project"
 
-          echo "Searching for settings.gradle..."
-
           SETTINGS_FILE="$(
             find "$ROOT" \
               -type f \
-              \
+              \( \
                 -name "settings.gradle" \
                 -o \
                 -name "settings.gradle.kts" \
-              \
+              \) \
               -print -quit
           )"
 
           if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::settings.gradle or settings.gradle.kts was not found inside the ZIP."
+            echo "::error::settings.gradle or settings.gradle.kts was not found."
             echo ""
-            echo "=== Extracted directory tree ==="
-            find "$ROOT" -maxdepth 6 -print | sort
+            echo "ZIP contents:"
+            find "$ROOT" -maxdepth 7 -print | sort
             exit 1
           fi
 
@@ -160,19 +170,19 @@ jobs:
 
           echo ""
           echo "=========================================="
-          echo "Android project detected"
+          echo "ANDROID PROJECT FOUND"
           echo "=========================================="
-          echo "Settings file:"
+          echo "Settings:"
           echo "$SETTINGS_FILE"
           echo ""
-          echo "Project directory:"
+          echo "Project:"
           echo "$PROJECT_DIR"
           echo "=========================================="
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 9. Verify Gradle project
+      # 9. Verify Gradle wrapper
       # ============================================================
       - name: Verify Gradle project
         shell: bash
@@ -181,15 +191,157 @@ jobs:
 
           cd "$PROJECT_DIR"
 
-          echo "=== Project root ==="
+          echo "Project directory:"
           pwd
 
           echo ""
-          echo "=== Project files ==="
+          echo "Project files:"
           find . -maxdepth 2 -type f -print | sort
 
-          echo ""
-          echo "=== Checking Gradle wrapper ==="
-
           if [ ! -f "./gradlew" ]; then
-            echo "::error::
+            echo "::error::gradlew was not found."
+            echo ""
+            echo "Expected:"
+            echo "$PROJECT_DIR/gradlew"
+            exit 1
+          fi
+
+          chmod +x ./gradlew
+
+          echo ""
+          echo "Gradle wrapper:"
+          ls -lh ./gradlew
+
+      # ============================================================
+      # 10. Verify Gradle
+      # ============================================================
+      - name: Verify Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          ./gradlew --version
+
+      # ============================================================
+      # 11. Show Gradle tasks
+      # ============================================================
+      - name: Check Gradle configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          ./gradlew tasks \
+            --no-daemon \
+            --stacktrace \
+            --console=plain
+
+      # ============================================================
+      # 12. Build APK
+      # ============================================================
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo ""
+          echo "=========================================="
+          echo "BUILDING MICRO-MAX"
+          echo "=========================================="
+
+          ./gradlew \
+            :app:assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --console=plain \
+            --warning-mode=all
+
+      # ============================================================
+      # 13. Verify APK
+      # ============================================================
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          APK_DIR="app/build/outputs/apk/debug"
+
+          echo ""
+          echo "=========================================="
+          echo "APK OUTPUT"
+          echo "=========================================="
+
+          if ! find "$APK_DIR" \
+            -type f \
+            -name "*.apk" \
+            -print -quit | grep -q .; then
+
+            echo "::error::APK was not generated."
+
+            echo ""
+            echo "Build outputs:"
+            find app/build/outputs \
+              -type f \
+              -print 2>/dev/null || true
+
+            exit 1
+          fi
+
+          find "$APK_DIR" \
+            -type f \
+            -name "*.apk" \
+            -exec ls -lh {} \;
+
+      # ============================================================
+      # 14. Prepare artifact
+      # ============================================================
+      - name: Prepare APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/micromax-apk"
+
+          find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+            -type f \
+            -name "*.apk" \
+            -exec cp {} "$RUNNER_TEMP/micromax-apk/" \;
+
+          echo ""
+          echo "Artifact:"
+          ls -lh "$RUNNER_TEMP/micromax-apk"
+
+      # ============================================================
+      # 15. Upload APK
+      # ============================================================
+      - name: Upload MICRO-MAX APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MICRO-MAX-debug
+          path: ${{ runner.temp }}/micromax-apk/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # ============================================================
+      # 16. Success
+      # ============================================================
+      - name: Build successful
+        if: success()
+        shell: bash
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " MICRO-MAX APK BUILD SUCCESSFUL "
+          echo "=========================================="
+          echo ""
+          echo "Go to:"
+          echo "Actions -> MICRO-MAX-debug"
+          echo ""
+          echo "Download the generated APK."
