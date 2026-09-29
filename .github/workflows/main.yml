@@ -77,13 +77,13 @@ jobs:
           # and GitHub's setup-java cache validation can fail on ZIP-only repository layouts.
 
       - name: Install Android SDK packages
-        shell: bash
+          shell: bash
         run: |
-          set -euo pipefail
-        export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-        export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/cmdline-tools/16.0/bin:$ANDROID_SDK_ROOT/tools/bin:$PATH"
-        yes | sdkmanager --licenses >/dev/null || true
-        sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+            set -euo pipefail
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/cmdline-tools/16.0/bin:$ANDROID_SDK_ROOT/tools/bin:$PATH"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
 
       - name: Validate backend
         shell: bash
