@@ -110,7 +110,7 @@ jobs:
           KEYSTORE_PATH="$RUNNER_TEMP/micromax-upload.jks"
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
           test -s "$KEYSTORE_PATH"
-          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" 
           {
             echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE_PATH"
             echo "MICROMAX_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
