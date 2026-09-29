@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- "M" monogram, kept inside the 66dp safe-zone circle used by adaptive-icon masks -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M22.5,22.5
+                           L33.75,22.5
+                           L54,56.25
+                           L74.25,22.5
+                           L85.5,22.5
+                           L85.5,85.5
+                           L74.25,85.5
+                           L74.25,42.75
+                           L54,74.25
+                           L33.75,42.75
+                           L33.75,85.5
+                           L22.5,85.5
+                           Z" />
+</vector>

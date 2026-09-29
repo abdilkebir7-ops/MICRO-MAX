@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MICRO-MAX</string>
+    <string name="tagline">HOTSPOT • NETWORK MANAGER</string>
+
+    <!-- Bottom navigation + top bar subtitle share this single source now,
+         instead of the label list being duplicated in two places. -->
+    <string-array name="nav_labels">
+        <item>الرئيسية</item>
+        <item>الراوترات</item>
+        <item>الكروت</item>
+        <item>المتجر</item>
+        <item>المبيعات</item>
+        <item>التقارير</item>
+        <item>الأمان</item>
+        <item>الإعدادات</item>
+    </string-array>
+
+    <!-- Login / register screen -->
+    <string name="login_title">تسجيل الدخول</string>
+    <string name="register_title">إنشاء حساب</string>
+    <string name="email_label">البريد الإلكتروني</string>
+    <string name="password_label">كلمة المرور</string>
+    <string name="login_action">دخول آمن</string>
+    <string name="register_action">إنشاء الحساب</string>
+    <string name="checking_action">جاري التحقق…</string>
+    <string name="switch_to_register">إنشاء حساب جديد</string>
+    <string name="switch_to_login">لدي حساب بالفعل</string>
+    <string name="login_security_note">HTTPS • JWT • حماية محاولات الدخول</string>
+    <string name="connection_failed">فشل الاتصال</string>
+
+    <!-- Shared actions used across several screens -->
+    <string name="action_cancel">إلغاء</string>
+    <string name="action_close">إغلاق</string>
+    <string name="action_logout">تسجيل الخروج</string>
+    <string name="action_refresh">تحديث</string>
+
+    <!-- Settings screen -->
+    <string name="settings_title">الإعدادات</string>
+    <string name="settings_subtitle">White Glass / Black Glass</string>
+    <string name="appearance_label">المظهر</string>
+    <string name="appearance_dark">Black Glass</string>
+    <string name="appearance_light">White Glass</string>
+    <string name="version_label">النسخة</string>
+    <string name="backup_label">النسخ الاحتياطي</string>
+    <string name="backup_note">يتوفر تصدير JSON من /api/backup/export للمشرف.</string>
+</resources>
