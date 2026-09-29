@@ -76,9 +76,6 @@ jobs:
           # Do not enable Gradle cache here. The source is prepared just before this step,
           # and GitHub's setup-java cache validation can fail on ZIP-only repository layouts.
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android SDK packages
         shell: bash
         run: |
