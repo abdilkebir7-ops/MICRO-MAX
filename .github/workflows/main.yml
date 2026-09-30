@@ -13,12 +13,13 @@ jobs:
   release:
     name: Build Signed APK + AAB
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Check project
+      - name: Check Android project
         run: |
           set -e
           test -f gradlew
@@ -26,24 +27,26 @@ jobs:
           chmod +x gradlew
 
       - name: Setup Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK 35
+      - name: Install required Android SDK
         run: |
-          yes | sdkmanager --licenses || true
+          set -e
+
+          yes | sdkmanager --licenses >/dev/null || true
+
           sdkmanager \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      # إنشاء Keystore من GitHub Secret
       - name: Prepare Keystore
         env:
           KEYSTORE_B64: ${{ secrets.MICROMAX_KEYSTORE_BASE64 }}
@@ -53,6 +56,7 @@ jobs:
           test -n "$KEYSTORE_B64"
 
           mkdir -p "$RUNNER_TEMP/micromax"
+
           KEYSTORE="$RUNNER_TEMP/micromax/micromax-upload.jks"
 
           printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
@@ -61,7 +65,6 @@ jobs:
 
           echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
 
-      # رابط Backend الحقيقي
       - name: Configure Backend
         env:
           API_URL: ${{ secrets.MICROMAX_API_BASE_URL }}
@@ -75,15 +78,14 @@ jobs:
               echo "Backend HTTPS OK"
               ;;
             *)
-              echo "ERROR: Backend must use HTTPS"
+              echo "ERROR: Backend URL must use HTTPS"
               exit 1
               ;;
           esac
 
           echo "MICROMAX_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
 
-      # Google Client ID
-      - name: Configure Google
+      - name: Configure Google Client ID
         env:
           GOOGLE_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
         run: |
@@ -93,7 +95,6 @@ jobs:
 
           echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=$GOOGLE_ID" >> "$GITHUB_ENV"
 
-      # التحقق من مفاتيح التوقيع
       - name: Check Signing Secrets
         env:
           STORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
@@ -108,15 +109,13 @@ jobs:
 
           echo "Signing configuration OK"
 
-      # تنظيف
-      - name: Clean
+      - name: Clean project
         run: |
           ./gradlew clean \
             --no-daemon \
             --stacktrace
 
-      # بناء النسخة الحقيقية
-      - name: Build Real Release
+      - name: Build signed APK and AAB
         env:
           MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
           MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
@@ -130,8 +129,7 @@ jobs:
             --no-daemon \
             --stacktrace
 
-      # التحقق من الملفات
-      - name: Check Release Files
+      - name: Check release files
         run: |
           set -e
 
@@ -141,34 +139,35 @@ jobs:
           test -f "$APK"
           test -f "$AAB"
 
-          mkdir -p download
+          mkdir -p release
 
-          cp "$APK" download/MICRO-MAX-release.apk
-          cp "$AAB" download/MICRO-MAX-release.aab
+          cp "$APK" release/MICRO-MAX-release.apk
+          cp "$AAB" release/MICRO-MAX-release.aab
 
-          ls -lh download/
+          ls -lh release/
 
-      # التحقق من توقيع APK
       - name: Verify APK
         run: |
+          set -e
+
           apksigner verify \
             --verbose \
-            download/MICRO-MAX-release.apk
+            release/MICRO-MAX-release.apk
 
-      # التحقق من توقيع AAB
       - name: Verify AAB
         run: |
+          set -e
+
           jarsigner \
             -verify \
             -verbose \
             -certs \
-            download/MICRO-MAX-release.aab
+            release/MICRO-MAX-release.aab
 
-      # رفع الملفات
-      - name: Upload Real Release
-        uses: actions/upload-artifact@v4
+      - name: Upload APK and AAB
+        uses: actions/upload-artifact@v7
         with:
           name: MICRO-MAX-REAL-RELEASE
-          path: download/
+          path: release/
           if-no-files-found: error
           retention-days: 30
