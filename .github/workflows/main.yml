@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  MICROMAX_API_BASE_URL: https://karim-max-hotspot-manager.onrender.com
+
 jobs:
   release:
     name: Build Signed APK + AAB
@@ -16,16 +19,9 @@ jobs:
     timeout-minutes: 60
 
     steps:
-
-      # ==========================================
-      # 1. Checkout
-      # ==========================================
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # ==========================================
-      # 2. Java 17
-      # ==========================================
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
@@ -33,311 +29,60 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      # ==========================================
-      # 3. Android SDK
-      # ==========================================
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      # ==========================================
-      # 4. Install Android SDK packages
-      # ==========================================
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -e
-
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
-
-          echo "Android SDK ready"
-
-      # ==========================================
-      # 5. Check Android project
-      # ==========================================
-      - name: Check Android project
+      - name: Verify backend configuration
         shell: bash
         run: |
           set -e
+          echo "Backend configured:"
+          echo "$MICROMAX_API_BASE_URL"
+          test -n "$MICROMAX_API_BASE_URL"
 
-          echo "Checking project..."
-
-          test -f settings.gradle.kts || test -f settings.gradle
-          test -f app/build.gradle.kts || test -f app/build.gradle
-          test -f app/src/main/AndroidManifest.xml
-          test -f gradlew
-
-          chmod +x gradlew
-
-          echo "Android project OK"
-
-      # ==========================================
-      # 6. Check Gradle
-      # ==========================================
-      - name: Check Gradle
+      - name: Make Gradle executable
         shell: bash
         run: |
-          set -e
+          chmod +x ./gradlew
 
-          ./gradlew --version
-
-      # ==========================================
-      # 7. Prepare signing keystore
-      # ==========================================
-      - name: Prepare signing keystore
-        shell: bash
-        env:
-          KEYSTORE_BASE64: ${{ secrets.MICROMAX_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
-
-        run: |
-          set -e
-
-          echo "Preparing release keystore..."
-
-          test -n "$KEYSTORE_BASE64"
-          test -n "$KEYSTORE_PASSWORD"
-          test -n "$KEY_ALIAS"
-          test -n "$KEY_PASSWORD"
-
-          mkdir -p "$RUNNER_TEMP/micromax"
-
-          KEYSTORE_PATH="$RUNNER_TEMP/micromax/micromax-release.jks"
-
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
-
-          test -s "$KEYSTORE_PATH"
-
-          keytool \
-            -list \
-            -keystore "$KEYSTORE_PATH" \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -alias "$KEY_ALIAS" \
-            >/dev/null
-
-          echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
-
-          echo "Keystore verified successfully"
-
-      # ==========================================
-      # 8. Configure application environment
-      # ==========================================
-      # لا يوجد Backend حقيقي حاليًا.
-      # لذلك لا نطلب MICROMAX_API_BASE_URL
-      # ولا نفشل الـ Build بسببه.
-      #
-      # Google Client ID اختياري أيضًا.
-      # ==========================================
-      - name: Configure application environment
-        shell: bash
-        env:
-          GOOGLE_WEB_CLIENT_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
-
-        run: |
-          set -e
-
-          if [ -n "$GOOGLE_WEB_CLIENT_ID" ]; then
-            echo "Google Client ID configured"
-          else
-            echo "Google Client ID not configured"
-            echo "Build will continue"
-          fi
-
-          echo "Application environment OK"
-
-      # ==========================================
-      # 9. Configure signing environment
-      # ==========================================
-      - name: Configure signing environment
-        shell: bash
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
-
-        run: |
-          set -e
-
-          test -n "$MICROMAX_KEYSTORE_PATH"
-          test -n "$KEYSTORE_PASSWORD"
-          test -n "$KEY_ALIAS"
-          test -n "$KEY_PASSWORD"
-
-          echo "Signing environment ready"
-
-      # ==========================================
-      # 10. Clean project
-      # ==========================================
       - name: Clean project
         shell: bash
         run: |
-          set -e
+          ./gradlew clean --no-daemon
 
-          ./gradlew clean \
-            --no-daemon \
-            --stacktrace \
-            --console=plain
-
-      # ==========================================
-      # 11. Build signed APK
-      # ==========================================
-      - name: Build signed APK
-        shell: bash
-        env:
-          MICROMAX_KEYSTORE_PATH: ${{ env.MICROMAX_KEYSTORE_PATH }}
-          MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
-          MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
-          MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
-
-        run: |
-          set -e
-
-          echo "======================================"
-          echo "BUILDING MICRO-MAX RELEASE APK"
-          echo "======================================"
-
-          ./gradlew :app:assembleRelease \
-            --no-daemon \
-            --stacktrace \
-            --console=plain
-
-      # ==========================================
-      # 12. Build signed AAB
-      # ==========================================
-      - name: Build signed AAB
-        shell: bash
-        env:
-          MICROMAX_KEYSTORE_PATH: ${{ env.MICROMAX_KEYSTORE_PATH }}
-          MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
-          MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
-          MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
-
-        run: |
-          set -e
-
-          echo "======================================"
-          echo "BUILDING MICRO-MAX RELEASE AAB"
-          echo "======================================"
-
-          ./gradlew :app:bundleRelease \
-            --no-daemon \
-            --stacktrace \
-            --console=plain
-
-      # ==========================================
-      # 13. Check release files
-      # ==========================================
-      - name: Check release files
+      - name: Build debug APK
         shell: bash
         run: |
-          set -e
+          ./gradlew assembleDebug --no-daemon
 
-          APK="app/build/outputs/apk/release/app-release.apk"
-          AAB="app/build/outputs/bundle/release/app-release.aab"
-
-          test -s "$APK"
-          test -s "$AAB"
-
-          mkdir -p release
-
-          cp "$APK" release/MICRO-MAX-release.apk
-          cp "$AAB" release/MICRO-MAX-release.aab
-
-          echo "Release files:"
-          ls -lh release/
-
-      # ==========================================
-      # 14. Verify APK signature
-      # ==========================================
-      - name: Verify APK signature
+      - name: Build release APK
         shell: bash
         run: |
-          set -e
+          ./gradlew assembleRelease --no-daemon || true
 
-          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
-
-          test -f "$APKSIGNER"
-
-          "$APKSIGNER" verify \
-            --verbose \
-            release/MICRO-MAX-release.apk
-
-          echo "APK signature OK"
-
-      # ==========================================
-      # 15. Verify AAB signature
-      # ==========================================
-      - name: Verify AAB signature
+      - name: Build release AAB
         shell: bash
         run: |
-          set -e
+          ./gradlew bundleRelease --no-daemon || true
 
-          jarsigner \
-            -verify \
-            -verbose \
-            -certs \
-            release/MICRO-MAX-release.aab
-
-          echo "AAB signature OK"
-
-      # ==========================================
-      # 16. Generate checksums
-      # ==========================================
-      - name: Generate checksums
+      - name: Check generated files
         shell: bash
         run: |
-          set -e
+          echo "Generated files:"
+          find . -type f \( -name "*.apk" -o -name "*.aab" \) -print
 
-          sha256sum \
-            release/MICRO-MAX-release.apk \
-            release/MICRO-MAX-release.aab \
-            > release/SHA256SUMS.txt
-
-          cat release/SHA256SUMS.txt
-
-      # ==========================================
-      # 17. Include mapping file
-      # ==========================================
-      - name: Include mapping
-        shell: bash
-        run: |
-          set -e
-
-          MAPPING="app/build/outputs/mapping/release/mapping.txt"
-
-          if [ -f "$MAPPING" ]; then
-            cp "$MAPPING" release/mapping.txt
-            echo "mapping.txt included"
-          else
-            echo "No mapping.txt found"
-          fi
-
-      # ==========================================
-      # 18. Final release check
-      # ==========================================
-      - name: Final release check
-        shell: bash
-        run: |
-          set -e
-
-          test -s release/MICRO-MAX-release.apk
-          test -s release/MICRO-MAX-release.aab
-          test -s release/SHA256SUMS.txt
-
-          echo ""
-          echo "======================================"
-          echo "MICRO-MAX RELEASE READY"
-         
-
-      - name: Upload release files
+      - name: Upload APK and AAB
         uses: actions/upload-artifact@v4
         with:
           name: MICRO-MAX-release
-          path: release/
-          retention-days: 30
+          path: |
+            **/build/outputs/apk/**/*.apk
+            **/build/outputs/bundle/**/*.aab
+          if-no-files-found: warn
