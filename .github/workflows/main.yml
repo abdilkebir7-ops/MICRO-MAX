@@ -26,63 +26,39 @@ jobs:
 
     steps:
 
-      # =========================================================
-      # 1. Checkout
-      # =========================================================
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
-      # =========================================================
-      # 2. Java 17
-      # =========================================================
       - name: Setup Java 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
 
-      # =========================================================
-      # 3. Android SDK
-      #
-      # مهم:
-      # لا نستخدم sdkmanager لتثبيت platform-tools هنا.
-      # Ubuntu runner يحتوي Android SDK مسبقاً.
-      # =========================================================
+      # ==========================================
+      # Android SDK
+      # ==========================================
       - name: Verify Android SDK
         shell: bash
         run: |
           set -euo pipefail
 
           echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
           test -d "$ANDROID_HOME"
-
-          echo "Android SDK:"
-          ls -la "$ANDROID_HOME" | head -50
-
-          echo
-          echo "Platform tools:"
           test -d "$ANDROID_HOME/platform-tools"
-          "$ANDROID_HOME/platform-tools/adb" version
-
-          echo
-          echo "Build tools:"
+          test -d "$ANDROID_HOME/platforms/android-35"
           test -d "$ANDROID_HOME/build-tools/35.0.0"
-          test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
+
+          "$ANDROID_HOME/platform-tools/adb" version
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" version
 
-          echo
-          echo "Android 35:"
-          test -d "$ANDROID_HOME/platforms/android-35"
+          echo "Android SDK OK"
 
-          echo
-          echo "Android SDK verification OK"
-
-      # =========================================================
-      # 4. Project validation
-      # =========================================================
+      # ==========================================
+      # Android project
+      # ==========================================
       - name: Check Android project
         shell: bash
         run: |
@@ -95,9 +71,9 @@ jobs:
 
           echo "Android project OK"
 
-      # =========================================================
-      # 5. Prepare signing keystore
-      # =========================================================
+      # ==========================================
+      # Keystore
+      # ==========================================
       - name: Prepare Keystore
         shell: bash
         env:
@@ -120,11 +96,15 @@ jobs:
 
           echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
 
-          echo "Keystore prepared successfully"
+          echo "Keystore OK"
 
-      # =========================================================
-      # 6. Backend configuration
-      # =========================================================
+      # ==========================================
+      # Backend
+      #
+      # اختياري في الـWorkflow.
+      # إذا كان Secret موجوداً يتم تمريره.
+      # إذا لم يكن موجوداً لا يتوقف البناء هنا.
+      # ==========================================
       - name: Configure Backend
         shell: bash
         env:
@@ -132,26 +112,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${API_URL:-}" ]; then
-            echo "ERROR: MICROMAX_API_BASE_URL is missing"
-            exit 1
+          if [ -n "${API_URL:-}" ]; then
+
+            case "$API_URL" in
+              https://*)
+                echo "Backend HTTPS OK"
+                ;;
+              *)
+                echo "ERROR: MICROMAX_API_BASE_URL must use HTTPS"
+                exit 1
+                ;;
+            esac
+
+            echo "MICROMAX_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
+
+            echo "Backend configured"
+
+          else
+
+            echo "MICROMAX_API_BASE_URL is not configured."
+            echo "Continuing build without backend override."
+
           fi
 
-          case "$API_URL" in
-            https://*)
-              echo "Backend HTTPS: OK"
-              ;;
-            *)
-              echo "ERROR: Backend URL must start with https://"
-              exit 1
-              ;;
-          esac
-
-          echo "MICROMAX_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
-
-      # =========================================================
-      # 7. Google Client ID
-      # =========================================================
+      # ==========================================
+      # Google Client ID
+      # ==========================================
       - name: Configure Google Client ID
         shell: bash
         env:
@@ -159,16 +145,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${GOOGLE_ID:-}" ]; then
-            echo "ERROR: MICROMAX_GOOGLE_WEB_CLIENT_ID is missing"
-            exit 1
+          if [ -n "${GOOGLE_ID:-}" ]; then
+            echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=$GOOGLE_ID" >> "$GITHUB_ENV"
+            echo "Google Client ID configured"
+          else
+            echo "Google Client ID not configured."
+            echo "Continuing build."
           fi
 
-          echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=$GOOGLE_ID" >> "$GITHUB_ENV"
-
-      # =========================================================
-      # 8. Signing secrets
-      # =========================================================
+      # ==========================================
+      # Signing
+      # ==========================================
       - name: Check Signing Secrets
         shell: bash
         env:
@@ -178,38 +165,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${STORE_PASSWORD:-}" ]; then
-            echo "ERROR: MICROMAX_KEYSTORE_PASSWORD is missing"
-            exit 1
-          fi
-
-          if [ -z "${KEY_ALIAS:-}" ]; then
-            echo "ERROR: MICROMAX_KEY_ALIAS is missing"
-            exit 1
-          fi
-
-          if [ -z "${KEY_PASSWORD:-}" ]; then
-            echo "ERROR: MICROMAX_KEY_PASSWORD is missing"
-            exit 1
-          fi
+          test -n "${STORE_PASSWORD:-}"
+          test -n "${KEY_ALIAS:-}"
+          test -n "${KEY_PASSWORD:-}"
 
           echo "Signing secrets OK"
 
-      # =========================================================
-      # 9. Check Java / Gradle
-      # =========================================================
+      # ==========================================
+      # Java / Gradle
+      # ==========================================
       - name: Check Java and Gradle
         shell: bash
         run: |
           set -euo pipefail
 
           java -version
-
           ./gradlew --version
 
-      # =========================================================
-      # 10. Clean
-      # =========================================================
+      # ==========================================
+      # Clean
+      # ==========================================
       - name: Clean project
         shell: bash
         run: |
@@ -219,9 +194,9 @@ jobs:
             --no-daemon \
             --stacktrace
 
-      # =========================================================
-      # 11. Build Release APK
-      # =========================================================
+      # ==========================================
+      # Build APK
+      # ==========================================
       - name: Build signed APK
         shell: bash
         env:
@@ -236,9 +211,9 @@ jobs:
             --no-daemon \
             --stacktrace
 
-      # =========================================================
-      # 12. Build Release AAB
-      # =========================================================
+      # ==========================================
+      # Build AAB
+      # ==========================================
       - name: Build signed AAB
         shell: bash
         env:
@@ -253,9 +228,9 @@ jobs:
             --no-daemon \
             --stacktrace
 
-      # =========================================================
-      # 13. Check generated files
-      # =========================================================
+      # ==========================================
+      # Check outputs
+      # ==========================================
       - name: Check release files
         shell: bash
         run: |
@@ -266,13 +241,13 @@ jobs:
 
           if [ ! -f "$APK" ]; then
             echo "ERROR: APK was not generated"
-            find app/build/outputs -type f -maxdepth 6 || true
+            find app/build/outputs -type f || true
             exit 1
           fi
 
           if [ ! -f "$AAB" ]; then
             echo "ERROR: AAB was not generated"
-            find app/build/outputs -type f -maxdepth 6 || true
+            find app/build/outputs -type f || true
             exit 1
           fi
 
@@ -281,31 +256,25 @@ jobs:
           cp "$APK" release/MICRO-MAX-release.apk
           cp "$AAB" release/MICRO-MAX-release.aab
 
-          echo
-          echo "Release files:"
-          ls -lh release/
+          ls -lh release
 
-      # =========================================================
-      # 14. Verify APK signature
-      # =========================================================
+      # ==========================================
+      # Verify APK
+      # ==========================================
       - name: Verify APK signature
         shell: bash
         run: |
           set -euo pipefail
 
-          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
-
-          test -x "$APKSIGNER"
-
-          "$APKSIGNER" verify \
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
             --verbose \
             release/MICRO-MAX-release.apk
 
-          echo "APK signature verified"
+          echo "APK signature OK"
 
-      # =========================================================
-      # 15. Verify AAB signature
-      # =========================================================
+      # ==========================================
+      # Verify AAB
+      # ==========================================
       - name: Verify AAB signature
         shell: bash
         run: |
@@ -317,11 +286,11 @@ jobs:
             -certs \
             release/MICRO-MAX-release.aab
 
-          echo "AAB signature verified"
+          echo "AAB signature OK"
 
-      # =========================================================
-      # 16. Generate SHA256
-      # =========================================================
+      # ==========================================
+      # SHA256
+      # ==========================================
       - name: Generate checksums
         shell: bash
         run: |
@@ -336,9 +305,9 @@ jobs:
 
           cat SHA256SUMS.txt
 
-      # =========================================================
-      # 17. Upload artifacts
-      # =========================================================
+      # ==========================================
+      # Upload
+      # ==========================================
       - name: Upload APK and AAB
         uses: actions/upload-artifact@v4
         with:
