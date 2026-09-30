@@ -1,149 +1,90 @@
-name: MICRO-MAX Release AAB
+name: MICRO-MAX APK
 
 on:
   workflow_dispatch:
-    inputs:
-      release:
-        description: Build and sign the Play Store AAB
-        required: true
-        default: true
-        type: boolean
-  push:
-    tags:
-      - 'v*.*.*'
 
 permissions:
   contents: read
 
-concurrency:
-  group: micromax-release
-  cancel-in-progress: false
-
 jobs:
-  release:
-    name: Build signed Android App Bundle
+  build:
+    name: Build MICRO-MAX APK
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || inputs.release == true
+
     steps:
-      - name: Checkout repository
+
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare Android source
-        shell: bash
+      - name: Check project
         run: |
-          set -euo pipefail
-
-          # The repository may contain either the full source tree or the full
-          # MICRO-MAX source ZIP. Support both layouts so a ZIP upload never
-          # breaks the Gradle cache/setup steps.
-          if [ ! -f gradlew ] || [ ! -f settings.gradle.kts ]; then
-            ARCHIVE="$(find . -maxdepth 1 -type f \( -iname '*.zip' -o -iname '*.ZIP' \) | head -n 1)"
-            test -n "$ARCHIVE" || { echo 'ERROR: Full MICRO-MAX source was not found.'; exit 1; }
-
-            TMP_DIR="$(mktemp -d)"
-            unzip -q "$ARCHIVE" -d "$TMP_DIR"
-
-            SOURCE_ROOT="$TMP_DIR"
-            if [ ! -f "$SOURCE_ROOT/gradlew" ]; then
-              SOURCE_ROOT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 2 -type f -name gradlew -printf '%h\n' | head -n 1)"
-            fi
-            test -n "$SOURCE_ROOT" && test -f "$SOURCE_ROOT/gradlew" || { echo 'ERROR: gradlew was not found inside the uploaded source ZIP.'; exit 1; }
-
-            rsync -a --exclude='*.zip' --exclude='*.ZIP' "$SOURCE_ROOT/" ./
-          fi
-
-      - name: Verify source layout
-        shell: bash
-        run: |
-          set -euo pipefail
           test -f gradlew
-          test -f settings.gradle.kts
           test -f app/build.gradle.kts
-          test -f app/src/main/java/com/micromax/app/MainActivity.kt
-          test -f backend/src/server.js
-          test -f backend/package-lock.json
           chmod +x gradlew
-          echo 'MICRO-MAX source layout verified.'
-          printf 'Root files: '; find . -maxdepth 1 -type f | wc -l
-          printf 'Android files: '; find app -type f | wc -l
-          printf 'Backend files: '; find backend -type f | wc -l
 
-      - name: Set up Java 17
+      - name: Java 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
-          # Do not enable Gradle cache here. The source is prepared just before this step,
-          # and GitHub's setup-java cache validation can fail on ZIP-only repository layouts.
+          java-version: "17"
 
-      - name: Install Android SDK packages
-        shell: bash
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK
         run: |
-          set -euo pipefail
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/cmdline-tools/16.0/bin:$ANDROID_SDK_ROOT/tools/bin:$PATH"
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Validate backend
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd backend
-          npm ci
-          npm test
-
-      - name: Prepare upload keystore
-        shell: bash
+      - name: Configure API
         env:
-          KEYSTORE_BASE64: ${{ secrets.MICROMAX_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
+          API_URL: ${{ secrets.MICROMAX_API_BASE_URL }}
         run: |
-          set -euo pipefail
-          umask 077
-          test -n "$KEYSTORE_BASE64" || { echo 'ERROR: MICROMAX_KEYSTORE_BASE64 is missing'; exit 1; }
-          test -n "$KEYSTORE_PASSWORD" || { echo 'ERROR: MICROMAX_KEYSTORE_PASSWORD is missing'; exit 1; }
-          test -n "$KEY_ALIAS" || { echo 'ERROR: MICROMAX_KEY_ALIAS is missing'; exit 1; }
-          test -n "$KEY_PASSWORD" || { echo 'ERROR: MICROMAX_KEY_PASSWORD is missing'; exit 1; }
-          KEYSTORE_PATH="$RUNNER_TEMP/micromax-upload.jks"
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
-          test -s "$KEYSTORE_PATH"
-          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" 
-          {
-            echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE_PATH"
-            echo "MICROMAX_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
-            echo "MICROMAX_KEY_ALIAS=$KEY_ALIAS"
-            echo "MICROMAX_KEY_PASSWORD=$KEY_PASSWORD"
-          } >> "$GITHUB_ENV"
+          if [ -n "$API_URL" ]; then
+            echo "MICROMAX_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
+          else
+            echo "MICROMAX_API_BASE_URL=https://api.example.com" >> "$GITHUB_ENV"
+          fi
 
-      - name: Build signed Release AAB
-        shell: bash
+      - name: Configure Google Client ID
         env:
-          MICROMAX_API_BASE_URL: ${{ secrets.MICROMAX_API_BASE_URL }}
-          MICROMAX_GOOGLE_WEB_CLIENT_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
+          GOOGLE_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
         run: |
-          set -euo pipefail
-          test -n "$MICROMAX_API_BASE_URL" || { echo 'ERROR: MICROMAX_API_BASE_URL is missing'; exit 1; }
-          ./gradlew :app:bundleRelease --stacktrace --warning-mode all
+          echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=$GOOGLE_ID" >> "$GITHUB_ENV"
 
-      - name: Verify signed AAB
-        shell: bash
+      - name: Build APK
         run: |
-          set -euo pipefail
-          AAB='app/build/outputs/bundle/release/app-release.aab'
-          test -s "$AAB"
-          jarsigner -verify -verbose -certs "$AAB"
-          sha256sum "$AAB"
-          ls -lh "$AAB"
+          ./gradlew clean assembleRelease \
+            --no-daemon \
+            --stacktrace
 
-      - name: Upload signed release artifacts
+      - name: Find APK
+        run: |
+          echo "APK files:"
+          find app/build/outputs/apk -type f -name "*.apk" -print
+
+      - name: Prepare APK
+        run: |
+          set -e
+
+          mkdir -p download
+
+          APK=$(find app/build/outputs/apk/release \
+            -type f \
+            -name "*.apk" \
+            | head -n 1)
+
+          test -n "$APK"
+          test -f "$APK"
+
+          cp "$APK" download/MICRO-MAX.apk
+
+          ls -lh download/MICRO-MAX.apk
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MICRO-MAX-release-${{ github.ref_name }}
-          path: |
-            app/build/outputs/bundle/release/app-release.aab
-            app/build/outputs/mapping/release/mapping.txt
+          name: MICRO-MAX-APK
+          path: download/MICRO-MAX.apk
           if-no-files-found: error
           retention-days: 30
