@@ -17,11 +17,15 @@ jobs:
 
     steps:
 
+      # ==========================================
       # 1. Checkout
+      # ==========================================
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # ==========================================
       # 2. Java 17
+      # ==========================================
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
@@ -29,15 +33,19 @@ jobs:
           java-version: '17'
           cache: gradle
 
+      # ==========================================
       # 3. Android SDK
+      # ==========================================
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      # 4. Install Android SDK
-      - name: Install Android SDK
+      # ==========================================
+      # 4. Install Android SDK packages
+      # ==========================================
+      - name: Install Android SDK packages
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
@@ -46,11 +54,17 @@ jobs:
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      # 5. Check project
+          echo "Android SDK ready"
+
+      # ==========================================
+      # 5. Check Android project
+      # ==========================================
       - name: Check Android project
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
+
+          echo "Checking project..."
 
           test -f settings.gradle.kts || test -f settings.gradle
           test -f app/build.gradle.kts || test -f app/build.gradle
@@ -61,14 +75,19 @@ jobs:
 
           echo "Android project OK"
 
+      # ==========================================
       # 6. Check Gradle
+      # ==========================================
       - name: Check Gradle
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
+
           ./gradlew --version
 
+      # ==========================================
       # 7. Prepare signing keystore
+      # ==========================================
       - name: Prepare signing keystore
         shell: bash
         env:
@@ -78,7 +97,9 @@ jobs:
           KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
 
         run: |
-          set -euo pipefail
+          set -e
+
+          echo "Preparing release keystore..."
 
           test -n "$KEYSTORE_BASE64"
           test -n "$KEYSTORE_PASSWORD"
@@ -87,7 +108,7 @@ jobs:
 
           mkdir -p "$RUNNER_TEMP/micromax"
 
-          KEYSTORE_PATH="$RUNNER_TEMP/micromax/micromax-upload.jks"
+          KEYSTORE_PATH="$RUNNER_TEMP/micromax/micromax-release.jks"
 
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
 
@@ -102,73 +123,120 @@ jobs:
 
           echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
 
-          echo "Keystore OK"
+          echo "Keystore verified successfully"
 
-      # مهم:
-      # لا نحتاج MICROMAX_API_BASE_URL
-      # لا نحتاج MICROMAX_GOOGLE_WEB_CLIENT_ID
+      # ==========================================
+      # 8. Configure application environment
+      # ==========================================
+      # لا يوجد Backend حقيقي حاليًا.
+      # لذلك لا نطلب MICROMAX_API_BASE_URL
+      # ولا نفشل الـ Build بسببه.
       #
-      # app/build.gradle.kts عندك يحتوي على fallback
-      # لذلك لن نفشل الـ build بسبب عدم وجود Backend.
+      # Google Client ID اختياري أيضًا.
+      # ==========================================
+      - name: Configure application environment
+        shell: bash
+        env:
+          GOOGLE_WEB_CLIENT_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
 
-      # 8. Clean
+        run: |
+          set -e
+
+          if [ -n "$GOOGLE_WEB_CLIENT_ID" ]; then
+            echo "Google Client ID configured"
+          else
+            echo "Google Client ID not configured"
+            echo "Build will continue"
+          fi
+
+          echo "Application environment OK"
+
+      # ==========================================
+      # 9. Configure signing environment
+      # ==========================================
+      - name: Configure signing environment
+        shell: bash
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
+
+        run: |
+          set -e
+
+          test -n "$MICROMAX_KEYSTORE_PATH"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+
+          echo "Signing environment ready"
+
+      # ==========================================
+      # 10. Clean project
+      # ==========================================
       - name: Clean project
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           ./gradlew clean \
             --no-daemon \
             --stacktrace \
             --console=plain
 
-      # 9. Build APK
+      # ==========================================
+      # 11. Build signed APK
+      # ==========================================
       - name: Build signed APK
         shell: bash
         env:
+          MICROMAX_KEYSTORE_PATH: ${{ env.MICROMAX_KEYSTORE_PATH }}
           MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
           MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
           MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
 
         run: |
-          set -euo pipefail
+          set -e
 
           echo "======================================"
           echo "BUILDING MICRO-MAX RELEASE APK"
           echo "======================================"
 
-          ./gradlew \
-            :app:assembleRelease \
+          ./gradlew :app:assembleRelease \
             --no-daemon \
             --stacktrace \
             --console=plain
 
-      # 10. Build AAB
+      # ==========================================
+      # 12. Build signed AAB
+      # ==========================================
       - name: Build signed AAB
         shell: bash
         env:
+          MICROMAX_KEYSTORE_PATH: ${{ env.MICROMAX_KEYSTORE_PATH }}
           MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
           MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
           MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
 
         run: |
-          set -euo pipefail
+          set -e
 
           echo "======================================"
           echo "BUILDING MICRO-MAX RELEASE AAB"
           echo "======================================"
 
-          ./gradlew \
-            :app:bundleRelease \
+          ./gradlew :app:bundleRelease \
             --no-daemon \
             --stacktrace \
             --console=plain
 
-      # 11. Check files
+      # ==========================================
+      # 13. Check release files
+      # ==========================================
       - name: Check release files
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           APK="app/build/outputs/apk/release/app-release.apk"
           AAB="app/build/outputs/bundle/release/app-release.aab"
@@ -178,19 +246,19 @@ jobs:
 
           mkdir -p release
 
-          cp "$APK" \
-            release/MICRO-MAX-release.apk
+          cp "$APK" release/MICRO-MAX-release.apk
+          cp "$AAB" release/MICRO-MAX-release.aab
 
-          cp "$AAB" \
-            release/MICRO-MAX-release.aab
-
+          echo "Release files:"
           ls -lh release/
 
-      # 12. Verify APK
+      # ==========================================
+      # 14. Verify APK signature
+      # ==========================================
       - name: Verify APK signature
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
 
@@ -202,11 +270,13 @@ jobs:
 
           echo "APK signature OK"
 
-      # 13. Verify AAB
+      # ==========================================
+      # 15. Verify AAB signature
+      # ==========================================
       - name: Verify AAB signature
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           jarsigner \
             -verify \
@@ -216,11 +286,13 @@ jobs:
 
           echo "AAB signature OK"
 
-      # 14. Checksums
+      # ==========================================
+      # 16. Generate checksums
+      # ==========================================
       - name: Generate checksums
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           sha256sum \
             release/MICRO-MAX-release.apk \
@@ -229,47 +301,36 @@ jobs:
 
           cat release/SHA256SUMS.txt
 
-      # 15. Mapping
+      # ==========================================
+      # 17. Include mapping file
+      # ==========================================
       - name: Include mapping
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          if [ -f "app/build/outputs/mapping/release/mapping.txt" ]; then
+          MAPPING="app/build/outputs/mapping/release/mapping.txt"
 
-            cp \
-              app/build/outputs/mapping/release/mapping.txt \
-              release/mapping.txt
-
+          if [ -f "$MAPPING" ]; then
+            cp "$MAPPING" release/mapping.txt
             echo "mapping.txt included"
-
           else
-
             echo "No mapping.txt found"
-
           fi
 
-      # 16. Final check
+      # ==========================================
+      # 18. Final release check
+      # ==========================================
       - name: Final release check
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           test -s release/MICRO-MAX-release.apk
           test -s release/MICRO-MAX-release.aab
           test -s release/SHA256SUMS.txt
 
+          echo ""
           echo "======================================"
           echo "MICRO-MAX RELEASE READY"
-          echo "======================================"
-
-          ls -lah release/
-
-      # 17. Upload
-      - name: Upload APK and AAB
-        uses: actions/upload-artifact@v4
-        with:
-          name: MICRO-MAX-REAL-RELEASE
-          path: release/
-          if-no-files-found: error
-          retention-days: 30
+         
