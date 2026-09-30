@@ -50,16 +50,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
-private val Bg = Color(0xFF050A14)
-private val Card = Color(0xFF101B2C)
-private val Card2 = Color(0xFF0B1524)
-private val Accent = Color(0xFF22D3EE)
-private val Blue = Color(0xFF3B82F6)
-private val Green = Color(0xFF22C55E)
-private val Red = Color(0xFFF43F5E)
-private val Amber = Color(0xFFF59E0B)
-private val TextMain = Color(0xFFF8FAFC)
-private val TextMuted = Color(0xFF94A3B8)
+val Bg = Color(0xFF050A14)
+val Card = Color(0xFF101B2C)
+val Card2 = Color(0xFF0B1524)
+val Accent = Color(0xFF22D3EE)
+val Blue = Color(0xFF3B82F6)
+val Green = Color(0xFF22C55E)
+val Red = Color(0xFFF43F5E)
+val Amber = Color(0xFFF59E0B)
+val TextMain = Color(0xFFF8FAFC)
+val TextMuted = Color(0xFF94A3B8)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {

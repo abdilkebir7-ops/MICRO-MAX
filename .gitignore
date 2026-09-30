@@ -11,3 +11,4 @@ keystore.properties
 
 .env
 backend/.env
+keystore.base64
