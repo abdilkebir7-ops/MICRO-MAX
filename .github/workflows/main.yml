@@ -40,7 +40,7 @@ jobs:
         uses: android-actions/setup-android@v4
 
       # ==========================================
-      # 4. Install Android SDK packages
+      # 4. Android SDK packages
       # ==========================================
       - name: Install Android SDK packages
         shell: bash
@@ -63,8 +63,6 @@ jobs:
         shell: bash
         run: |
           set -e
-
-          echo "Checking project..."
 
           test -f settings.gradle.kts || test -f settings.gradle
           test -f app/build.gradle.kts || test -f app/build.gradle
@@ -128,12 +126,6 @@ jobs:
       # ==========================================
       # 8. Configure application environment
       # ==========================================
-      # لا يوجد Backend حقيقي حاليًا.
-      # لذلك لا نطلب MICROMAX_API_BASE_URL
-      # ولا نفشل الـ Build بسببه.
-      #
-      # Google Client ID اختياري أيضًا.
-      # ==========================================
       - name: Configure application environment
         shell: bash
         env:
@@ -142,17 +134,51 @@ jobs:
         run: |
           set -e
 
+          # ========================================
+          # REAL PRODUCTION BACKEND
+          # ========================================
+          API_BASE_URL="https://karim-max-hotspot-manager.onrender.com"
+
+          echo "MICROMAX_API_BASE_URL=$API_BASE_URL" >> "$GITHUB_ENV"
+
+          echo "Backend configured:"
+          echo "$API_BASE_URL"
+
+          # ========================================
+          # Google Client ID
+          # ========================================
           if [ -n "$GOOGLE_WEB_CLIENT_ID" ]; then
+            echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=$GOOGLE_WEB_CLIENT_ID" >> "$GITHUB_ENV"
             echo "Google Client ID configured"
           else
+            echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=REPLACE_WITH_GOOGLE_WEB_CLIENT_ID" >> "$GITHUB_ENV"
             echo "Google Client ID not configured"
-            echo "Build will continue"
           fi
 
-          echo "Application environment OK"
+          echo "Application environment ready"
 
       # ==========================================
-      # 9. Configure signing environment
+      # 9. Verify backend configuration
+      # ==========================================
+      - name: Verify backend configuration
+        shell: bash
+        run: |
+          set -e
+
+          test -n "$MICROMAX_API_BASE_URL"
+
+          if [ "$MICROMAX_API_BASE_URL" = "https://api.example.com" ]; then
+            echo "ERROR: Example backend URL detected."
+            exit 1
+          fi
+
+          echo "Backend URL:"
+          echo "$MICROMAX_API_BASE_URL"
+
+          echo "Backend configuration OK"
+
+      # ==========================================
+      # 10. Configure signing environment
       # ==========================================
       - name: Configure signing environment
         shell: bash
@@ -172,7 +198,7 @@ jobs:
           echo "Signing environment ready"
 
       # ==========================================
-      # 10. Clean project
+      # 11. Clean project
       # ==========================================
       - name: Clean project
         shell: bash
@@ -185,7 +211,7 @@ jobs:
             --console=plain
 
       # ==========================================
-      # 11. Build signed APK
+      # 12. Build signed APK
       # ==========================================
       - name: Build signed APK
         shell: bash
@@ -194,13 +220,18 @@ jobs:
           MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
           MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
           MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
+          MICROMAX_API_BASE_URL: ${{ env.MICROMAX_API_BASE_URL }}
+          MICROMAX_GOOGLE_WEB_CLIENT_ID: ${{ env.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
 
         run: |
           set -e
 
           echo "======================================"
-          echo "BUILDING MICRO-MAX RELEASE APK"
+          echo "MICRO-MAX RELEASE APK"
           echo "======================================"
+
+          echo "Backend:"
+          echo "$MICROMAX_API_BASE_URL"
 
           ./gradlew :app:assembleRelease \
             --no-daemon \
@@ -208,7 +239,7 @@ jobs:
             --console=plain
 
       # ==========================================
-      # 12. Build signed AAB
+      # 13. Build signed AAB
       # ==========================================
       - name: Build signed AAB
         shell: bash
@@ -217,13 +248,18 @@ jobs:
           MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
           MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
           MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
+          MICROMAX_API_BASE_URL: ${{ env.MICROMAX_API_BASE_URL }}
+          MICROMAX_GOOGLE_WEB_CLIENT_ID: ${{ env.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
 
         run: |
           set -e
 
           echo "======================================"
-          echo "BUILDING MICRO-MAX RELEASE AAB"
+          echo "MICRO-MAX RELEASE AAB"
           echo "======================================"
+
+          echo "Backend:"
+          echo "$MICROMAX_API_BASE_URL"
 
           ./gradlew :app:bundleRelease \
             --no-daemon \
@@ -231,7 +267,7 @@ jobs:
             --console=plain
 
       # ==========================================
-      # 13. Check release files
+      # 14. Check release files
       # ==========================================
       - name: Check release files
         shell: bash
@@ -253,7 +289,7 @@ jobs:
           ls -lh release/
 
       # ==========================================
-      # 14. Verify APK signature
+      # 15. Verify APK signature
       # ==========================================
       - name: Verify APK signature
         shell: bash
@@ -271,7 +307,7 @@ jobs:
           echo "APK signature OK"
 
       # ==========================================
-      # 15. Verify AAB signature
+      # 16. Verify AAB signature
       # ==========================================
       - name: Verify AAB signature
         shell: bash
@@ -287,7 +323,7 @@ jobs:
           echo "AAB signature OK"
 
       # ==========================================
-      # 16. Generate checksums
+      # 17. Generate checksums
       # ==========================================
       - name: Generate checksums
         shell: bash
@@ -302,7 +338,7 @@ jobs:
           cat release/SHA256SUMS.txt
 
       # ==========================================
-      # 17. Include mapping file
+      # 18. Include mapping
       # ==========================================
       - name: Include mapping
         shell: bash
@@ -319,7 +355,7 @@ jobs:
           fi
 
       # ==========================================
-      # 18. Final release check
+      # 19. Final release check
       # ==========================================
       - name: Final release check
         shell: bash
@@ -333,8 +369,17 @@ jobs:
           echo ""
           echo "======================================"
           echo "MICRO-MAX RELEASE READY"
-         
+          echo "======================================"
 
+          echo "Backend:"
+          echo "$MICROMAX_API_BASE_URL"
+
+          echo ""
+          ls -lh release/
+
+      # ==========================================
+      # 20. Upload APK + AAB
+      # ==========================================
       - name: Upload release files
         uses: actions/upload-artifact@v4
         with:
