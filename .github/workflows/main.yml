@@ -334,3 +334,10 @@ jobs:
           echo "======================================"
           echo "MICRO-MAX RELEASE READY"
          
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: MICRO-MAX-release
+          path: release/
+          retention-days: 30
