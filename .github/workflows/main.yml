@@ -17,24 +17,32 @@ jobs:
 
     steps:
 
-      # 1. تحميل المشروع
-      - name: Checkout
+      # =========================================================
+      # 1. Checkout
+      # =========================================================
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. التحقق من مشروع Android
-      - name: Check Android Project
+      # =========================================================
+      # 2. Check Android project
+      # =========================================================
+      - name: Check Android project
         shell: bash
         run: |
           set -e
+
+          echo "Checking Android project..."
 
           test -f gradlew
           test -f app/build.gradle.kts
 
           chmod +x gradlew
 
-          echo "Android project OK"
+          echo "Android project detected successfully."
 
+      # =========================================================
       # 3. Java 17
+      # =========================================================
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
@@ -42,43 +50,51 @@ jobs:
           java-version: '17'
           cache: gradle
 
+      # =========================================================
       # 4. Android SDK
+      #
+      # IMPORTANT:
+      # Do NOT install the old "tools" package.
+      # =========================================================
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
 
-      # 5. تثبيت SDK المطلوب
-      # ملاحظة: لا يوجد tools هنا
-      - name: Install Android SDK
-        shell: bash
-        run: |
-          set -e
-
-          yes | sdkmanager --licenses >/dev/null || true
-
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
-
-          echo "Android SDK installed successfully"
-
-      # 6. التحقق من SDK
+      # =========================================================
+      # 5. Verify Android SDK
+      # =========================================================
       - name: Verify Android SDK
         shell: bash
         run: |
           set -e
 
           echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
+          echo "Checking platform-tools..."
           test -d "$ANDROID_HOME/platform-tools"
+
+          echo "Checking Android 35..."
           test -d "$ANDROID_HOME/platforms/android-35"
+
+          echo "Checking Build Tools 35..."
           test -d "$ANDROID_HOME/build-tools/35.0.0"
 
-          "$ANDROID_HOME/platform-tools/adb" version
+          echo "Checking adb..."
+          adb version
 
-          echo "Android SDK verification OK"
+          echo "Checking sdkmanager..."
+          sdkmanager --version
 
-      # 7. تجهيز Keystore
+          echo "Android SDK is ready."
+
+      # =========================================================
+      # 6. Prepare Keystore
+      # =========================================================
       - name: Prepare Keystore
         shell: bash
         env:
@@ -98,9 +114,11 @@ jobs:
 
           echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
 
-          echo "Keystore prepared"
+          echo "Keystore prepared successfully."
 
-      # 8. فحص رابط Backend
+      # =========================================================
+      # 7. Check Backend
+      # =========================================================
       - name: Configure Backend
         shell: bash
         env:
@@ -112,17 +130,19 @@ jobs:
 
           case "$API_URL" in
             https://*)
-              echo "Backend HTTPS OK"
+              echo "Backend HTTPS: OK"
               ;;
             *)
-              echo "ERROR: Backend URL must use HTTPS"
+              echo "ERROR: MICROMAX_API_BASE_URL must start with https://"
               exit 1
               ;;
           esac
 
           echo "MICROMAX_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
 
-      # 9. Google Client ID
+      # =========================================================
+      # 8. Google Web Client ID
+      # =========================================================
       - name: Configure Google Client ID
         shell: bash
         env:
@@ -134,7 +154,11 @@ jobs:
 
           echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=$GOOGLE_ID" >> "$GITHUB_ENV"
 
-      # 10. التحقق من مفاتيح التوقيع
+          echo "Google Client ID configured."
+
+      # =========================================================
+      # 9. Signing secrets
+      # =========================================================
       - name: Check Signing Secrets
         shell: bash
         env:
@@ -148,10 +172,24 @@ jobs:
           test -n "$KEY_ALIAS"
           test -n "$KEY_PASSWORD"
 
-          echo "Signing secrets OK"
+          echo "Signing secrets are available."
 
-      # 11. تنظيف المشروع
-      - name: Clean Project
+      # =========================================================
+      # 10. Check Java / Gradle
+      # =========================================================
+      - name: Check Java and Gradle
+        shell: bash
+        run: |
+          set -e
+
+          java -version
+
+          ./gradlew --version
+
+      # =========================================================
+      # 11. Clean
+      # =========================================================
+      - name: Clean project
         shell: bash
         run: |
           set -e
@@ -160,8 +198,10 @@ jobs:
             --no-daemon \
             --stacktrace
 
-      # 12. بناء APK + AAB
-      - name: Build Signed APK and AAB
+      # =========================================================
+      # 12. Build signed APK
+      # =========================================================
+      - name: Build signed APK
         shell: bash
         env:
           MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
@@ -172,12 +212,30 @@ jobs:
 
           ./gradlew \
             :app:assembleRelease \
+            --no-daemon \
+            --stacktrace
+
+      # =========================================================
+      # 13. Build signed AAB
+      # =========================================================
+      - name: Build signed AAB
+        shell: bash
+        env:
+          MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
+          MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
+          MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
+        run: |
+          set -e
+
+          ./gradlew \
             :app:bundleRelease \
             --no-daemon \
             --stacktrace
 
-      # 13. التحقق من الملفات
-      - name: Check Release Files
+      # =========================================================
+      # 14. Check generated files
+      # =========================================================
+      - name: Check release files
         shell: bash
         run: |
           set -e
@@ -185,19 +243,31 @@ jobs:
           APK="app/build/outputs/apk/release/app-release.apk"
           AAB="app/build/outputs/bundle/release/app-release.aab"
 
+          echo "Checking APK..."
           test -f "$APK"
+
+          echo "Checking AAB..."
           test -f "$AAB"
 
           mkdir -p release
 
-          cp "$APK" release/MICRO-MAX-release.apk
-          cp "$AAB" release/MICRO-MAX-release.aab
+          cp "$APK" \
+            release/MICRO-MAX-release.apk
 
-          echo "Release files:"
+          cp "$AAB" \
+            release/MICRO-MAX-release.aab
+
+          echo ""
+          echo "================================"
+          echo "RELEASE FILES"
+          echo "================================"
+
           ls -lh release/
 
-      # 14. التحقق من توقيع APK
-      - name: Verify APK Signature
+      # =========================================================
+      # 15. Verify APK signature
+      # =========================================================
+      - name: Verify APK signature
         shell: bash
         run: |
           set -e
@@ -210,10 +280,12 @@ jobs:
             --verbose \
             release/MICRO-MAX-release.apk
 
-          echo "APK signature OK"
+          echo "APK signature verified successfully."
 
-      # 15. التحقق من توقيع AAB
-      - name: Verify AAB Signature
+      # =========================================================
+      # 16. Verify AAB signature
+      # =========================================================
+      - name: Verify AAB signature
         shell: bash
         run: |
           set -e
@@ -223,9 +295,11 @@ jobs:
             -certs \
             release/MICRO-MAX-release.aab
 
-          echo "AAB signature OK"
+          echo "AAB signature verified successfully."
 
-      # 16. رفع الملفات
+      # =========================================================
+      # 17. Upload APK + AAB
+      # =========================================================
       - name: Upload APK and AAB
         uses: actions/upload-artifact@v4
         with:
@@ -233,3 +307,24 @@ jobs:
           path: release/
           if-no-files-found: error
           retention-days: 30
+
+      # =========================================================
+      # 18. Final message
+      # =========================================================
+      - name: Release completed
+        shell: bash
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " MICRO-MAX RELEASE BUILD COMPLETED"
+          echo "=========================================="
+          echo ""
+          echo "APK:"
+          echo "release/MICRO-MAX-release.apk"
+          echo ""
+          echo "AAB:"
+          echo "release/MICRO-MAX-release.aab"
+          echo ""
+          echo "Artifact:"
+          echo "MICRO-MAX-REAL-RELEASE"
+          echo ""
