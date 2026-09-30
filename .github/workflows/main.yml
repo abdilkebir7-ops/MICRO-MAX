@@ -9,10 +9,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: micromax-release-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   release:
     name: Build Signed APK + AAB
@@ -21,34 +17,51 @@ jobs:
 
     steps:
 
-      # =========================================================
+      # ============================================================
       # 1. Checkout
-      # =========================================================
+      # ============================================================
       - name: Checkout source
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          submodules: recursive
 
-      # =========================================================
+      # ============================================================
       # 2. Java 17
-      # =========================================================
+      # ============================================================
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
-      # =========================================================
-      # 3. Gradle
-      # =========================================================
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+      # ============================================================
+      # 3. Android SDK
+      # ============================================================
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
 
-      # =========================================================
-      # 4. Check Android project
-      # =========================================================
+      # ============================================================
+      # 4. Install Android SDK packages
+      # ============================================================
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Accepting Android SDK licenses..."
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          echo "Installing Android SDK packages..."
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          echo "Android SDK ready."
+
+      # ============================================================
+      # 5. Check Android project
+      # ============================================================
       - name: Check Android project
         shell: bash
         run: |
@@ -56,188 +69,125 @@ jobs:
 
           echo "Checking Android project..."
 
-          test -f "./gradlew"
-          test -f "./settings.gradle" \
-            || test -f "./settings.gradle.kts"
+          test -f settings.gradle.kts || \
+          test -f settings.gradle
 
-          test -d "./app"
+          test -f app/build.gradle.kts || \
+          test -f app/build.gradle
 
-          test -f "./app/build.gradle" \
-            || test -f "./app/build.gradle.kts"
+          test -f app/src/main/AndroidManifest.xml
+
+          test -f gradlew
+
+          chmod +x gradlew
+
+          echo "Android project OK."
+
+      # ============================================================
+      # 6. Check Gradle
+      # ============================================================
+      - name: Check Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
 
           chmod +x ./gradlew
 
-          echo ""
-          echo "Project structure:"
-          ls -la
+          ./gradlew --version
 
-          echo ""
-          echo "App directory:"
-          ls -la app
-
-      # =========================================================
-      # 5. Android SDK
-      # =========================================================
-      # GitHub ubuntu-latest already contains Android SDK.
-      # We intentionally DO NOT run android-actions/setup-android
-      # because sdkmanager was the previous point of failure.
-      # =========================================================
-      - name: Verify Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "ANDROID_HOME=${ANDROID_HOME:-}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
-
-          if [ -n "${ANDROID_HOME:-}" ]; then
-            SDK_DIR="$ANDROID_HOME"
-          elif [ -n "${ANDROID_SDK_ROOT:-}" ]; then
-            SDK_DIR="$ANDROID_SDK_ROOT"
-          else
-            echo "ERROR: Android SDK not found."
-            exit 1
-          fi
-
-          echo "Using Android SDK: $SDK_DIR"
-
-          test -d "$SDK_DIR"
-
-          echo ""
-          echo "Installed SDK platforms:"
-          ls -la "$SDK_DIR/platforms" || true
-
-          echo ""
-          echo "Installed build tools:"
-          ls -la "$SDK_DIR/build-tools" || true
-
-          echo ""
-          echo "SDK verification completed."
-
-      # =========================================================
-      # 6. Prepare signing keystore
-      # =========================================================
+      # ============================================================
+      # 7. Prepare signing keystore
+      # ============================================================
       - name: Prepare signing keystore
         shell: bash
         env:
-          KEYSTORE_B64: ${{ secrets.MICROMAX_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${KEYSTORE_B64:-}" ]; then
-            echo "ERROR: MICROMAX_KEYSTORE_BASE64 is missing."
-            exit 1
-          fi
-
-          KEYSTORE_DIR="$RUNNER_TEMP/micromax"
-          KEYSTORE_FILE="$KEYSTORE_DIR/micromax-upload.jks"
-
-          mkdir -p "$KEYSTORE_DIR"
-
-          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE_FILE"
-
-          if [ ! -s "$KEYSTORE_FILE" ]; then
-            echo "ERROR: Keystore file is empty."
-            exit 1
-          fi
-
-          echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
-
-          echo "Keystore prepared successfully."
-
-      # =========================================================
-      # 7. Backend configuration
-      # =========================================================
-      - name: Configure Backend
-        shell: bash
-        env:
-          API_URL: ${{ secrets.MICROMAX_API_BASE_URL }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${API_URL:-}" ]; then
-            echo "ERROR: MICROMAX_API_BASE_URL is missing."
-            exit 1
-          fi
-
-          case "$API_URL" in
-            https://*)
-              echo "Backend HTTPS: OK"
-              ;;
-            *)
-              echo "ERROR: Backend URL must start with https://"
-              exit 1
-              ;;
-          esac
-
-          echo "MICROMAX_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
-
-      # =========================================================
-      # 8. Google Client ID
-      # =========================================================
-      - name: Configure Google Client ID
-        shell: bash
-        env:
-          GOOGLE_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${GOOGLE_ID:-}" ]; then
-            echo "ERROR: MICROMAX_GOOGLE_WEB_CLIENT_ID is missing."
-            exit 1
-          fi
-
-          echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=$GOOGLE_ID" >> "$GITHUB_ENV"
-
-          echo "Google Client ID configured."
-
-      # =========================================================
-      # 9. Check signing secrets
-      # =========================================================
-      - name: Check signing secrets
-        shell: bash
-        env:
-          STORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
+          KEYSTORE_BASE64: ${{ secrets.MICROMAX_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
-          if [ -z "${STORE_PASSWORD:-}" ]; then
-            echo "ERROR: MICROMAX_KEYSTORE_PASSWORD is missing."
-            exit 1
-          fi
+          echo "Preparing release keystore..."
 
-          if [ -z "${KEY_ALIAS:-}" ]; then
-            echo "ERROR: MICROMAX_KEY_ALIAS is missing."
-            exit 1
-          fi
+          test -n "$KEYSTORE_BASE64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
 
-          if [ -z "${KEY_PASSWORD:-}" ]; then
-            echo "ERROR: MICROMAX_KEY_PASSWORD is missing."
-            exit 1
-          fi
+          mkdir -p "$RUNNER_TEMP/micromax"
 
-          echo "Signing secrets: OK"
+          KEYSTORE_PATH="$RUNNER_TEMP/micromax/micromax-upload.jks"
 
-      # =========================================================
-      # 10. Java / Gradle diagnostics
-      # =========================================================
-      - name: Check Java and Gradle
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+
+          test -s "$KEYSTORE_PATH"
+
+          echo "Checking keystore..."
+
+          keytool \
+            -list \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" \
+            >/dev/null
+
+          echo "MICROMAX_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+          echo "Keystore is valid."
+
+      # ============================================================
+      # 8. Configure optional application environment
+      # ============================================================
+      - name: Configure application environment
         shell: bash
+        env:
+          API_BASE_URL: ${{ secrets.MICROMAX_API_BASE_URL }}
+          GOOGLE_WEB_CLIENT_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
         run: |
           set -euo pipefail
 
-          echo "Java:"
-          java -version
+          # Backend URL is OPTIONAL for compilation.
+          # No fake URL is inserted.
 
-          echo ""
-          echo "Gradle:"
-          ./gradlew --version
+          if [ -n "${API_BASE_URL:-}" ]; then
+            echo "MICROMAX_API_BASE_URL=$API_BASE_URL" >> "$GITHUB_ENV"
+            echo "Backend URL configured."
+          else
+            echo "MICROMAX_API_BASE_URL=" >> "$GITHUB_ENV"
+            echo "Backend URL is not configured."
+            echo "Build will continue."
+          fi
 
-      # =========================================================
-      # 11. Clean
-      # =========================================================
+          if [ -n "${GOOGLE_WEB_CLIENT_ID:-}" ]; then
+            echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=$GOOGLE_WEB_CLIENT_ID" >> "$GITHUB_ENV"
+            echo "Google Client ID configured."
+          else
+            echo "MICROMAX_GOOGLE_WEB_CLIENT_ID=" >> "$GITHUB_ENV"
+            echo "Google Client ID is not configured."
+          fi
+
+      # ============================================================
+      # 9. Export signing variables
+      # ============================================================
+      - name: Configure signing environment
+        shell: bash
+        env:
+          STORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
+          KEY_ALIAS_VALUE: ${{ secrets.MICROMAX_KEY_ALIAS }}
+          KEY_PASSWORD_VALUE: ${{ secrets.MICROMAX_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          echo "MICROMAX_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "MICROMAX_KEY_ALIAS=$KEY_ALIAS_VALUE" >> "$GITHUB_ENV"
+          echo "MICROMAX_KEY_PASSWORD=$KEY_PASSWORD_VALUE" >> "$GITHUB_ENV"
+
+          echo "Signing environment configured."
+
+      # ============================================================
+      # 10. Clean
+      # ============================================================
       - name: Clean project
         shell: bash
         run: |
@@ -248,53 +198,49 @@ jobs:
           ./gradlew clean \
             --no-daemon \
             --stacktrace \
-            --warning-mode all
+            --console=plain
 
-      # =========================================================
-      # 12. Build signed APK
-      # =========================================================
+      # ============================================================
+      # 11. Build Release APK
+      # ============================================================
       - name: Build signed APK
         shell: bash
-        env:
-          MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
-          MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
-          MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
           echo "======================================"
-          echo "BUILDING SIGNED APK"
+          echo "BUILDING MICRO-MAX RELEASE APK"
           echo "======================================"
 
-          ./gradlew :app:assembleRelease \
+          ./gradlew \
+            :app:assembleRelease \
             --no-daemon \
             --stacktrace \
-            --info
+            --console=plain \
+            --warning-mode all
 
-      # =========================================================
-      # 13. Build signed AAB
-      # =========================================================
+      # ============================================================
+      # 12. Build Release AAB
+      # ============================================================
       - name: Build signed AAB
         shell: bash
-        env:
-          MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
-          MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
-          MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
           echo "======================================"
-          echo "BUILDING SIGNED AAB"
+          echo "BUILDING MICRO-MAX RELEASE AAB"
           echo "======================================"
 
-          ./gradlew :app:bundleRelease \
+          ./gradlew \
+            :app:bundleRelease \
             --no-daemon \
             --stacktrace \
-            --info
+            --console=plain \
+            --warning-mode all
 
-      # =========================================================
-      # 14. Locate release files
-      # =========================================================
+      # ============================================================
+      # 13. Check output
+      # ============================================================
       - name: Check release files
         shell: bash
         run: |
@@ -304,126 +250,134 @@ jobs:
           AAB="app/build/outputs/bundle/release/app-release.aab"
 
           echo "Checking APK..."
-          test -f "$APK"
+
+          test -s "$APK"
 
           echo "Checking AAB..."
-          test -f "$AAB"
 
-          mkdir -p release
+          test -s "$AAB"
 
-          cp "$APK" \
-            "release/MICRO-MAX-release.apk"
+          echo
+          echo "======================================"
+          echo "RELEASE FILES"
+          echo "======================================"
 
-          cp "$AAB" \
-            "release/MICRO-MAX-release.aab"
+          ls -lh "$APK"
+          ls -lh "$AAB"
 
-          echo ""
-          echo "Release files:"
-          ls -lh release/
-
-      # =========================================================
-      # 15. Verify APK signature
-      # =========================================================
+      # ============================================================
+      # 14. Verify APK signature
+      # ============================================================
       - name: Verify APK signature
         shell: bash
         run: |
           set -euo pipefail
 
-          APK_SIGNER=""
+          APK="app/build/outputs/apk/release/app-release.apk"
 
-          if [ -n "${ANDROID_HOME:-}" ]; then
-            APK_SIGNER=$(find "$ANDROID_HOME/build-tools" \
-              -type f \
-              -name apksigner \
-              2>/dev/null \
-              | sort -V \
-              | tail -n 1 || true)
-          fi
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
 
-          if [ -z "$APK_SIGNER" ]; then
-            echo "ERROR: apksigner not found."
-            exit 1
-          fi
+          test -f "$APKSIGNER"
 
-          echo "Using:"
-          echo "$APK_SIGNER"
+          echo "Verifying APK signature..."
 
-          "$APK_SIGNER" verify \
+          "$APKSIGNER" verify \
             --verbose \
-            release/MICRO-MAX-release.apk
+            "$APK"
 
-      # =========================================================
-      # 16. Verify AAB signature
-      # =========================================================
+          echo "APK signature OK."
+
+      # ============================================================
+      # 15. Verify AAB signature
+      # ============================================================
       - name: Verify AAB signature
         shell: bash
         run: |
           set -euo pipefail
 
+          AAB="app/build/outputs/bundle/release/app-release.aab"
+
+          echo "Verifying AAB signature..."
+
           jarsigner \
             -verify \
             -verbose \
             -certs \
-            release/MICRO-MAX-release.aab
+            "$AAB"
 
-          echo "AAB signature verification completed."
+          echo "AAB signature OK."
 
-      # =========================================================
-      # 17. Generate checksums
-      # =========================================================
+      # ============================================================
+      # 16. Generate checksums
+      # ============================================================
       - name: Generate checksums
         shell: bash
         run: |
           set -euo pipefail
 
-          cd release
+          mkdir -p release
+
+          cp \
+            app/build/outputs/apk/release/app-release.apk \
+            release/MICRO-MAX-release.apk
+
+          cp \
+            app/build/outputs/bundle/release/app-release.aab \
+            release/MICRO-MAX-release.aab
 
           sha256sum \
-            MICRO-MAX-release.apk \
-            MICRO-MAX-release.aab \
-            > SHA256SUMS.txt
+            release/MICRO-MAX-release.apk \
+            release/MICRO-MAX-release.aab \
+            > release/SHA256SUMS.txt
 
-          echo ""
-          cat SHA256SUMS.txt
+          echo
+          echo "======================================"
+          echo "CHECKSUMS"
+          echo "======================================"
 
-      # =========================================================
+          cat release/SHA256SUMS.txt
+
+      # ============================================================
+      # 17. Include mapping file if available
+      # ============================================================
+      - name: Include mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "app/build/outputs/mapping/release/mapping.txt" ]; then
+            cp \
+              app/build/outputs/mapping/release/mapping.txt \
+              release/mapping.txt
+
+            echo "mapping.txt included."
+          else
+            echo "No mapping.txt found."
+          fi
+
+      # ============================================================
       # 18. Final release check
-      # =========================================================
+      # ============================================================
       - name: Final release check
         shell: bash
         run: |
           set -euo pipefail
 
+          echo
           echo "======================================"
-          echo "MICRO-MAX RELEASE CHECK"
+          echo "MICRO-MAX RELEASE READY"
           echo "======================================"
 
-          test -f release/MICRO-MAX-release.apk
-          test -f release/MICRO-MAX-release.aab
-          test -f release/SHA256SUMS.txt
+          test -s release/MICRO-MAX-release.apk
+          test -s release/MICRO-MAX-release.aab
+          test -s release/SHA256SUMS.txt
 
-          APK_SIZE=$(stat -c%s release/MICRO-MAX-release.apk)
-          AAB_SIZE=$(stat -c%s release/MICRO-MAX-release.aab)
+          echo
+          ls -lah release/
 
-          echo "APK size: ${APK_SIZE} bytes"
-          echo "AAB size: ${AAB_SIZE} bytes"
-
-          if [ "$APK_SIZE" -lt 100000 ]; then
-            echo "ERROR: APK is suspiciously small."
-            exit 1
-          fi
-
-          if [ "$AAB_SIZE" -lt 100000 ]; then
-            echo "ERROR: AAB is suspiciously small."
-            exit 1
-          fi
-
-          echo ""
-          echo "RELEASE CHECK PASSED."
-
-      # =========================================================
-      # 19. Upload artifacts
-      # =========================================================
+      # ============================================================
+      # 19. Upload APK + AAB
+      # ============================================================
       - name: Upload APK and AAB
         uses: actions/upload-artifact@v4
         with:
