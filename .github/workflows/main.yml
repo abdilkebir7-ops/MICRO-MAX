@@ -1,88 +1,87 @@
-name: MICRO-MAX Real Release
-
+name: MICRO-MAX Release
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-
+    branches: [main]
 permissions:
   contents: read
-
 env:
-  MICROMAX_API_BASE_URL: https://karim-max-hotspot-manager.onrender.com
-
+  MICROMAX_API_BASE_URL: ${{ secrets.MICROMAX_API_BASE_URL }}
+  MICROMAX_GOOGLE_WEB_CLIENT_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
 jobs:
   release:
-    name: Build Signed APK + AAB
+    name: Build signed Play artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
-
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
-
       - name: Install Android SDK packages
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Verify backend configuration
+      - name: Validate release inputs
         shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.MICROMAX_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
         run: |
-          set -e
-          echo "Backend configured:"
-          echo "$MICROMAX_API_BASE_URL"
-          test -n "$MICROMAX_API_BASE_URL"
-
-      - name: Make Gradle executable
+          set -euo pipefail
+          test -n "$MICROMAX_API_BASE_URL" || { echo 'MICROMAX_API_BASE_URL is required'; exit 1; }
+          case "$MICROMAX_API_BASE_URL" in http://*) echo 'Release API URL must use HTTPS'; exit 1;; esac
+          test -n "$KEYSTORE_BASE64" && test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
+      - name: Decode and verify upload keystore
         shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.MICROMAX_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
         run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/micromax-upload.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$key"
+          test -s "$key"
+          keytool -list -keystore "$key" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          echo "MICROMAX_KEYSTORE_PATH=$key" >> "$GITHUB_ENV"
+      - name: Build signed APK and AAB
+        shell: bash
+        env:
+          MICROMAX_KEYSTORE_PASSWORD: ${{ secrets.MICROMAX_KEYSTORE_PASSWORD }}
+          MICROMAX_KEY_ALIAS: ${{ secrets.MICROMAX_KEY_ALIAS }}
+          MICROMAX_KEY_PASSWORD: ${{ secrets.MICROMAX_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
           chmod +x ./gradlew
-
-      - name: Clean project
+          ./gradlew clean assembleRelease bundleRelease --no-daemon --stacktrace --console=plain
+      - name: Verify release artifacts
         shell: bash
         run: |
-          ./gradlew clean --no-daemon
-
-      - name: Build debug APK
-        shell: bash
-        run: |
-          ./gradlew assembleDebug --no-daemon
-
-      - name: Build release APK
-        shell: bash
-        run: |
-          ./gradlew assembleRelease --no-daemon || true
-
-      - name: Build release AAB
-        shell: bash
-        run: |
-          ./gradlew bundleRelease --no-daemon || true
-
-      - name: Check generated files
-        shell: bash
-        run: |
-          echo "Generated files:"
-          find . -type f \( -name "*.apk" -o -name "*.aab" \) -print
-
-      - name: Upload APK and AAB
+          set -euo pipefail
+          apk="$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
+          aab="$(find app/build/outputs/bundle/release -type f -name '*.aab' | head -n 1)"
+          test -f "$apk" && test -f "$aab"
+          apksigner verify --verbose "$apk"
+          jarsigner -verify -verbose -certs "$aab" >/dev/null
+          mkdir -p download
+          cp "$apk" download/MICRO-MAX-release.apk
+          cp "$aab" download/MICRO-MAX-release.aab
+          sha256sum download/*
+      - name: Upload signed artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: MICRO-MAX-release
-          path: |
-            **/build/outputs/apk/**/*.apk
-            **/build/outputs/bundle/**/*.aab
-          if-no-files-found: warn
+          name: MICRO-MAX-release-${{ github.run_number }}
+          path: download/
+          if-no-files-found: error
+          retention-days: 30
