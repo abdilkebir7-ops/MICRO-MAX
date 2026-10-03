@@ -105,7 +105,7 @@ fun MicroMaxApp(activity: MainActivity) {
     ) {
 
         val prefs = remember { activity.getSharedPreferences("micromax_session", Context.MODE_PRIVATE) }
-        val api = remember { Api(prefs.getString("api_base_url", BuildConfig.MICROMAX_API_BASE_URL).orEmpty()) }
+        val api = remember { Api(BuildConfig.MICROMAX_API_BASE_URL) }
         var authenticated by remember { mutableStateOf(prefs.getString("jwt_token", null).isNullOrBlank().not()) }
         if (authenticated) {
             api.token = prefs.getString("jwt_token", null)
@@ -116,7 +116,7 @@ fun MicroMaxApp(activity: MainActivity) {
             }
         } else {
             AuthScreen(api, prefs) { token ->
-                prefs.edit().putString("jwt_token", token).putString("api_base_url", api.base.trim().trimEnd('/')).apply()
+                prefs.edit().putString("jwt_token", token).apply()
                 api.token = token
                 authenticated = true
             }
@@ -151,8 +151,6 @@ private fun AuthPill(label: String, icon: ImageVector) {
 @Composable
 private fun AuthScreen(api: Api, prefs: android.content.SharedPreferences, onAuthenticated: (String) -> Unit) {
     var register by remember { mutableStateOf(false) }
-    var server by remember { mutableStateOf(api.base) }
-    var serverOpen by remember { mutableStateOf(false) }
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var reveal by remember { mutableStateOf(false) }
@@ -202,10 +200,7 @@ private fun AuthScreen(api: Api, prefs: android.content.SharedPreferences, onAut
                         scope.launch {
                             busy = true; message = null
                             try {
-                                val clean = server.trim().trimEnd('/')
-                                require(clean.startsWith("http://") || clean.startsWith("https://")) { "رابط الخادم يجب أن يبدأ بـ http:// أو https://" }
                                 require(email.contains("@") && password.length >= 8) { "أدخل بريدًا صحيحًا وكلمة مرور من 8 أحرف على الأقل" }
-                                api.base = clean
                                 val body = JSONObject().put("email", email.trim()).put("password", password).toString()
                                 val raw = api.post(if (register) "/api/auth/register" else "/api/auth/login", body)
                                 val token = JSONObject(raw).optString("token")
@@ -220,23 +215,6 @@ private fun AuthScreen(api: Api, prefs: android.content.SharedPreferences, onAut
                     }
                     TextButton({ register = !register; message = null }, modifier = Modifier.fillMaxWidth()) {
                         Text(if (register) "لديك حساب؟ تسجيل الدخول" else "أول مرة؟ إنشاء حساب المدير")
-                    }
-                }
-            }
-            Surface(shape = RoundedCornerShape(17.dp), color = Color.White) {
-                Column(Modifier.padding(horizontal = 15.dp, vertical = 10.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SymbolTile(Icons.Outlined.Dns, Royal, size = 39.dp)
-                        Spacer(Modifier.width(9.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("خادم الاتصال", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Ink)
-                            Text(server.ifBlank { "لم يُحدّد بعد" }, fontSize = 11.sp, color = MutedInk, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                        TextButton({ serverOpen = !serverOpen }) { Text(if (serverOpen) "إخفاء" else "تغيير") }
-                    }
-                    if (serverOpen) {
-                        AppField(server, { server = it }, "رابط Backend (HTTPS)", Icons.Outlined.Link)
-                        Text(if (server.contains("10.0.2.2")) "10.0.2.2 للمحاكي فقط. للهاتف الحقيقي استخدم خادم HTTPS أو عنوان شبكة قابل للوصول." else "استخدم HTTPS للخادم الحقيقي.", fontSize = 11.sp, color = MutedInk)
                     }
                 }
             }
