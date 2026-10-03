@@ -1,23 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <!-- "M" monogram, kept inside the 66dp safe-zone circle used by adaptive-icon masks -->
-    <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M22.5,22.5
-                           L33.75,22.5
-                           L54,56.25
-                           L74.25,22.5
-                           L85.5,22.5
-                           L85.5,85.5
-                           L74.25,85.5
-                           L74.25,42.75
-                           L54,74.25
-                           L33.75,42.75
-                           L33.75,85.5
-                           L22.5,85.5
-                           Z" />
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="4.5" android:strokeLineCap="round"
+        android:pathData="M24,54 C24,36 37,24 54,24 C71,24 84,36 84,54 C84,72 71,84 54,84 C37,84 24,72 24,54 Z" />
+    <path android:fillColor="#00000000" android:strokeColor="#FF22D3EE"
+        android:strokeWidth="4" android:strokeLineCap="round"
+        android:pathData="M29,64 L53,35 L78,61 L29,64 M53,35 L53,75" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M29,64 m-7,0 a7,7 0,1 0,14 0 a7,7 0,1 0,-14 0" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M53,35 m-7,0 a7,7 0,1 0,14 0 a7,7 0,1 0,-14 0" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M78,61 m-7,0 a7,7 0,1 0,14 0 a7,7 0,1 0,-14 0" />
+    <path android:fillColor="#FF22D3EE" android:pathData="M53,75 m-5,0 a5,5 0,1 0,10 0 a5,5 0,1 0,-10 0" />
 </vector>

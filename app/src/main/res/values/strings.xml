@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">MICRO-MAX</string>
-    <string name="tagline">HOTSPOT • NETWORK MANAGER</string>
+    <string name="tagline">INTERNET NETWORK • MIKROTIK OPERATIONS</string>
 
     <!-- Bottom navigation + top bar subtitle share this single source now,
          instead of the label list being duplicated in two places. -->

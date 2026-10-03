@@ -29,8 +29,8 @@ android {
         minSdk = 26
         targetSdk = 35
         // Keep versionCode/versionName in step with the README's V-number on every release.
-        versionCode = 301
-        versionName = "3.0.1"
+        versionCode = 302
+        versionName = "3.0.2"
 
         val apiBaseUrl = System.getenv("MICROMAX_API_BASE_URL") ?: "https://api.example.com"
         buildConfigField("String", "MICROMAX_API_BASE_URL", "\"$apiBaseUrl\"")

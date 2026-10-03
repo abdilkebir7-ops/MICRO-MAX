@@ -32,7 +32,7 @@ private val StudioRed = Color(0xFFF43F5E)
 private val StudioMint = Color(0xFF82E3BF)
 
 @Composable
-fun DesignStudioPage(api: Api, router: JSONObject?, activity: MainActivity) {
+fun DesignStudioPage(api: Api, router: JSONObject?, activity: MainActivity, initialTemplate: String = "Midnight Glass") {
     var tab by remember { mutableIntStateOf(0) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -50,7 +50,7 @@ fun DesignStudioPage(api: Api, router: JSONObject?, activity: MainActivity) {
             }
         }
         when (tab) {
-            0 -> CardDesignStudio(api, router)
+            0 -> CardDesignStudio(api, router, initialTemplate)
             1 -> HotspotPageStudio(api, router)
             else -> PrinterStudio(activity)
         }
@@ -58,8 +58,8 @@ fun DesignStudioPage(api: Api, router: JSONObject?, activity: MainActivity) {
 }
 
 @Composable
-private fun CardDesignStudio(api: Api, router: JSONObject?) {
-    var template by remember { mutableStateOf("Midnight Glass") }
+private fun CardDesignStudio(api: Api, router: JSONObject?, initialTemplate: String) {
+    var template by remember(initialTemplate) { mutableStateOf(initialTemplate) }
     var title by remember { mutableStateOf("WiFi Access") }
     var subtitle by remember { mutableStateOf("اتصال سريع وآمن") }
     var support by remember { mutableStateOf("support@micromax.app") }
@@ -75,7 +75,7 @@ private fun CardDesignStudio(api: Api, router: JSONObject?) {
     var message by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val routerId = router?.optString("id")
-    val templates = listOf("Modern Wave", "Midnight Glass", "VIP Neon", "Classic Gold", "Minimal Mono", "Clean White", "Coffee House", "Hotel Luxe", "School Clean", "Market Orange")
+    val templates = listOf("Modern Wave", "Midnight Glass", "VIP Neon", "Classic Gold", "Minimal Mono", "Clean White", "Coffee House", "Hotel Luxe", "School Clean", "Market Orange", "Travel WiFi", "Gaming Arena")
     val templateColors = mapOf("Modern Wave" to "#2563EB", "Midnight Glass" to "#22D3EE", "VIP Neon" to "#E879F9", "Classic Gold" to "#D4A84F", "Minimal Mono" to "#111827", "Clean White" to "#2563EB", "Coffee House" to "#B77945", "Hotel Luxe" to "#66D9C0", "School Clean" to "#1D4ED8", "Market Orange" to "#FF9B5A")
     val templateDescriptions = mapOf("Modern Wave" to "عصري • تدرج أزرق", "Midnight Glass" to "داكن • زجاجي", "VIP Neon" to "جريء • نيون", "Classic Gold" to "كلاسيكي • فاخر", "Minimal Mono" to "بسيط • أبيض وأسود", "Clean White" to "نظيف • تجاري", "Coffee House" to "مقهى • دافئ", "Hotel Luxe" to "فندق • راقٍ", "School Clean" to "تعليمي • واضح", "Market Orange" to "متجر • حيوي")
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {

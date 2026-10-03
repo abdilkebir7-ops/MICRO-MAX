@@ -198,3 +198,10 @@ Use the same application ID `com.micromax.app`, increment `versionCode` for ever
 - Tests: `npm test` runs smoke checks plus 9 unit tests (script generation, duplicate resolution against a fake router, QR signing/tamper detection, state detection, audit, scan).
 - **Two QR codes per card** when an SSID is given: (1) Wi-Fi join QR (`WIFI:T:nopass;S:<ssid>;;`) so phones connect without typing, (2) signed login QR that auto-fills and submits the card. Both are drawn on the preview and on the printed card from the same values stored in the database, which were read back from the router.
 - **Two card methods** (chosen before generation): (1) username + password + QR, (2) **code only + QR** (`passwordMode:"pin"`). Method 2 uses `hotspot-templates/login-code.html` (single field; the code is sent as username and password) and needs at least 100M combinations (8 digits) or `PIN_MODE_CODE_TOO_SHORT`. Upload that file as the router's `hotspot/login.html` (method 1 uses `login.html`). Set `shared-users=1` and a `limit-uptime` on the profile for code-only cards.
+
+
+## MICRO-MAX Internet Network — product direction
+
+The public product identity is **MICRO-MAX — INTERNET NETWORK**, designed for MikroTik network owners and hotspot operators. The launcher and splash use the connected-network mark, while the login screen presents MikroTik, HotSpot, and Smart Operations as the core product pillars.
+
+The recommended commercial model is B2B recurring revenue: Basic for one router, Pro for multiple routers/branches, and White-Label for resellers. The highest-value expansion is branch and reseller management with staff roles, inventory, sales reporting, white-label captive pages, and operational alerts. NITA can be connected later as the payment rail without making card generation or core network operations dependent on it.

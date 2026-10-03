@@ -6,6 +6,9 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pg from "pg";
 import crypto from "crypto";
+import net from "net";
+import tls from "tls";
+import dns from "dns";
 import rateLimit from "express-rate-limit";
 import { OAuth2Client } from "google-auth-library";
 import PDFDocument from "pdfkit";
@@ -123,7 +126,51 @@ app.get("/api/store/my",auth,async(req,res)=>{const r=await pool.query("SELECT e
 app.get("/api/payment-methods",auth,async(req,res)=>{const online=process.env.ENABLE_ONLINE_PAYMENTS==="true";res.json({methods:[{id:"cash",name:"نقداً / يدوي",available:true},...(online?[{id:"binance_pay",name:"Binance Pay",available:binancePayConfigured()}]:[])]});});
 
 app.get("/api/routers",auth,async(req,res)=>{const r=await pool.query("SELECT id,name,host,port,username,tls,created_at FROM routers WHERE user_id=$1 ORDER BY created_at DESC",[req.user.sub]);res.json({routers:r.rows});});
-app.post("/api/routers/test",auth,async(req,res)=>{const {host,port=8728,username,password,tls=false}=req.body;try{const ros=new RouterOS({host,port:Number(port),username,password,tls:!!tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});const resource=await ros.command("/system/resource/print",[]);await ros.close();res.json({ok:true,resource:resource[0]||{}});}catch(e){res.status(400).json({ok:false,error:"ROUTER_CONNECTION_FAILED"});}});
+
+function tcpProbe(host, port, useTls=false, timeout=5000) {
+  return new Promise(resolve => {
+    const started=Date.now(); let settled=false;
+    const finish=(result)=>{if(settled)return;settled=true;try{socket?.destroy();}catch{};resolve({...result,latencyMs:Date.now()-started});};
+    const socket=useTls ? tls.connect({host,port,servername:host,rejectUnauthorized:false}) : net.createConnection({host,port});
+    const timer=setTimeout(()=>finish({ok:false,code:"TIMEOUT",message:"لم يصل رد من المنفذ خلال المهلة"}),timeout);
+    socket.once("connect",()=>{clearTimeout(timer);finish({ok:true,code:"OPEN",message:"المنفذ مفتوح ويمكن الوصول إليه"});});
+    socket.once("secureConnect",()=>{clearTimeout(timer);finish({ok:true,code:"OPEN_TLS",message:"منفذ TLS مفتوح ويمكن الوصول إليه"});});
+    socket.once("error",e=>{clearTimeout(timer);finish({ok:false,code:String(e.code||"SOCKET_ERROR"),message:String(e.message||e.code||"فشل الاتصال").slice(0,180)});});
+  });
+}
+
+function privateIpv4(host) {
+  const p=String(host).split(".").map(Number);
+  return p.length===4 && p.every(x=>Number.isInteger(x)&&x>=0&&x<=255) && (p[0]===10 || p[0]===192&&p[1]===168 || p[0]===172&&p[1]>=16&&p[1]<=31);
+}
+app.post("/api/routers/discover",auth,async(req,res)=>{
+  const network=String(req.body?.network||"192.168.88.0/24").trim(); const m=network.match(/^(\d+\.\d+\.\d+)\.0\/24$/);
+  if(!m || !privateIpv4(`${m[1]}.1`)) return res.status(400).json({ok:false,error:"PRIVATE_24_NETWORK_REQUIRED",detail:"اكتشاف الراوتر يعمل فقط على شبكة خاصة بصيغة 192.168.88.0/24"});
+  const hosts=Array.from({length:254},(_,i)=>`${m[1]}.${i+1}`); const found=[]; let cursor=0;
+  async function worker(){while(cursor<hosts.length){const host=hosts[cursor++]; const [api,ssl]=await Promise.all([tcpProbe(host,8728,false,450),tcpProbe(host,8729,true,450)]); if(api.ok||ssl.ok) found.push({host,port:ssl.ok?8729:8728,tls:ssl.ok,service:ssl.ok?"API-SSL":"API",latencyMs:Math.min(api.latencyMs||9999,ssl.latencyMs||9999)});}}
+  await Promise.all(Array.from({length:24},worker));
+  res.json({ok:true,network,source:"backend",routers:found.sort((a,b)=>a.host.localeCompare(b.host,{numeric:true}))});
+});
+
+app.post("/api/routers/diagnose",auth,async(req,res)=>{
+  const host=String(req.body?.host||"").trim(); const port=Number(req.body?.port)||8728; const tlsMode=!!req.body?.tls;
+  if(!host)return res.status(400).json({ok:false,error:"ROUTER_INPUT_REQUIRED",steps:[]});
+  const steps=[]; let addresses=[];
+  try { addresses=await dns.promises.lookup(host,{all:true}); steps.push({name:"DNS",ok:true,message:`تم حل ${host}`,addresses:addresses.map(x=>x.address)}); }
+  catch(e){ steps.push({name:"DNS",ok:false,code:String(e.code||"DNS_ERROR"),message:"تعذر حل اسم المضيف من Backend"}); }
+  const tcp=await tcpProbe(host,port,tlsMode); steps.push({name:tlsMode?"TCP/TLS":"TCP",...tcp});
+  let login=null;
+  if(req.body?.username && typeof req.body?.password === "string" && tcp.ok){
+    let ros;
+    try { ros=new RouterOS({host,port,username:String(req.body.username),password:req.body.password,tls:tlsMode,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",timeout:8000}); const r=await ros.command("/system/resource/print",[]); login={ok:true,code:"AUTH_OK",message:"تم تسجيل الدخول إلى RouterOS",resource:r[0]||{}}; }
+    catch(e){ login={ok:false,code:String(e.code||e.message||"ROUTER_LOGIN_FAILED"),message:String(e.message||e.code||"فشل تسجيل الدخول").slice(0,240)}; }
+    finally { try{await ros?.close();}catch{} }
+    steps.push({name:"RouterOS",...login});
+  } else steps.push({name:"RouterOS",ok:false,code:tcp.ok?"CREDENTIALS_NOT_TESTED":"TCP_UNREACHABLE",message:tcp.ok?"تم فتح المنفذ لكن لم تُرسل بيانات الدخول":"لا يمكن اختبار بيانات الدخول قبل فتح المنفذ"});
+  const ok=steps.every(x=>x.ok);
+  res.json({ok,source:"backend",host,port,tls:tlsMode,steps,advice:ok?"الاتصال جاهز من مكان تشغيل Backend":"إذا فشل TCP فالمشكلة شبكة/VPN/Firewall، وليست كلمة مرور التطبيق"});
+});
+app.post("/api/routers/test",auth,async(req,res)=>{const {host,port=8728,username,password,tls=false}=req.body;let ros;try{if(!String(host||"").trim()||!String(username||"").trim()||!String(password||""))return res.status(400).json({ok:false,error:"ROUTER_INPUT_REQUIRED",detail:"host, username and password are required"});ros=new RouterOS({host:String(host).trim(),port:Number(port)||8728,username:String(username).trim(),password,tls:!!tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});const resource=await ros.command("/system/resource/print",[]);res.json({ok:true,resource:resource[0]||{}});}catch(e){const detail=String(e?.code||e?.message||"UNKNOWN").replace(/\s+/g," ").slice(0,240);res.status(502).json({ok:false,error:"ROUTER_CONNECTION_FAILED",detail,help:tls?"تحقق من API-SSL والمنفذ 8729 والشهادة وALLOW_INSECURE_ROUTER_TLS":"تحقق من API والمنفذ 8728 وIP الراوتر والجدار الناري"});}finally{try{await ros?.close();}catch{}}});
 app.post("/api/routers",auth,async(req,res)=>{const {name,host,port=8728,username,password,tls=false}=req.body;if(!name||!host||!username||!password)return res.status(400).json({error:"INVALID_INPUT"});const id=crypto.randomUUID();await pool.query("INSERT INTO routers(id,user_id,name,host,port,username,password_enc,tls) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",[id,req.user.sub,name,host,Number(port),username,encrypt(password),!!tls]);await audit(req.user.sub,"CREATE","router",id,{name,host});res.status(201).json({id,name,host,port:Number(port),username,tls:!!tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});});
 app.delete("/api/routers/:id",auth,role("admin"),async(req,res)=>{await pool.query("DELETE FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);await audit(req.user.sub,"DELETE","router",req.params.id);res.status(204).end();});
 async function getRouter(req,id){const r=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[id,req.user.sub]);if(!r.rowCount)throw Error("ROUTER_NOT_FOUND");return r.rows[0];}
@@ -142,7 +189,7 @@ app.post("/api/routers/:id/terminal",auth,role("admin"),async(req,res)=>{
     });
     await audit(req.user.sub,"TERMINAL","router",req.params.id,{command});
     res.json({ok:true,command,result});
-  }catch(e){res.status(502).json({error:"TERMINAL_COMMAND_FAILED"});}
+  }catch(e){res.status(502).json({error:"TERMINAL_COMMAND_FAILED",detail:String(e.code||e.message||"UNKNOWN").slice(0,240),help:"تحقق من صلاحية api والأمر ومن اتصال Backend بالراوتر"});}
 });
 app.get("/api/routers/:id/dashboard",auth,async(req,res)=>{try{const data=await withRos(req,req.params.id,async ros=>{const [resource,active,interfaces]=await Promise.all([ros.command("/system/resource/print",[]),ros.command("/ip/hotspot/active/print",[]),ros.command("/interface/print",[])]);return {resource:resource[0]||{},activeUsers:active.length,interfaces};});res.json(data);}catch(e){res.status(502).json({error:"ROUTER_QUERY_FAILED",detail:e.message});}});
 function hotspotDuration(minutes){
@@ -481,7 +528,8 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
   const usernameLetters=Math.min(Math.max(Number.isFinite(Number(req.body.usernameLetters))?Math.floor(Number(req.body.usernameLetters)):0,0),12);
   const planId=String(req.body.planId||"").trim();
   const portalUrl=String(req.body.portalUrl||"").trim();
-  const ssid=String(req.body.ssid||"").trim().slice(0,32);
+  // A Wi-Fi QR must never claim an unknown secured network is open.
+  const ssid=String(req.body.wifiOpen === true ? req.body.ssid||"" : "").trim().slice(0,32);
   const batchId=crypto.randomUUID();
   const created=[];
   let routerTouched=false,committed=false;
