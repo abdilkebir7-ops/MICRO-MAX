@@ -32,7 +32,7 @@ android {
         versionCode = 302
         versionName = "3.0.2"
 
-        val apiBaseUrl = System.getenv("MICROMAX_API_BASE_URL") ?: "https://api.example.com"
+        val apiBaseUrl = System.getenv("MICROMAX_API_BASE_URL") ?: "https://karim-max-hotspot-manager.onrender.com"
         buildConfigField("String", "MICROMAX_API_BASE_URL", "\"$apiBaseUrl\"")
         manifestPlaceholders["allowCleartext"] = "false"
         val googleWebClientId = System.getenv("MICROMAX_GOOGLE_WEB_CLIENT_ID") ?: "REPLACE_WITH_GOOGLE_WEB_CLIENT_ID"
