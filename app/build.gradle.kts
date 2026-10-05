@@ -61,7 +61,7 @@ android {
         debug {
             // Local emulator backend only; never enabled in release builds.
             manifestPlaceholders["allowCleartext"] = "true"
-            buildConfigField("String", "MICROMAX_API_BASE_URL", "\"http://10.0.2.2:8080\"")
+            buildConfigField("String", "MICROMAX_API_BASE_URL", "\"\\"\\")
         }
         release {
             isMinifyEnabled = true
