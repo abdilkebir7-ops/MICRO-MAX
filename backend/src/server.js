@@ -12,6 +12,7 @@ import dns from "dns";
 import rateLimit from "express-rate-limit";
 import { OAuth2Client } from "google-auth-library";
 import PDFDocument from "pdfkit";
+import ExcelJS from "exceljs";
 import { RouterOS } from "./routeros.js";
 import { assertPinStrength, buildWifiQr, generateBatch, sanitizePrefix, usernameSpace, usernameRegex, qrSecretFrom, buildQrUrl, parseQr, auditCards, scanVerdict, classifyRouterUser } from "./cards.js";
 import { binancePayConfigured, createBinancePayOrder, queryBinancePayOrder, verifyBinancePayNotification } from "./binancePay.js";
@@ -650,6 +651,69 @@ app.post("/api/card-batches/:id/disable",auth,async(req,res)=>{const client=awai
 app.delete("/api/card-batches/:id",auth,async(req,res)=>{const client=await pool.connect();let ros=null;try{await client.query("BEGIN");const q=await client.query(`SELECT c.*,r.host,r.port,r.username router_username,r.password_enc,r.tls FROM cards c JOIN routers r ON r.id=c.router_id WHERE c.batch_id=$1 AND r.user_id=$2 FOR UPDATE`,[req.params.id,req.user.sub]);if(!q.rowCount)throw Error("BATCH_NOT_FOUND");const protectedCards=q.rows.filter(x=>!["available","expired","disabled"].includes(x.status));if(protectedCards.length)throw Error("BATCH_CONTAINS_SOLD_OR_USED_CARDS");const deletable=q.rows.filter(x=>["available","expired","disabled"].includes(x.status));for(const c of deletable)await client.query("DELETE FROM cards WHERE id=$1",[c.id]);await client.query("COMMIT");try{const r=q.rows[0];ros=new RouterOS({host:r.host,port:r.port,username:r.router_username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});await ros.connect();const users=await ros.command("/ip/hotspot/user/print",[`?comment=MICRO-MAX:${req.params.id}`]);for(const u of users){if(u[".id"])await ros.command("/ip/hotspot/user/remove",[`=.id=${u[".id"]}`]);}}catch{}await audit(req.user.sub,"DELETE","card_batch",req.params.id,{deleted:deletable.length});res.json({success:true,batchId:req.params.id,deleted:deletable.length});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();try{await ros?.close();}catch{}}});
 app.get("/api/card-batches/:id/csv",auth,async(req,res)=>{try{const r=await pool.query(`SELECT c.username,c.password,c.profile,c.status,c.price,c.price_currency,c.plan_id,c.batch_id,c.created_at,c.sold_at,r.name router_name,p.name plan_name FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE c.batch_id=$1 AND r.user_id=$2 ORDER BY c.created_at`,[req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:"BATCH_NOT_FOUND"});const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;const lines=["username,password,profile,status,price,currency,plan_id,batch_id,created_at,sold_at,router,plan"];for(const x of r.rows)lines.push([x.username,decPass(x.password),x.profile,x.status,x.price,x.price_currency,x.plan_id,x.batch_id,x.created_at?.toISOString?.()||x.created_at,x.sold_at?.toISOString?.()||x.sold_at,x.router_name,x.plan_name].map(esc).join(","));res.setHeader("Content-Type","text/csv; charset=utf-8");res.setHeader("Content-Disposition",`attachment; filename="micromax-batch-${req.params.id}.csv"`);res.send("\uFEFF"+lines.join("\n"));}catch(e){res.status(500).json({error:"BATCH_CSV_FAILED",detail:e.message});}});
 
+const CARD_REPORT_COLUMNS = [
+  ["username", "Username"], ["profile", "Profile"], ["status", "Status"],
+  ["price", "Price"], ["price_currency", "Currency"], ["batch_id", "Batch ID"],
+  ["created_at", "Created At"], ["sold_at", "Sold At"], ["router_name", "Router"], ["plan_name", "Plan"]
+];
+async function cardReportRows(req) {
+  const params = [req.user.sub];
+  const filters = ["r.user_id=$1"];
+  const routerId = String(req.query.routerId || "").trim();
+  const status = String(req.query.status || "").trim().toLowerCase();
+  if (routerId) { params.push(routerId); filters.push(`c.router_id=$${params.length}`); }
+  if (["available", "sold", "used", "expired", "disabled"].includes(status)) { params.push(status); filters.push(`c.status=$${params.length}`); }
+  const result = await pool.query(`SELECT c.username,c.profile,c.status,c.price,c.price_currency,c.batch_id,c.created_at,c.sold_at,r.name router_name,p.name plan_name FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE ${filters.join(" AND ")} ORDER BY c.created_at DESC LIMIT 10000`, params);
+  return result.rows;
+}
+function reportCell(value) { return value instanceof Date ? value.toISOString() : String(value ?? ""); }
+app.get("/api/reports/cards.csv", auth, async (req, res) => {
+  try {
+    const rows = await cardReportRows(req);
+    const esc = value => `"${reportCell(value).replaceAll('"', '""')}"`;
+    const lines = [CARD_REPORT_COLUMNS.map(([, title]) => title).map(esc).join(",")];
+    for (const row of rows) lines.push(CARD_REPORT_COLUMNS.map(([key]) => esc(row[key])).join(","));
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="micromax-card-report.csv"');
+    res.send("\uFEFF" + lines.join("\n"));
+  } catch (e) { res.status(500).json({ error: "CARD_REPORT_CSV_FAILED", detail: e.message }); }
+});
+app.get("/api/reports/cards.xlsx", auth, async (req, res) => {
+  try {
+    const rows = await cardReportRows(req);
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "MICRO-MAX";
+    const sheet = workbook.addWorksheet("Card Report");
+    sheet.columns = CARD_REPORT_COLUMNS.map(([key, header]) => ({ key, header, width: Math.max(14, header.length + 3) }));
+    rows.forEach(row => sheet.addRow(Object.fromEntries(CARD_REPORT_COLUMNS.map(([key]) => [key, reportCell(row[key])]))));
+    sheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
+    sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "123B66" } };
+    sheet.views = [{ state: "frozen", ySplit: 1 }];
+    sheet.autoFilter = { from: "A1", to: `${String.fromCharCode(64 + CARD_REPORT_COLUMNS.length)}${rows.length + 1}` };
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", 'attachment; filename="micromax-card-report.xlsx"');
+    res.send(Buffer.from(buffer));
+  } catch (e) { res.status(500).json({ error: "CARD_REPORT_XLSX_FAILED", detail: e.message }); }
+});
+app.get("/api/reports/cards.pdf", auth, async (req, res) => {
+  try {
+    const rows = await cardReportRows(req);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="micromax-card-report.pdf"');
+    const doc = new PDFDocument({ margin: 42, size: "A4" });
+    doc.pipe(res);
+    doc.fontSize(20).fillColor("#123B66").text("MICRO-MAX - Card Report");
+    doc.fontSize(9).fillColor("#64748B").text(`Generated: ${new Date().toISOString()}   |   Rows: ${rows.length}`);
+    doc.moveDown();
+    rows.forEach((row, index) => {
+      const line = `${index + 1}. ${row.username} | ${row.profile || "-"} | ${row.status} | ${row.price} ${row.price_currency || ""} | ${row.router_name || "-"} | ${reportCell(row.created_at).slice(0, 10)}`;
+      doc.fontSize(9).fillColor("#1E293B").text(line, { lineGap: 3 });
+      if (doc.y > 760) doc.addPage();
+    });
+    doc.end();
+  } catch (e) { res.status(500).json({ error: "CARD_REPORT_PDF_FAILED", detail: e.message }); }
+});
 app.post("/api/sales",auth,async(req,res)=>{const {cardId,paymentMethod="cash",reference=null}=req.body;const requestedAmount=req.body.amount; if(!cardId)return res.status(400).json({error:"CARD_REQUIRED"});if(paymentMethod!=="cash" && process.env.ENABLE_ONLINE_PAYMENTS!=="true")return res.status(403).json({error:"ONLINE_PAYMENTS_DISABLED"});const client=await pool.connect();try{await client.query("BEGIN");const c=await client.query("SELECT c.*,hp.duration_minutes profile_duration_minutes FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile WHERE c.id=$1 AND r.user_id=$2 FOR UPDATE",[cardId,req.user.sub]);if(!c.rowCount||c.rows[0].status!=="available")throw Error("CARD_NOT_AVAILABLE");const card=c.rows[0];const planPrice=Number(card.price||0);const numericAmount=planPrice;if(!Number.isFinite(numericAmount)||numericAmount<=0)return res.status(400).json({error:"PLAN_PRICE_NOT_SET",plan:card.plan_name||card.profile});const saleId=crypto.randomUUID();const finalCash=paymentMethod==="cash";await client.query("UPDATE cards SET status='sold',sold_at=now() WHERE id=$1",[cardId]);await client.query("INSERT INTO sales(id,card_id,seller_id,amount,payment_method,payment_status,reference) VALUES($1,$2,$3,$4,$5,$6,$7)",[saleId,cardId,req.user.sub,numericAmount,paymentMethod,finalCash?"success":"pending",reference]);await client.query("COMMIT");await audit(req.user.sub,"CREATE","sale",saleId,{cardId,amount:numericAmount,paymentMethod,paymentStatus:finalCash?"success":"pending",profile:card.profile,plan:card.plan_name||null,profileDurationMinutes:Number(card.profile_duration_minutes||0)});res.status(201).json({saleId,status:finalCash?"success":"pending",amount:numericAmount,profile:card.profile,durationMinutes:Number(card.profile_duration_minutes||0),card:finalCash?{username:card.username,password:decPass(card.password),profile:card.profile,price:numericAmount}:undefined});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();}});
 app.get("/api/sales",auth,async(req,res)=>{const r=await pool.query("SELECT s.*,c.username card_username FROM sales s LEFT JOIN cards c ON c.id=s.card_id WHERE s.seller_id=$1 ORDER BY s.created_at DESC LIMIT 1000",[req.user.sub]);res.json({sales:r.rows});});
 app.post("/api/payments/intents",auth,async(req,res)=>{

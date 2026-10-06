@@ -93,6 +93,15 @@ class Api(var base: String) {
     suspend fun get(path: String): String = call(req(path).get().build())
     suspend fun post(path: String, body: String = "{}"): String = call(req(path).post(body.toRequestBody("application/json".toMediaType())).build())
     suspend fun delete(path: String): String = call(req(path).delete().build())
+    suspend fun download(path: String): ByteArray = withContext(Dispatchers.IO) {
+        http.newCall(req(path).get().build()).execute().use { response ->
+            if (!response.isSuccessful) {
+                val body = response.body?.string().orEmpty()
+                throw Exception(try { JSONObject(body).optString("detail").ifBlank { JSONObject(body).optString("error") } } catch (_: Exception) { "HTTP ${response.code}" })
+            }
+            response.body?.bytes() ?: ByteArray(0)
+        }
+    }
     private suspend fun call(r: Request): String = withContext(Dispatchers.IO) { http.newCall(r).execute().use { x -> val b=x.body?.string().orEmpty(); if(!x.isSuccessful) throw Exception(try{JSONObject(b).optString("detail").ifBlank{JSONObject(b).optString("error")}}catch(_:Exception){"HTTP ${x.code}"}); b } }
 }
 
@@ -256,7 +265,7 @@ fun MainShell(api: Api, activity: MainActivity, onLogout: () -> Unit) {
         Nav("التقارير", Icons.Outlined.BarChart, 6), Nav("الأمان", Icons.Outlined.AdminPanelSettings, 7),
         Nav("الشبكة", Icons.Outlined.Lan, 8), Nav("الإعدادات", Icons.Outlined.Settings, 9),
         Nav("HTML HotSpot", Icons.Outlined.Code, 10), Nav("طرفية RouterOS", Icons.Outlined.Terminal, 11),
-        Nav("استوديو الكروت", Icons.Outlined.Palette, 12), Nav("محرر الواجهات", Icons.Outlined.Web, 13), Nav("التحكم الذكي", Icons.Outlined.AutoAwesome, 14)
+        Nav("استوديو الكروت", Icons.Outlined.Palette, 12), Nav("محرر الواجهات", Icons.Outlined.Web, 13), Nav("التحكم الذكي", Icons.Outlined.AutoAwesome, 14), Nav("تقارير الكروت", Icons.Outlined.Assessment, 15)
     )
 
     var page by remember { mutableIntStateOf(0) }
@@ -374,13 +383,14 @@ fun MainShell(api: Api, activity: MainActivity, onLogout: () -> Unit) {
                     12 -> DesignStudioPage(api, selected, activity, chosenTemplate)
                     13 -> HotspotVisualEditorPage(api, selected)
                     14 -> SmartControlPage(api, selected, { page = 11 }, { page = 8 }, { page = 3 })
+                    15 -> CardReportsPage(api, routers, selected)
                 }
             }
         }
         if (moreOpen) ModalBottomSheet(onDismissRequest = { moreOpen = false }, containerColor = surface) {
             Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 30.dp), verticalArrangement = Arrangement.spacedBy(15.dp)) {
                 PageHeading("مركز العمليات", "كل الأدوات", "انتقل بسرعة إلى أي جزء من النظام")
-                val extra = listOf(nav[2], nav[5], nav[6], nav[12], nav[13], nav[14], nav[8], nav[7], nav[10], nav[11], nav[9])
+                val extra = listOf(nav[2], nav[5], nav[6], nav[15], nav[12], nav[13], nav[14], nav[8], nav[7], nav[10], nav[11], nav[9])
                 extra.chunked(3).forEach { row ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                         row.forEach { item -> ActionTile(item.icon, item.title, when (item.page) { 5 -> Teal; 12, 13 -> Lavender; 6 -> Tangerine; else -> Accent }, Modifier.weight(1f)) { page = item.page; moreOpen = false } }
