@@ -19,6 +19,8 @@ val keystoreProps = Properties().apply {
 }
 fun signingProp(key: String, envVar: String): String? =
     keystoreProps.getProperty(key) ?: System.getenv(envVar)
+fun buildConfigString(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r", "\\r").replace("\n", "\\n")}\""
 
 android {
     namespace = "com.micromax.app"
@@ -33,10 +35,10 @@ android {
         versionName = "3.0.2"
 
         val apiBaseUrl = System.getenv("MICROMAX_API_BASE_URL") ?: "https://karim-max-hotspot-manager.onrender.com"
-        buildConfigField("String", "MICROMAX_API_BASE_URL", "\"$apiBaseUrl\"")
+        buildConfigField("String", "MICROMAX_API_BASE_URL", buildConfigString(apiBaseUrl))
         manifestPlaceholders["allowCleartext"] = "false"
         val googleWebClientId = System.getenv("MICROMAX_GOOGLE_WEB_CLIENT_ID") ?: "REPLACE_WITH_GOOGLE_WEB_CLIENT_ID"
-        buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"$googleWebClientId\"")
+        buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", buildConfigString(googleWebClientId))
     }
 
     val storeFilePath = signingProp("storeFile", "MICROMAX_KEYSTORE_PATH")
@@ -61,7 +63,7 @@ android {
         debug {
             // Local emulator backend only; never enabled in release builds.
             manifestPlaceholders["allowCleartext"] = "true"
-            buildConfigField("String", "MICROMAX_API_BASE_URL", "\"\"")
+            buildConfigField("String", "MICROMAX_API_BASE_URL", buildConfigString(""))
         }
         release {
             isMinifyEnabled = true
