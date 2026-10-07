@@ -72,7 +72,9 @@ jobs:
           apk="$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
           aab="$(find app/build/outputs/bundle/release -type f -name '*.aab' | head -n 1)"
           test -f "$apk" && test -f "$aab"
-          apksigner verify --verbose "$apk"
+          apksigner_path="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$apksigner_path"
+          "$apksigner_path" verify --verbose "$apk"
           jarsigner -verify -verbose -certs "$aab" >/dev/null
           mkdir -p download
           cp "$apk" download/MICRO-MAX-release.apk
