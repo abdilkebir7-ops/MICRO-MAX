@@ -1,15 +1,61 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp" android:height="108dp"
-    android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF"
-        android:strokeWidth="4.5" android:strokeLineCap="round"
-        android:pathData="M24,54 C24,36 37,24 54,24 C71,24 84,36 84,54 C84,72 71,84 54,84 C37,84 24,72 24,54 Z" />
-    <path android:fillColor="#00000000" android:strokeColor="#FF22D3EE"
-        android:strokeWidth="4" android:strokeLineCap="round"
-        android:pathData="M29,64 L53,35 L78,61 L29,64 M53,35 L53,75" />
-    <path android:fillColor="#FFFFFFFF" android:pathData="M29,64 m-7,0 a7,7 0,1 0,14 0 a7,7 0,1 0,-14 0" />
-    <path android:fillColor="#FFFFFFFF" android:pathData="M53,35 m-7,0 a7,7 0,1 0,14 0 a7,7 0,1 0,-14 0" />
-    <path android:fillColor="#FFFFFFFF" android:pathData="M78,61 m-7,0 a7,7 0,1 0,14 0 a7,7 0,1 0,-14 0" />
-    <path android:fillColor="#FF22D3EE" android:pathData="M53,75 m-5,0 a5,5 0,1 0,10 0 a5,5 0,1 0,-10 0" />
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- تاج ذهبي -->
+    <path
+        android:fillColor="#FFFFC94A"
+        android:pathData="M38,30 L42,18 L54,26 L66,18 L70,30 L66,36 L42,36 Z" />
+
+    <!-- جوهرة -->
+    <path
+        android:fillColor="#FF22D3EE"
+        android:pathData="M54,21 L61,28 L54,35 L47,28 Z" />
+
+    <!-- Wi-Fi جديد وواضح -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:pathData="M28,49 C42,36 66,36 80,49" />
+
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FF22D3EE"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:pathData="M38,60 C47,52 61,52 70,60" />
+
+    <path
+        android:fillColor="#FFFFC94A"
+        android:pathData="M54,69 m-6,0 a6,6 0,1 0,12 0 a6,6 0,1 0,-12 0" />
+
+    <!-- راوتر -->
+    <path
+        android:fillColor="#FF06101F"
+        android:strokeColor="#FF22D3EE"
+        android:strokeWidth="3"
+        android:pathData="M30,77 L78,77 L74,87 L34,87 Z" />
+
+    <!-- لمبات -->
+    <path
+        android:fillColor="#FF22D3EE"
+        android:pathData="M38,80h5v3h-5z" />
+
+    <path
+        android:fillColor="#FF22D3EE"
+        android:pathData="M47,80h5v3h-5z" />
+
+    <path
+        android:fillColor="#FF22D3EE"
+        android:pathData="M56,80h5v3h-5z" />
+
+    <path
+        android:fillColor="#FFFFC94A"
+        android:pathData="M65,80h5v3h-5z" />
+
 </vector>
