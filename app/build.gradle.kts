@@ -34,7 +34,7 @@ android {
         versionCode = 302
         versionName = "3.0.2"
 
-        val apiBaseUrl = System.getenv("MICROMAX_API_BASE_URL") ?: "https://karim-max-hotspot-manager.onrender.com"
+        val apiBaseUrl = System.getenv("MICROMAX_API_BASE_URL") ?: "https://micro-max-api.onrender.com"
         buildConfigField("String", "MICROMAX_API_BASE_URL", buildConfigString(apiBaseUrl))
         manifestPlaceholders["allowCleartext"] = "false"
         val googleWebClientId = System.getenv("MICROMAX_GOOGLE_WEB_CLIENT_ID") ?: "REPLACE_WITH_GOOGLE_WEB_CLIENT_ID"
@@ -63,7 +63,7 @@ android {
         debug {
             // Local emulator backend only; never enabled in release builds.
             manifestPlaceholders["allowCleartext"] = "true"
-            buildConfigField("String", "MICROMAX_API_BASE_URL", buildConfigString(""))
+            buildConfigField("String", "MICROMAX_API_BASE_URL", buildConfigString("https://micro-max-api.onrender.com"))
         }
         release {
             isMinifyEnabled = true
