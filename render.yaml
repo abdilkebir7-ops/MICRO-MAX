@@ -42,6 +42,5 @@ databases:
   - name: micromax-db
     region: oregon
     plan: free
-    postgresMajorVersion: "16"
     databaseName: micromax
     user: micromax
