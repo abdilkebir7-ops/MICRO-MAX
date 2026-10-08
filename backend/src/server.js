@@ -94,6 +94,64 @@ ALTER TABLE cards ADD COLUMN IF NOT EXISTS batch_id UUID;
 }
 
 app.get("/health",(_,res)=>res.json({ok:true,service:"MICRO-MAX API",version:"2.0.0"}));
+
+// Protected administrator account recovery. Requires ADMIN_EMAIL and ADMIN_RECOVERY_SECRET.
+app.post("/api/auth/admin-recover", loginLimiter, async (req, res) => {
+  const expected = String(process.env.ADMIN_RECOVERY_SECRET || "");
+  const supplied = String(req.get("x-admin-recovery-secret") || "");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(supplied);
+
+  if (a.length < 32 || a.length !== b.length ||
+      !crypto.timingSafeEqual(a, b)) {
+    return res.status(403).json({ error: "RECOVERY_NOT_AUTHORIZED" });
+  }
+
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+
+  if (!adminEmail || email !== adminEmail)
+    return res.status(403).json({ error: "ADMIN_EMAIL_MISMATCH" });
+  if (password.length < 12)
+    return res.status(400).json({ error: "PASSWORD_TOO_SHORT" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const found = await client.query(
+      "SELECT id FROM users WHERE email=$1 FOR UPDATE", [email]
+    );
+    const hash = await bcrypt.hash(password, 12);
+
+    if (found.rowCount) {
+      await client.query(
+        "UPDATE users SET password_hash=$1, role='admin' WHERE id=$2",
+        [hash, found.rows[0].id]
+      );
+    } else {
+      const id = crypto.randomUUID();
+      await client.query(
+        "INSERT INTO users(id,email,password_hash,role) VALUES($1,$2,$3,'admin')",
+        [id, email, hash]
+      );
+      await client.query(
+        "INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",
+        [id]
+      );
+    }
+
+    await client.query("COMMIT");
+    return res.json({ ok: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Admin recovery failed:", e.message);
+    return res.status(500).json({ error: "ADMIN_RECOVERY_FAILED" });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/auth/register",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");if(!email||password.length<8)return res.status(400).json({error:"INVALID_INPUT"});try{const count=Number((await pool.query("SELECT count(*)::int n FROM users")).rows[0].n);let user;if(count===0){user=await bootstrapAdmin({email,hash:await bcrypt.hash(password,12)});}else if(process.env.ALLOW_REGISTRATION==="true"){user=await registerUser({email,hash:await bcrypt.hash(password,12)});}else{user=null;}if(!user)return res.status(403).json({error:count===0?"REGISTRATION_FAILED":"REGISTRATION_CLOSED"});await audit(user.id,"REGISTER","user",user.id,{role:user.role});res.status(201).json({token:sign(user),user});}catch(e){if(String(e?.code)==="23505")return res.status(409).json({error:"EMAIL_EXISTS"});res.status(500).json({error:"REGISTRATION_FAILED"});}});
 app.post("/api/auth/login",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");const r=await pool.query("SELECT * FROM users WHERE email=$1",[email]);if(!r.rowCount||!r.rows[0].password_hash||!(await bcrypt.compare(password,r.rows[0].password_hash)))return res.status(401).json({error:"INVALID_CREDENTIALS"});await audit(r.rows[0].id,"LOGIN","user",r.rows[0].id);res.json({token:sign(r.rows[0]),user:{id:r.rows[0].id,email:r.rows[0].email,role:r.rows[0].role}});});
 app.post("/api/auth/google",loginLimiter,async(req,res)=>{
