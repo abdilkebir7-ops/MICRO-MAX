@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: micro-max-api
+    runtime: node
+    region: oregon
+    plan: free
+    branch: main
+    rootDir: backend
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      - key: TRUST_PROXY
+        value: "true"
+
+      - key: DATABASE_URL
+        fromDatabase:
+          name: micro-max-db
+          property: connectionString
+
+      - key: JWT_SECRET
+        generateValue: true
+
+      - key: ROUTER_ENCRYPTION_KEY
+        generateValue: true
+
+      - key: ALLOW_INSECURE_ROUTER_TLS
+        value: "false"
+
+      - key: ENABLE_ONLINE_PAYMENTS
+        value: "false"
+
+      - key: CORS_ORIGIN
+        sync: false
+
+databases:
+  - name: micro-max-db
+    region: oregon
+    plan: free
+    postgresMajorVersion: "16"
+    databaseName: micromax
+    user: micromax
