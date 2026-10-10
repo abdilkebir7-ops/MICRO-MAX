@@ -1,0 +1,21 @@
+diff --git a/backend/src/server.js b/backend/src/server.js
+index 19057ff..579a148 100644
+--- a/backend/src/server.js
++++ b/backend/src/server.js
+@@ -36,6 +36,7 @@ const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHead
+ const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, skip: req => req.path === "/health" });
+ app.use("/api", apiLimiter);
+ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID || undefined);
++const registrationEnabled = String(process.env.ALLOW_REGISTRATION || "false").toLowerCase() === "true";
+ const configuredJwtSecret = String(process.env.JWT_SECRET || "");
+ const configuredEncryptionSecret = String(process.env.ROUTER_ENCRYPTION_KEY || "");
+ const devMode = ["development","test"].includes(process.env.NODE_ENV);
+@@ -53,7 +54,7 @@ function auth(req,res,next){ const h=req.headers.authorization||""; try{ const t
+ const decPass = v => String(v||"").startsWith("enc:") ? decrypt(String(v).slice(4)) : String(v||"");
+ const encPass = v => "enc:" + encrypt(v);
+ function cardOut(row){ const password = decPass(row.password); const passwordMode = password===row.username?"pin":"userpass"; const qr = row.portal_url ? buildQrUrl({portalUrl:row.portal_url,username:row.username,password:passwordMode==="pin"?"":password,cardId:row.id,secret:QR_SECRET}) : (row.qr_content||null); return { ...row, password, passwordMode, qr_content: qr, qrContent: qr, wifiQr: buildWifiQr(row.ssid) }; }
+-async function bootstrapAdmin({email,hash=null,googleSub=null}){ const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query("SELECT pg_advisory_xact_lock(7734001)"); const n=(await client.query("SELECT count(*)::int n FROM users")).rows[0].n; if(n>0){ await client.query("ROLLBACK"); return null; } const id=crypto.randomUUID(); const r=await client.query("INSERT INTO users(id,email,password_hash,google_sub,role) VALUES($1,$2,$3,$4,'admin') RETURNING id,email,role",[id,email,hash,googleSub]); await client.query("INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",[id]); await client.query("COMMIT"); return r.rows[0]; }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; } finally{ client.release(); } }
++async function bootstrapAdmin({email,hash=null,googleSub=null}){ const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query("SELECT pg_advisory_xact_lock(7734001)"); const n=(await client.query("SELECT count(*)::int n FROM users")).rows[0].n; if(n>0 && !registrationEnabled){ await client.query("ROLLBACK"); return null; } const id=crypto.randomUUID(); const accountRole=n===0?"admin":"staff"; const r=await client.query("INSERT INTO users(id,email,password_hash,google_sub,role) VALUES($1,$2,$3,$4,$5) RETURNING id,email,role",[id,email,hash,googleSub,accountRole]); await client.query("INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",[id]); await client.query("COMMIT"); return r.rows[0]; }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; } finally{ client.release(); } }
+ function role(...roles){ return (req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:"FORBIDDEN"}); }
+ async function audit(userId,action,entity,entityId,details={}){ await pool.query("INSERT INTO audit_logs(id,user_id,action,entity,entity_id,details) VALUES(gen_random_uuid(),$1,$2,$3,$4,$5)",[userId,action,entity,entityId,JSON.stringify(details)]); }
+ 

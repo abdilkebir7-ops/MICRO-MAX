@@ -1,0 +1,1875 @@
+diff --git a/backend/package.json b/backend/package.json
+index bfb8563..35d0faa 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "start": "node src/server.js",
+-    "test": "node test/smoke.mjs && node --test test/cards.test.mjs"
++    "test": "node test/smoke.mjs && node --test test/cards.test.mjs test/netguard.test.mjs test/agent.test.mjs test/routeros-pin.test.mjs test/qr.test.mjs test/insights.test.mjs test/security.test.mjs"
+   },
+   "dependencies": {
+     "bcryptjs": "^2.4.3",
+diff --git a/backend/src/agent.js b/backend/src/agent.js
+new file mode 100644
+index 0000000..b65970e
+--- /dev/null
++++ b/backend/src/agent.js
+@@ -0,0 +1,199 @@
++// Remote-router "Agent" mode: the router connects OUT to this server (no open ports, works behind NAT).
++// The server only ever emits a fixed whitelist of RouterOS commands, built from strictly validated values.
++import crypto from "node:crypto";
++import { USER_LETTERS, USER_DIGITS, PASS_ALPHABET, sanitizePrefix } from "./cards.js";
++
++export const AGENT_JOB_TYPES = ["hotspot-user-add", "hotspot-user-remove", "hotspot-profile-set"];
++
++export function newAgentToken() { return "mmag_" + crypto.randomBytes(32).toString("base64url"); }
++export function hashToken(t) { return crypto.createHash("sha256").update(String(t)).digest("hex"); }
++export function tokenMatches(token, hashHex) {
++  const a = Buffer.from(hashToken(token), "hex"), b = Buffer.from(String(hashHex || ""), "hex");
++  return a.length === b.length && crypto.timingSafeEqual(a, b);
++}
++
++/** Values are placed inside RouterOS double-quoted strings: `$ [ ] " \` must never appear. */
++export function rosSafe(v, { max = 64 } = {}) {
++  const s = String(v ?? "");
++  if (s.length > max || !/^[\p{L}\p{N} ._\-+@:]*$/u.test(s)) throw new Error("UNSAFE_VALUE");
++  return s;
++}
++function escRos(s) { return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$"); }
++
++export function normalizeBaseUrl(u) {
++  const url = new URL(String(u));
++  if (url.protocol !== "https:") throw new Error("BASE_URL_MUST_BE_HTTPS");
++  return url.origin;
++}
++
++const FETCH_OPTS = 'mode=https check-certificate=yes-without-crl';
++
++export function renderJobScript(jobs, { baseUrl, token, chunkSize = 25 }) {
++  const base = normalizeBaseUrl(baseUrl);
++  if (!/^mmag_[A-Za-z0-9_-]{20,}$/.test(token)) throw new Error("BAD_TOKEN");
++  const ack = (ids, st) => `/tool fetch url="${base}/api/agent/ack?j=${[].concat(ids).join(",")}&s=${st}" http-header-field="X-Agent-Token: ${token}" keep-result=no ${FETCH_OPTS}`;
++  const out = [`# MICRO-MAX jobs (${jobs.length})`];
++  let chunk = [];
++  const flush = () => {
++    if (!chunk.length) return;
++    const ids = chunk.map(c => c.id);
++    const adds = chunk.map(c => `:do { ${c.body} } on-error={ :set bad 1 }`).join("; ");
++    out.push(`:do { :local bad 0; ${adds}; :if ($bad = 0) do={ ${ack(ids, "ok")} } else={ ${ack(ids, "fail")} } } on-error={}`);
++    chunk = [];
++  };
++  for (const j of jobs) {
++    if (!/^[0-9a-f-]{36}$/.test(j.id)) throw new Error("BAD_JOB_ID");
++    const p = j.payload || {};
++    let body;
++    if (j.type === "hotspot-user-add") {
++      const u = rosSafe(p.username), pw = rosSafe(p.password), pr = rosSafe(p.profile), c = rosSafe(p.comment || "");
++      const lu = p.limitUptime ? String(p.limitUptime) : "";
++      if (lu && !/^\d{1,5}[smhdw]$/.test(lu)) throw new Error("UNSAFE_VALUE");
++      if (!u || !pr) throw new Error("UNSAFE_VALUE");
++      chunk.push({ id: j.id, body: `:if ([:len [/ip hotspot user find where name="${u}"]] = 0) do={ /ip hotspot user add name="${u}" password="${pw}" profile="${pr}" comment="${c}"${lu ? ` limit-uptime=${lu}` : ""} }` });
++      if (chunk.length >= chunkSize) flush();
++      continue;
++    }
++    flush();
++    if (j.type === "hotspot-profile-set") {
++      const n = rosSafe(p.name);
++      if (!n) throw new Error("UNSAFE_VALUE");
++      const parts = [];
++      const su = Number(p.sharedUsers ?? 1);
++      if (!Number.isInteger(su) || su < 1 || su > 1000) throw new Error("UNSAFE_VALUE");
++      parts.push(`shared-users=${su}`);
++      if (p.rateLimit) { if (!/^\d+[kKmMgG]?(\/\d+[kKmMgG]?)?$/.test(String(p.rateLimit))) throw new Error("UNSAFE_VALUE"); parts.push(`rate-limit=${p.rateLimit}`); }
++      for (const [k, key] of [["sessionTimeout", "session-timeout"], ["idleTimeout", "idle-timeout"]]) {
++        if (p[k]) { if (!/^(\d{1,5}[wdhms])+$/.test(String(p[k]))) throw new Error("UNSAFE_VALUE"); parts.push(`${key}=${p[k]}`); }
++      }
++      const attrs = parts.join(" ");
++      body = `:if ([:len [/ip hotspot user profile find where name="${n}"]] = 0) do={ /ip hotspot user profile add name="${n}" ${attrs} } else={ /ip hotspot user profile set [find where name="${n}"] ${attrs} }`;
++    } else if (j.type === "hotspot-user-remove") {
++      const u = rosSafe(p.username);
++      if (!u) throw new Error("UNSAFE_VALUE");
++      body = `/ip hotspot user remove [find where name="${u}"]`;
++    } else throw new Error("UNKNOWN_JOB_TYPE");
++    out.push(`:do { ${body}; ${ack(j.id, "ok")} } on-error={ :do { ${ack(j.id, "fail")} } on-error={} }`);
++  }
++  flush();
++  return out.join("\n") + "\n";
++}
++
++/** Parses the router's heartbeat body ("k=v&k=v", plain text) into a sanitized object. */
++export function parseReport(text) {
++  const o = {};
++  for (const part of String(text || "").slice(0, 6000).split("&")) {
++    const i = part.indexOf("="); if (i < 1) continue;
++    const k = part.slice(0, i).trim(), raw = part.slice(i + 1).trim();
++    if (k === "pf") {
++      o.profiles = [...new Set(raw.split("|").map(x => x.trim()).filter(x => x && x.length <= 64 && /^[\p{L}\p{N} ._\-+@:]+$/u.test(x)))].slice(0, 100);
++      continue;
++    }
++    const v = raw.slice(0, 80);
++    if (!["v", "board", "cpu", "uptime", "active", "name"].includes(k)) continue;
++    o[k] = ["cpu", "active"].includes(k) ? (Number.isFinite(Number(v)) ? Number(v) : 0) : v.replace(/[^\p{L}\p{N} ._\-+@:()]/gu, "");
++  }
++  return o;
++}
++
++export function agentSource({ baseUrl, token }) {
++  const base = normalizeBaseUrl(baseUrl);
++  if (!/^mmag_[A-Za-z0-9_-]{20,}$/.test(token)) throw new Error("BAD_TOKEN");
++  return [
++    `:local base "${base}";`,
++    `:local tk "${token}";`,
++    `:local pf "";`,
++    `:do { :foreach i in=[/ip hotspot user profile find] do={ :set pf ($pf . [/ip hotspot user profile get $i name] . "|") } } on-error={};`,
++    `:local d "";`,
++    `:do { :set d ("v=" . [/system resource get version] . "&board=" . [/system resource get board-name] . "&cpu=" . [/system resource get cpu-load] . "&uptime=" . [/system resource get uptime] . "&active=" . [:len [/ip hotspot active find]] . "&name=" . [/system identity get name] . "&pf=" . $pf) } on-error={};`,
++    `:do { /file remove [find where name="mm-jobs.rsc"] } on-error={};`,
++    `/tool fetch url=($base . "/api/agent/sync") http-method=post http-data=$d http-header-field=("Content-Type: text/plain,X-Agent-Token: " . $tk) dst-path="mm-jobs.rsc" ${FETCH_OPTS};`,
++    `:delay 2s;`,
++    `:if ([:len [/file find where name="mm-jobs.rsc"]] > 0) do={ /import file-name=mm-jobs.rsc; /file remove [find where name="mm-jobs.rsc"] };`
++  ].join("\n");
++}
++export const AGENT_POLICY = "read,write,test,policy,ftp,sensitive";
++
++export function buildEnrollScript({ baseUrl, token, intervalSec = 30, includeCa = true, caUrl = "https://curl.se/ca/cacert.pem" }) {
++  const base = normalizeBaseUrl(baseUrl);
++  const interval = Math.min(Math.max(Math.floor(Number(intervalSec)) || 30, 10), 300);
++  const src = agentSource({ baseUrl: base, token }).split("\n").map(escRos).join("\\n");
++  const lines = [
++    "# MICRO-MAX Agent — paste into Winbox > New Terminal (RouterOS 6.49+ / 7.x)",
++    "# Requires: DNS configured on the router and correct date/time (NTP) for certificate checks.",
++    "# Re-running this script is safe (it replaces the previous agent)."
++  ];
++  if (includeCa) lines.push(
++    `/tool fetch url="${caUrl}" mode=https check-certificate=no dst-path="mm-ca.pem"`,
++    ":delay 3s",
++    ':do { /certificate import file-name=mm-ca.pem passphrase="" } on-error={}',
++    ':do { /file remove [find where name="mm-ca.pem"] } on-error={}'
++  );
++  const pol = "read,write,test,policy,ftp,sensitive";
++  lines.push(
++    ':do { /system scheduler remove [find where name="micromax-agent"] } on-error={}',
++    ':do { /system script remove [find where name="micromax-agent"] } on-error={}',
++    `/system script add name=micromax-agent policy=${pol} source="${src}"`,
++    `/system scheduler add name=micromax-agent interval=${interval}s start-time=startup policy=${pol} on-event="/system script run micromax-agent"`,
++    '/system script run micromax-agent'
++  );
++  return lines.join("\n") + "\n";
++}
++
++export function buildDirectSetupScript({ allowFrom = [], apiUser = "micromax", apiPass, port = 8729, certCn = "micromax-api", days = 3650 }) {
++  const user = rosSafe(apiUser, { max: 32 }), pass = rosSafe(apiPass, { max: 64 });
++  if (!pass || pass.length < 12) throw new Error("WEAK_PASSWORD");
++  const cidrs = (allowFrom || []).map(x => String(x).trim()).filter(Boolean);
++  for (const c of cidrs) if (!/^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(c)) throw new Error("BAD_CIDR");
++  const p = Number(port); if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error("BAD_PORT");
++  const cn = rosSafe(certCn, { max: 40 });
++  const addr = cidrs.join(",");
++  const L = [
++    "# MICRO-MAX API-SSL setup — paste into Winbox > New Terminal",
++    `:do { /certificate add name=micromax-api common-name="${cn}" days-valid=${days} key-usage=digital-signature,key-encipherment,tls-server } on-error={}`,
++    "/certificate sign micromax-api",
++    ":delay 5s",
++    `/ip service set api-ssl certificate=micromax-api port=${p} disabled=no${addr ? ` address=${addr}` : ""}`,
++    "/ip service set api disabled=yes",
++    ':do { /user group add name=micromax policy=read,write,api,test,ftp,sensitive,policy } on-error={}',
++    `:do { /user remove [find where name="${user}"] } on-error={}`,
++    `/user add name="${user}" group=micromax password="${pass}"${addr ? ` address=${addr}` : ""}`
++  ];
++  if (addr) L.push(`/ip firewall filter add chain=input protocol=tcp dst-port=${p} src-address-list=!micromax-allow action=drop comment="MICRO-MAX: API-SSL allowlist" place-before=0`,
++    ...cidrs.map(c => `/ip firewall address-list add list=micromax-allow address=${c}`));
++  L.push(":put (\"Certificate fingerprint (paste into MICRO-MAX): \" . [/certificate get micromax-api fingerprint])");
++  return L.join("\n") + "\n";
++}
++
++/** Server-side card credentials for agent-mode routers (no RouterOS round-trip available). */
++export function generateCredentials({ count, prefix, digits, letters, passLen = 8, pin = false, taken = new Set() }) {
++  const pick = (alpha, n) => Array.from({ length: n }, () => alpha[crypto.randomInt(alpha.length)]).join("");
++  const out = []; const seen = new Set(taken); let guard = 0;
++  const pre = sanitizePrefix(prefix);
++  while (out.length < count && guard++ < count * 25 + 100) {
++    const u = pre + pick(USER_LETTERS, letters) + pick(USER_DIGITS, digits);
++    if (seen.has(u)) continue;
++    seen.add(u);
++    out.push({ username: u, password: pin ? u : pick(PASS_ALPHABET, passLen) });
++  }
++  if (out.length < count) {
++    // Random sampling stalls near exhaustion: enumerate the (small) remaining space instead.
++    const space = Math.pow(USER_LETTERS.length, letters) * Math.pow(10, digits);
++    if (space <= 5e6) {
++      const free = [];
++      for (let i = 0; i < space; i++) {
++        let n = i, d = "", l = "";
++        for (let k = 0; k < digits; k++) { d = USER_DIGITS[n % 10] + d; n = Math.floor(n / 10); }
++        for (let k = 0; k < letters; k++) { l = USER_LETTERS[n % USER_LETTERS.length] + l; n = Math.floor(n / USER_LETTERS.length); }
++        const u = pre + l + d;
++        if (!seen.has(u)) free.push(u);
++      }
++      while (out.length < count && free.length) {
++        const u = free.splice(crypto.randomInt(free.length), 1)[0];
++        out.push({ username: u, password: pin ? u : pick(PASS_ALPHABET, passLen) });
++      }
++    }
++  }
++  if (out.length < count) throw new Error("USERNAME_SPACE_EXHAUSTED");
++  return out;
++}
+diff --git a/backend/src/cards.js b/backend/src/cards.js
+index 11d132f..8a5ad8c 100644
+--- a/backend/src/cards.js
++++ b/backend/src/cards.js
+@@ -31,8 +31,9 @@ export function usernameRegex(prefix, letters, digits) {
+ }
+ 
+ // ---- RouterOS script: MikroTik itself generates usernames/passwords --------
+-export function buildGenScript({ count, prefix, digits, letters, passLen, pin, profile, comment }) {
++export function buildGenScript({ count, prefix, digits, letters, passLen, pin, profile, comment, limitUptime = "" }) {
+   assertSafeProfile(profile);
++  if (limitUptime && !/^\d{1,5}[smhdw]$/.test(limitUptime)) throw new Error("UNSAFE_LIMIT_UPTIME");
+   if (!/^[A-Za-z0-9:_\-]+$/.test(comment)) throw new Error("UNSAFE_COMMENT");
+   const parts = [`"${sanitizePrefix(prefix)}"`];
+   if (letters > 0) parts.push(`[:rndstr length=${letters} from="${USER_LETTERS}"]`);
+@@ -47,7 +48,7 @@ export function buildGenScript({ count, prefix, digits, letters, passLen, pin, p
+     `  :local u (${nameExpr})`,
+     "  :if ([:len [/ip hotspot user find where name=$u]] = 0) do={",
+     `    :local p ${passExpr}`,
+-    `    /ip hotspot user add name=$u password=$p profile="${profile}" comment="${comment}"`,
++    `    /ip hotspot user add name=$u password=$p profile="${profile}" comment="${comment}"${limitUptime ? ` limit-uptime=${limitUptime}` : ""}`,
+     "    :set made ($made + 1)",
+     "  }",
+     "}"
+@@ -76,7 +77,7 @@ async function runGenScript(ros, source) {
+  * resolves duplicates against the database. Regenerates until the count is met.
+  * dbHas(names) => Promise<Set<string>> of usernames already stored for this router.
+  */
+-export async function generateBatch({ ros, count, prefix, digits, letters, passLen = 8, pin = false, profile, batchId, dbHas, maxRounds = 6, chunk = 500 }) {
++export async function generateBatch({ ros, count, prefix, digits, letters, passLen = 8, pin = false, profile, batchId, dbHas, maxRounds = 6, chunk = 500, limitUptime = "" }) {
+   if (letters + digits === 0) throw new Error("USERNAME_FORMAT_EMPTY");
+   const comment = `MICRO-MAX:${batchId}`;
+   const kept = [];
+@@ -84,7 +85,7 @@ export async function generateBatch({ ros, count, prefix, digits, letters, passL
+   for (let round = 0; round < maxRounds && kept.length < count; round++) {
+     const need = count - kept.length;
+     for (let left = need; left > 0; left -= chunk) {
+-      await runGenScript(ros, buildGenScript({ count: Math.min(chunk, left), prefix, digits, letters, passLen, pin, profile, comment }));
++      await runGenScript(ros, buildGenScript({ count: Math.min(chunk, left), prefix, digits, letters, passLen, pin, profile, comment, limitUptime }));
+     }
+     const batchUsers = await ros.command("/ip/hotspot/user/print", [`?comment=${comment}`]);
+     const names = batchUsers.map(u => String(u.name || "")).filter(n => !kept.some(k => k.username === n));
+diff --git a/backend/src/fleet.js b/backend/src/fleet.js
+new file mode 100644
+index 0000000..7299af5
+--- /dev/null
++++ b/backend/src/fleet.js
+@@ -0,0 +1,47 @@
++// Fleet overview + server configuration doctor (pure, unit-tested).
++export function fleetSummary(routers = [], now = Date.now(), { onlineMs = 120000, cpuWarn = 85 } = {}) {
++  const items = routers.map(r => {
++    let status = "unknown";
++    if (r.mode === "agent") {
++      const t = r.agent_last_seen ? new Date(r.agent_last_seen).getTime() : null;
++      status = t === null ? "pending" : now - t < onlineMs ? "online" : "offline";
++    } else if (r.probe) status = r.probe.ok ? "online" : "offline";
++    const info = r.agent_info || {};
++    const cpu = Number.isFinite(Number(info.cpu)) && info.cpu !== undefined ? Number(info.cpu) : null;
++    const active = Number.isFinite(Number(info.active)) && info.active !== undefined ? Number(info.active) : null;
++    const issues = [];
++    if (status === "offline") issues.push("OFFLINE");
++    if (cpu !== null && cpu >= cpuWarn) issues.push("HIGH_CPU");
++    return { id: r.id, name: r.name, mode: r.mode, status, cpu, activeUsers: active, uptime: info.uptime || null, version: info.v || null, board: info.board || null, latencyMs: r.probe?.latencyMs ?? null, issues };
++  });
++  const count = s => items.filter(i => i.status === s).length;
++  const act = items.map(i => i.activeUsers).filter(v => v !== null);
++  const cpus = items.filter(i => i.status === "online" && i.cpu !== null).map(i => i.cpu);
++  return {
++    total: items.length, online: count("online"), offline: count("offline"), pending: count("pending"), unknown: count("unknown"),
++    activeUsers: act.reduce((a, b) => a + b, 0),
++    avgCpu: cpus.length ? Math.round(cpus.reduce((a, b) => a + b, 0) / cpus.length) : null,
++    attention: items.filter(i => i.issues.length), routers: items
++  };
++}
++
++export function configDoctor(env = {}, { dbOk = true } = {}) {
++  const checks = []; const add = (id, ok, level, message) => checks.push({ id, ok, level: ok ? "ok" : level, message });
++  const jwt = String(env.JWT_SECRET || ""), enc = String(env.ROUTER_ENCRYPTION_KEY || "");
++  add("DB", dbOk, "critical", dbOk ? "قاعدة البيانات تعمل" : "تعذر الاتصال بقاعدة البيانات");
++  add("JWT_SECRET", jwt.length >= 32 && !/replace|change-me/i.test(jwt), "critical", "JWT_SECRET يجب أن يكون 32 حرفاً فأكثر وعشوائياً");
++  add("ENC_KEY", enc.length >= 32 && !/replace|change-me/i.test(enc), "critical", "ROUTER_ENCRYPTION_KEY يجب أن يكون 32 حرفاً فأكثر وعشوائياً");
++  add("SECRETS_DISTINCT", !(jwt && jwt === enc), "warning", "استخدم قيمتين مختلفتين لـ JWT_SECRET و ROUTER_ENCRYPTION_KEY");
++  const cors = String(env.CORS_ORIGIN || "").split(",").map(x => x.trim()).filter(Boolean);
++  add("CORS", !cors.includes("*"), "critical", "CORS_ORIGIN يجب ألا يكون *");
++  let httpsBase = false; try { httpsBase = new URL(String(env.PUBLIC_BASE_URL || "")).protocol === "https:"; } catch {}
++  add("PUBLIC_BASE_URL", httpsBase, "warning", "PUBLIC_BASE_URL مطلوب (https) لتعمل سكربتات الراوتر البعيد (Agent)");
++  add("INSECURE_TLS", String(env.ALLOW_INSECURE_ROUTER_TLS).toLowerCase() !== "true", "warning", "ALLOW_INSECURE_ROUTER_TLS يعطل التحقق من الشهادات؛ استخدم تثبيت البصمة");
++  add("REGISTRATION", String(env.ALLOW_REGISTRATION).toLowerCase() !== "true", "warning", "ALLOW_REGISTRATION مفتوح: أي شخص يستطيع إنشاء حساب");
++  add("TRUST_PROXY", env.NODE_ENV !== "production" || String(env.TRUST_PROXY).toLowerCase() === "true", "warning", "خلف Render/Proxy اضبط TRUST_PROXY=true وإلا ستُحسب كل الطلبات من IP واحد");
++  add("PRIVATE_ON_CLOUD", !(env.RENDER && String(env.ALLOW_PRIVATE_ROUTER_HOSTS).toLowerCase() === "true"), "info", "ALLOW_PRIVATE_ROUTER_HOSTS لا فائدة منه على سيرفر سحابي (لا يصل لشبكتك المحلية)");
++  const pay = String(env.ENABLE_ONLINE_PAYMENTS).toLowerCase() === "true";
++  add("PAYMENTS", !pay || !!(env.BINANCE_PAY_SECRET_KEY && env.BINANCE_PAY_CERTIFICATE_SN), "warning", "الدفع الإلكتروني مفعّل لكن مفاتيح Binance Pay ناقصة");
++  const bad = checks.filter(c => !c.ok);
++  return { healthy: !bad.some(c => c.level === "critical"), critical: bad.filter(c => c.level === "critical").length, warnings: bad.filter(c => c.level === "warning").length, checks };
++}
+diff --git a/backend/src/insights.js b/backend/src/insights.js
+new file mode 100644
+index 0000000..933711b
+--- /dev/null
++++ b/backend/src/insights.js
+@@ -0,0 +1,29 @@
++// Sales-velocity insights: stock runway, restock suggestions, peak hours, best plan.
++export function buildInsights({ plans = [], hours = [], targetDays = 10 }) {
++  const out = plans.map(p => {
++    const available = Number(p.available) || 0, s7 = Number(p.sold_7d) || 0, s30 = Number(p.sold_30d) || 0;
++    // Blend: recent week weighs more than the month average.
++    const dailyRate = s30 === 0 && s7 === 0 ? 0 : 0.6 * (s7 / 7) + 0.4 * (s30 / 30);
++    const daysLeft = dailyRate > 0 ? available / dailyRate : null;
++    let status = "ok";
++    if (dailyRate === 0) status = available === 0 ? "empty" : "idle";
++    else if (available === 0) status = "out";
++    else if (daysLeft < 2) status = "critical";
++    else if (daysLeft < 5) status = "low";
++    const raw = Math.max(0, Math.ceil(dailyRate * targetDays * 1.15) - available);
++    const suggestedRestock = raw === 0 ? 0 : Math.ceil(raw / 10) * 10;
++    return { planId: p.plan_id, name: p.name, price: Number(p.price) || 0, currency: p.currency || "", available, sold7d: s7, sold30d: s30,
++      revenue30d: Number(p.revenue_30d) || 0, dailyRate: Math.round(dailyRate * 100) / 100, daysLeft: daysLeft === null ? null : Math.round(daysLeft * 10) / 10, status, suggestedRestock };
++  });
++  const alerts = [];
++  for (const p of out) {
++    if (p.status === "out") alerts.push({ level: "critical", planId: p.planId, message: `نفدت كروت باقة ${p.name}. المقترح توليد ${p.suggestedRestock} كرت.` });
++    else if (p.status === "critical") alerts.push({ level: "critical", planId: p.planId, message: `كروت ${p.name} تكفي أقل من يومين (${p.available} كرت). المقترح توليد ${p.suggestedRestock}.` });
++    else if (p.status === "low") alerts.push({ level: "warning", planId: p.planId, message: `مخزون ${p.name} منخفض (يكفي حوالي ${Math.floor(p.daysLeft)} أيام).` });
++  }
++  const hh = Array.from({ length: 24 }, (_, h) => ({ hour: h, sales: 0 }));
++  for (const x of hours) { const h = Number(x.h ?? x.hour); if (Number.isInteger(h) && h >= 0 && h < 24) hh[h].sales += Number(x.n ?? x.sales) || 0; }
++  const peakHours = hh.filter(x => x.sales > 0).sort((a, b) => b.sales - a.sales || a.hour - b.hour).slice(0, 3);
++  const best = [...out].filter(p => p.revenue30d > 0).sort((a, b) => b.revenue30d - a.revenue30d)[0] || null;
++  return { plans: out, alerts, peakHours, bestPlan: best ? { planId: best.planId, name: best.name, revenue30d: best.revenue30d } : null };
++}
+diff --git a/backend/src/netguard.js b/backend/src/netguard.js
+new file mode 100644
+index 0000000..9759025
+--- /dev/null
++++ b/backend/src/netguard.js
+@@ -0,0 +1,112 @@
++// Network guard: prevents the backend from being used to reach loopback, cloud-metadata
++// or (optionally) private networks (SSRF), and validates ports. Pure helpers are unit-tested.
++import net from "node:net";
++import dns from "node:dns";
++import http from "node:http";
++import https from "node:https";
++
++function v4ToInt(ip) {
++  const p = ip.split(".").map(Number);
++  return ((p[0] << 24) >>> 0) + (p[1] << 16) + (p[2] << 8) + p[3];
++}
++function inV4(ip, base, bits) {
++  const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
++  return ((v4ToInt(ip) & mask) >>> 0) === ((v4ToInt(base) & mask) >>> 0);
++}
++
++/** Returns "blocked" (never allowed), "private" (allowed only for on-prem deployments) or "public". */
++export function classifyIp(ip) {
++  ip = String(ip || "").trim().toLowerCase();
++  if (net.isIPv6(ip)) {
++    const m = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
++    if (m) return classifyIp(m[1]);
++    if (ip === "::" || ip === "::1") return "blocked";
++    if (/^fe[89ab]/.test(ip)) return "blocked";          // link-local fe80::/10
++    if (/^ff/.test(ip)) return "blocked";                 // multicast
++    if (/^f[cd]/.test(ip)) return "private";              // unique local fc00::/7
++    return "public";
++  }
++  if (!net.isIPv4(ip)) return "blocked";
++  if (inV4(ip, "0.0.0.0", 8) || inV4(ip, "127.0.0.0", 8) || inV4(ip, "169.254.0.0", 16) || inV4(ip, "224.0.0.0", 4) || inV4(ip, "240.0.0.0", 4)) return "blocked";
++  if (inV4(ip, "10.0.0.0", 8) || inV4(ip, "172.16.0.0", 12) || inV4(ip, "192.168.0.0", 16) || inV4(ip, "100.64.0.0", 10)) return "private";
++  return "public";
++}
++
++export function isAddressAllowed(ip, { allowPrivate = false } = {}) {
++  const c = classifyIp(ip);
++  return c === "public" || (c === "private" && allowPrivate);
++}
++
++export function validHostname(h) {
++  h = String(h || "").trim();
++  if (!h || h.length > 253) return false;
++  if (net.isIP(h)) return true;
++  return /^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(h);
++}
++
++export function parsePorts(csv, fallback) {
++  const list = String(csv || "").split(",").map(x => Number(x.trim())).filter(n => Number.isInteger(n) && n > 0 && n < 65536);
++  return list.length ? list : fallback;
++}
++
++export function netConfigFromEnv(env = process.env) {
++  return {
++    allowPrivate: String(env.ALLOW_PRIVATE_ROUTER_HOSTS || "false").toLowerCase() === "true",
++    routerPorts: parsePorts(env.ROUTER_ALLOWED_PORTS, [8728, 8729]),
++    portalPorts: parsePorts(env.PORTAL_ALLOWED_PORTS, [80, 443, 8080, 8443])
++  };
++}
++
++/** Syntax-level validation (no DNS). Throws Error(code). */
++export function assertRouterTarget(host, port, cfg = netConfigFromEnv()) {
++  host = String(host || "").trim();
++  if (!validHostname(host)) throw new Error("INVALID_HOST");
++  const p = Number(port);
++  if (!Number.isInteger(p) || !cfg.routerPorts.includes(p)) throw new Error("PORT_NOT_ALLOWED");
++  if (net.isIP(host) && !isAddressAllowed(host, cfg)) throw new Error("HOST_NOT_ALLOWED");
++  return { host, port: p };
++}
++
++/** dns.lookup replacement used at connect time, so DNS-rebinding cannot bypass the guard. */
++export function guardedLookup(cfg = netConfigFromEnv()) {
++  return (hostname, options, callback) => {
++    if (typeof options === "function") { callback = options; options = {}; }
++    dns.lookup(hostname, { ...options, all: true }, (err, addrs) => {
++      if (err) return callback(err);
++      const ok = addrs.filter(a => isAddressAllowed(a.address, cfg));
++      if (!ok.length) return callback(Object.assign(new Error("HOST_NOT_ALLOWED"), { code: "HOST_NOT_ALLOWED" }));
++      if (options && options.all) return callback(null, ok);
++      callback(null, ok[0].address, ok[0].family);
++    });
++  };
++}
++
++/** GET with SSRF protection: guarded DNS, manual redirects (max 3), size and time limits. */
++export async function safeGet(urlString, { cfg = netConfigFromEnv(), timeoutMs = 5000, maxBytes = 500000, maxRedirects = 3 } = {}) {
++  let url = new URL(urlString);
++  for (let hop = 0; hop <= maxRedirects; hop++) {
++    if (!["http:", "https:"].includes(url.protocol)) throw new Error("HOTSPOT_URL_MUST_BE_HTTP_OR_HTTPS");
++    const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
++    if (!cfg.portalPorts.includes(port)) throw new Error("PORT_NOT_ALLOWED");
++    const bare = url.hostname.replace(/^\[|\]$/g, "");
++    if (!validHostname(bare)) throw new Error("INVALID_HOST");
++    // Node skips the DNS lookup hook for IP literals, so they must be checked explicitly.
++    if (net.isIP(bare) && !isAddressAllowed(bare, cfg)) throw new Error("HOST_NOT_ALLOWED");
++    const mod = url.protocol === "https:" ? https : http;
++    const res = await new Promise((resolve, reject) => {
++      const req = mod.request(url, { method: "GET", lookup: guardedLookup(cfg), timeout: timeoutMs, headers: { "User-Agent": "MICRO-MAX-HotSpot-QR-Check/1.0" } }, resolve);
++      req.on("timeout", () => req.destroy(new Error("TIMEOUT")));
++      req.on("error", reject);
++      req.end();
++    });
++    if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
++      res.resume();
++      url = new URL(res.headers.location, url);
++      continue;
++    }
++    const chunks = []; let size = 0;
++    for await (const c of res) { size += c.length; if (size > maxBytes) { res.destroy(); break; } chunks.push(c); }
++    return { status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 300, body: Buffer.concat(chunks).toString("utf8").slice(0, maxBytes) };
++  }
++  throw new Error("TOO_MANY_REDIRECTS");
++}
+diff --git a/backend/src/profiles.js b/backend/src/profiles.js
+new file mode 100644
+index 0000000..06c7a17
+--- /dev/null
++++ b/backend/src/profiles.js
+@@ -0,0 +1,27 @@
++// Helpers for importing REAL MikroTik hotspot user profiles.
++/** RouterOS time ("1w2d3h4m5s", "1d12:00:00", "12:00:00", "30m") -> minutes (0 when empty/unknown). */
++export function parseRosDuration(v) {
++  const s = String(v ?? "").trim();
++  if (!s || s === "0s" || s === "00:00:00") return 0;
++  let secs = 0, rest = s, any = false;
++  const hms = rest.match(/(\d+):(\d{1,2}):(\d{1,2})$/);
++  if (hms) { secs += Number(hms[1]) * 3600 + Number(hms[2]) * 60 + Number(hms[3]); rest = rest.slice(0, hms.index); any = true; }
++  const unit = { w: 604800, d: 86400, h: 3600, m: 60, s: 1 };
++  const re = /(\d+)([wdhms])/g; let m;
++  while ((m = re.exec(rest))) { secs += Number(m[1]) * unit[m[2]]; any = true; }
++  return any ? Math.ceil(secs / 60) : 0;
++}
++
++/** One row of /ip/hotspot/user/profile/print -> local profile columns. */
++export function mapRouterProfile(x) {
++  const su = Number(x["shared-users"] || 1);
++  const sessionTimeout = String(x["session-timeout"] || "");
++  return {
++    name: String(x.name || ""),
++    rate_limit: String(x["rate-limit"] || ""),
++    session_timeout: sessionTimeout,
++    idle_timeout: String(x["idle-timeout"] || ""),
++    shared_users: Number.isInteger(su) && su > 0 ? su : 1,
++    duration_minutes: parseRosDuration(sessionTimeout)
++  };
++}
+diff --git a/backend/src/qrcheck.js b/backend/src/qrcheck.js
+new file mode 100644
+index 0000000..b747db3
+--- /dev/null
++++ b/backend/src/qrcheck.js
+@@ -0,0 +1,19 @@
++// Static analysis of a MikroTik hotspot login.html: can a scanned card QR log in without typing?
++// (Deliberately static: the file comes from the router and must never be executed on the server.)
++export function analyzeLoginHtml(html) {
++  const h = String(html || "");
++  const hasLoginForm = /<form[^>]*>/i.test(h) && /name=["']username["']/i.test(h) && /name=["']password["']/i.test(h);
++  const actionOk = /action=["']\$\(link-login-only\)["']/i.test(h) || /action=["'][^"']*\/login/i.test(h);
++  const readsQuery = /URLSearchParams|location\.search/.test(h);
++  const readsAuto = /['"]auto['"]/.test(h);
++  const hasAutoSubmit = /\.submit\s*\(|requestSubmit\s*\(/.test(h);
++  const stripsCredentials = /history\.replaceState/.test(h);
++  const autoLogin = hasLoginForm && actionOk && readsQuery && readsAuto && hasAutoSubmit;
++  const warnings = [];
++  if (!hasLoginForm) warnings.push("LOGIN_FORM_NOT_DETECTED");
++  if (hasLoginForm && !actionOk) warnings.push("FORM_ACTION_NOT_LINK_LOGIN_ONLY");
++  if (hasLoginForm && !autoLogin) warnings.push("LOGIN_HTML_DOES_NOT_AUTO_SUBMIT_FROM_QR");
++  if (autoLogin && !stripsCredentials) warnings.push("CREDENTIALS_REMAIN_IN_BROWSER_HISTORY");
++  if (h.length === 4095 || h.length === 4096) warnings.push("FILE_READ_MAY_BE_TRUNCATED");
++  return { hasLoginForm, actionOk, readsQuery, readsAuto, hasAutoSubmit, stripsCredentials, autoLogin, warnings };
++}
+diff --git a/backend/src/routeros.js b/backend/src/routeros.js
+index 772f736..18351c6 100644
+--- a/backend/src/routeros.js
++++ b/backend/src/routeros.js
+@@ -20,16 +20,27 @@ function sentence(words) {
+ }
+ 
+ export class RouterOS {
+-  constructor({host, port=8728, username, password, tls=false, ca, allowInsecureTls=false, timeout=10000}) {
++  constructor({host, port=8728, username, password, tls=false, ca, allowInsecureTls=false, timeout=10000, lookup, pinSha256}) {
+     this.host=host; this.port=port; this.username=username; this.password=password;
+     this.tls=tls; this.ca=ca; this.allowInsecureTls=allowInsecureTls; this.timeout=timeout; this.socket=null; this.buffer=Buffer.alloc(0);
++    this.lookup=lookup||undefined;
++    this.pinSha256=pinSha256?String(pinSha256).replace(/[^0-9a-fA-F]/g,"").toLowerCase():"";
+   }
+   async connect() {
+     this.socket = await new Promise((resolve,reject)=>{
+-      const s = (this.tls ? tls.connect({host:this.host,port:this.port,ca:this.ca || undefined,rejectUnauthorized:!this.allowInsecureTls})
+-                          : net.createConnection({host:this.host,port:this.port}));
++      const pin=this.pinSha256;
++      // With a pinned fingerprint (router self-signed certificate) the chain check is replaced by the pin.
++      const s = (this.tls ? tls.connect({host:this.host,port:this.port,ca:this.ca || undefined,lookup:this.lookup,rejectUnauthorized:pin?false:!this.allowInsecureTls,servername:net.isIP(this.host)?undefined:this.host})
++                          : net.createConnection({host:this.host,port:this.port,lookup:this.lookup}));
+       const timer=setTimeout(()=>{s.destroy();reject(new Error("TIMEOUT"))},this.timeout);
+-      s.once("connect",()=>{clearTimeout(timer);resolve(s)});
++      s.once(this.tls?"secureConnect":"connect",()=>{
++        clearTimeout(timer);
++        if(this.tls&&pin){
++          const fp=String(s.getPeerCertificate()?.fingerprint256||"").replace(/:/g,"").toLowerCase();
++          if(fp!==pin){s.destroy();return reject(Object.assign(new Error("CERT_PIN_MISMATCH"),{code:"CERT_PIN_MISMATCH"}));}
++        }
++        resolve(s);
++      });
+       s.once("error",e=>{clearTimeout(timer);reject(e)});
+     });
+     await this.write(sentence(["/login"]));
+@@ -45,7 +56,11 @@ export class RouterOS {
+       await this.write(sentence(["/login",`=name=${this.username}`,`=password=${this.password}`]));
+       reply=await this.readSentenceSet();
+     }
+-    if (reply.some(x=>x.startsWith("!trap"))) throw new Error("AUTH_FAILED");
++    if (reply.some(x=>x.startsWith("!trap"))) {
++      const err=new Error("AUTH_FAILED"); err.code="AUTH_FAILED";
++      err.routerMessage=String((reply.find(x=>x.startsWith("=message="))||"").slice(9)).slice(0,160);
++      throw err;
++    }
+   }
+   async write(buf) {
+     return new Promise((resolve,reject)=>{
+@@ -85,10 +100,15 @@ export class RouterOS {
+   async readBytes(n) {
+     while(this.buffer.length<n) {
+       const chunk=await new Promise((resolve,reject)=>{
++        const sock=this.socket;
++        if(!sock||sock.destroyed)return reject(Object.assign(new Error("CONNECTION_CLOSED"),{code:"CONNECTION_CLOSED"}));
++        // A silent or closed router must fail fast instead of hanging the HTTP request forever.
++        const timer=setTimeout(()=>{cleanup();try{sock.destroy();}catch{}reject(Object.assign(new Error("TIMEOUT"),{code:"TIMEOUT"}));},this.timeout);
+         const onData=d=>{cleanup();resolve(d)};
+         const onErr=e=>{cleanup();reject(e)};
+-        const cleanup=()=>{this.socket.off("data",onData);this.socket.off("error",onErr)};
+-        this.socket.once("data",onData); this.socket.once("error",onErr);
++        const onEnd=()=>{cleanup();reject(Object.assign(new Error("CONNECTION_CLOSED"),{code:"CONNECTION_CLOSED"}))};
++        const cleanup=()=>{clearTimeout(timer);sock.off("data",onData);sock.off("error",onErr);sock.off("end",onEnd);sock.off("close",onEnd)};
++        sock.once("data",onData); sock.once("error",onErr); sock.once("end",onEnd); sock.once("close",onEnd);
+       });
+       this.buffer=Buffer.concat([this.buffer,chunk]);
+     }
+diff --git a/backend/src/security.js b/backend/src/security.js
+new file mode 100644
+index 0000000..f19e043
+--- /dev/null
++++ b/backend/src/security.js
+@@ -0,0 +1,63 @@
++// Read-only MikroTik security audit. Pure: takes data already read from RouterOS and returns findings,
++// a score and a fix script. Fixes are NEVER applied automatically (a wrong firewall/service change can lock the admin out).
++const T = v => v === true || ["true", "yes"].includes(String(v).toLowerCase());
++const WEIGHT = { high: 20, medium: 10, low: 4, info: 0 };
++const openAddr = a => { const s = String(a || "").trim(); return s === "" || s === "0.0.0.0/0"; };
++
++export function auditSecurity(data = {}, { apiTls = false } = {}) {
++  const findings = [];
++  const add = (id, level, title, detail, fix = null) => findings.push({ id, level, title, detail, fix });
++  const services = new Map((data.services || []).map(s => [String(s.name), s]));
++  const on = n => services.has(n) && !T(services.get(n).disabled);
++  const exposed = n => on(n) && openAddr(services.get(n).address);
++
++  if (data.services) {
++    if (on("telnet")) add("SVC_TELNET", "high", "خدمة Telnet مفعّلة", "Telnet ينقل كلمة المرور نصاً صريحاً.", { commands: ["/ip service disable telnet"] });
++    if (on("ftp")) add("SVC_FTP", "high", "خدمة FTP مفعّلة", "FTP غير مشفّر. استخدم SFTP/WinBox بدلاً منه.", { commands: ["/ip service disable ftp"] });
++    if (on("www")) add("SVC_WWW", "medium", "واجهة HTTP للإدارة مفعّلة", "WebFig عبر HTTP بلا تشفير.", { commands: ["/ip service disable www"] });
++    if (on("api")) {
++      if (apiTls) add("SVC_API_PLAIN", "medium", "API غير المشفر (8728) مفعّل", "التطبيق يستخدم API-SSL، يمكن تعطيل API العادي.", { commands: ["/ip service disable api"] });
++      else add("SVC_API_PLAIN", "medium", "التطبيق متصل عبر API غير مشفر", "كلمة مرور الراوتر تعبر الشبكة دون تشفير. انتقل إلى API-SSL (8729) مع تثبيت البصمة، ثم عطّل API العادي. لا يُعطَّل الآن حتى لا ينقطع التطبيق.", { commands: ["/ip service set api address=<BACKEND-IP/32>"], needsInput: true, risky: true });
++    }
++    if (exposed("winbox")) add("SVC_WINBOX_OPEN", "medium", "WinBox مفتوح لأي عنوان", "حدّد عناوين الإدارة المسموحة.", { commands: ["/ip service set winbox address=<YOUR-ADMIN-IP/32>"], needsInput: true });
++    if (exposed("ssh")) add("SVC_SSH_OPEN", "low", "SSH مفتوح لأي عنوان", "حدّد العناوين المسموحة.", { commands: ["/ip service set ssh address=<YOUR-ADMIN-IP/32>"], needsInput: true });
++    if (exposed("api-ssl")) add("SVC_APISSL_OPEN", "low", "API-SSL مفتوح لأي عنوان", "حدّد عنوان السيرفر المسموح (Outbound IPs).", { commands: ["/ip service set api-ssl address=<BACKEND-IP/32>"], needsInput: true });
++  }
++
++  let hasInputDrop = null;
++  if (data.firewall) {
++    hasInputDrop = data.firewall.some(r => !T(r.disabled) && r.chain === "input" && r.action === "drop");
++    if (!hasInputDrop) add("FW_NO_INPUT_DROP", "high", "لا توجد قاعدة drop على سلسلة input", "الراوتر نفسه (WinBox/API/DNS) قابل للوصول من الإنترنت. أضف سياسة افتراضية: السماح لـ established/related ولشبكة LAN ثم drop لما تبقى.", {
++      commands: [
++        '/ip firewall filter add chain=input action=accept connection-state=established,related,untracked comment="MM: allow established"',
++        '/ip firewall filter add chain=input action=accept in-interface-list=LAN comment="MM: allow LAN"',
++        '/ip firewall filter add chain=input action=drop in-interface-list=!LAN comment="MM: drop the rest"'
++      ], needsInput: true, risky: true });
++  }
++  if (data.dns && T(data.dns["allow-remote-requests"]) && hasInputDrop === false)
++    add("DNS_OPEN_RESOLVER", "high", "DNS يقبل طلبات خارجية بلا حماية", "قد يُستغل الراوتر في هجمات تضخيم DNS. لا تعطّل الخاصية (عملاء HotSpot يعتمدون عليها)؛ أضف drop لمنفذ 53 من WAN.", { commands: ['/ip firewall filter add chain=input action=drop protocol=udp dst-port=53 in-interface-list=WAN', '/ip firewall filter add chain=input action=drop protocol=tcp dst-port=53 in-interface-list=WAN'], needsInput: true, risky: true });
++
++  if (data.discovery && String(data.discovery["discover-interface-list"] || "") === "all")
++    add("DISCOVERY_ALL", "low", "اكتشاف الجوار على كل الواجهات", "يكشف اسم الجهاز والإصدار للشبكة الخارجية.", { commands: ["/ip neighbor discovery-settings set discover-interface-list=LAN"], needsInput: true });
++  if (data.macServer && String(data.macServer["allowed-interface-list"] || "") === "all")
++    add("MACSERVER_ALL", "low", "MAC-Telnet/WinBox على كل الواجهات", "يسمح بالدخول عبر الطبقة الثانية من أي واجهة.", { commands: ["/tool mac-server set allowed-interface-list=LAN"], needsInput: true });
++
++  if (data.users && data.users.some(u => u.name === "admin" && !T(u.disabled)))
++    add("ADMIN_DEFAULT_USER", "medium", "المستخدم الافتراضي admin مفعّل", "اسم معروف يسهّل التخمين. أنشئ مستخدماً باسم مختلف وكلمة مرور قوية ثم عطّل admin.", { commands: ["/user add name=<NEW-ADMIN> group=full password=<STRONG-PASSWORD>", "/user disable admin"], needsInput: true, risky: true });
++
++  if (data.ssh && !T(data.ssh["strong-crypto"])) add("SSH_WEAK_CRYPTO", "low", "SSH بتشفير غير صارم", "فعّل strong-crypto.", { commands: ["/ip ssh set strong-crypto=yes"] });
++
++  const major = parseInt(String(data.resource?.version || "").trim().split(".")[0], 10);
++  if (Number.isInteger(major) && major < 7) add("OS_V6", "low", `الإصدار ${data.resource.version}`, "RouterOS 6 أقدم؛ فكّر بالترقية إلى 7.x بعد اختبارها (قد تتغير بعض الأوامر).");
++
++  if (data.hotspotProfiles && data.hotspotProfiles.some(p => /http-pap/.test(String(p["login-by"] || "")) && !/https/.test(String(p["login-by"] || ""))))
++    add("HOTSPOT_PAP_HTTP", "info", "دخول HotSpot عبر http-pap بدون HTTPS", "هذا مطلوب لدخول QR التلقائي، لكن كلمة مرور الكرت تعبر الواي فاي نصاً. مقبول لكروت الاستخدام المؤقت؛ استخدم كروت PIN قصيرة الصلاحية.");
++
++  const penalty = findings.reduce((n, f) => n + WEIGHT[f.level], 0);
++  const score = Math.max(0, 100 - penalty);
++  const grade = score >= 90 ? "A" : score >= 75 ? "B" : score >= 60 ? "C" : score >= 40 ? "D" : "F";
++  const safe = findings.filter(f => f.fix && !f.fix.needsInput && !f.fix.risky).flatMap(f => f.fix.commands);
++  const counts = { high: 0, medium: 0, low: 0, info: 0 };
++  for (const f of findings) counts[f.level]++;
++  return { score, grade, counts, findings, fixScript: safe.length ? "# MICRO-MAX: safe fixes (review before running)\n" + safe.join("\n") + "\n" : "" };
++}
+diff --git a/backend/src/server.js b/backend/src/server.js
+index e21700f..c5a22b2 100644
+--- a/backend/src/server.js
++++ b/backend/src/server.js
+@@ -15,6 +15,13 @@ import PDFDocument from "pdfkit";
+ import ExcelJS from "exceljs";
+ import { RouterOS } from "./routeros.js";
+ import { assertPinStrength, buildWifiQr, generateBatch, sanitizePrefix, usernameSpace, usernameRegex, qrSecretFrom, buildQrUrl, parseQr, auditCards, scanVerdict, classifyRouterUser } from "./cards.js";
++import { analyzeLoginHtml } from "./qrcheck.js";
++import { mapRouterProfile } from "./profiles.js";
++import { auditSecurity } from "./security.js";
++import { fleetSummary, configDoctor } from "./fleet.js";
++import { buildInsights } from "./insights.js";
++import { assertRouterTarget, guardedLookup, netConfigFromEnv, safeGet, isAddressAllowed } from "./netguard.js";
++import { agentSource, AGENT_POLICY, newAgentToken, hashToken, renderJobScript, parseReport, buildEnrollScript, buildDirectSetupScript, generateCredentials, rosSafe } from "./agent.js";
+ import { binancePayConfigured, createBinancePayOrder, queryBinancePayOrder, verifyBinancePayNotification } from "./binancePay.js";
+ 
+ dotenv.config();
+@@ -23,7 +30,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+ const app = express();
+ const allowedOrigins = String(process.env.CORS_ORIGIN || "").split(",").map(x => x.trim()).filter(Boolean);
+ if (allowedOrigins.includes("*") && process.env.NODE_ENV === "production") throw new Error("CORS_ORIGIN must be an explicit allowlist in production");
+-app.set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : false);
++app.set("trust proxy", (process.env.TRUST_PROXY === "true" || !!process.env.RENDER) ? 1 : false);
+ app.disable("x-powered-by");
+ app.use(helmet({ contentSecurityPolicy: false }));
+ app.use(cors({ origin(origin, callback) {
+@@ -33,9 +40,10 @@ app.use(cors({ origin(origin, callback) {
+ app.use(express.json({ limit: "2mb", verify: (req, _res, buf) => { req.rawBody = Buffer.from(buf); } }));
+ 
+ const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
+-const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, skip: req => req.path === "/health" });
++const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, skip: req => req.path === "/health" || req.path.startsWith("/agent/") });
+ app.use("/api", apiLimiter);
+ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID || undefined);
++const registrationEnabled = String(process.env.ALLOW_REGISTRATION || "false").toLowerCase() === "true";
+ const configuredJwtSecret = String(process.env.JWT_SECRET || "");
+ const configuredEncryptionSecret = String(process.env.ROUTER_ENCRYPTION_KEY || "");
+ const devMode = ["development","test"].includes(process.env.NODE_ENV);
+@@ -53,8 +61,26 @@ function auth(req,res,next){ const h=req.headers.authorization||""; try{ const t
+ const decPass = v => String(v||"").startsWith("enc:") ? decrypt(String(v).slice(4)) : String(v||"");
+ const encPass = v => "enc:" + encrypt(v);
+ function cardOut(row){ const password = decPass(row.password); const passwordMode = password===row.username?"pin":"userpass"; const qr = row.portal_url ? buildQrUrl({portalUrl:row.portal_url,username:row.username,password:passwordMode==="pin"?"":password,cardId:row.id,secret:QR_SECRET}) : (row.qr_content||null); return { ...row, password, passwordMode, qr_content: qr, qrContent: qr, wifiQr: buildWifiQr(row.ssid) }; }
+-async function bootstrapAdmin({email,hash=null,googleSub=null}){ const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query("SELECT pg_advisory_xact_lock(7734001)"); const n=(await client.query("SELECT count(*)::int n FROM users")).rows[0].n; if(n>0){ await client.query("ROLLBACK"); return null; } const id=crypto.randomUUID(); const r=await client.query("INSERT INTO users(id,email,password_hash,google_sub,role) VALUES($1,$2,$3,$4,'admin') RETURNING id,email,role",[id,email,hash,googleSub]); await client.query("INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",[id]); await client.query("COMMIT"); return r.rows[0]; }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; } finally{ client.release(); } }
+-async function registerUser({email,hash}){ const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query("SELECT pg_advisory_xact_lock(7734002)"); const exists=await client.query("SELECT id FROM users WHERE email=$1",[email]); if(exists.rowCount){ await client.query("ROLLBACK"); return null; } const id=crypto.randomUUID(); const r=await client.query("INSERT INTO users(id,email,password_hash,role) VALUES($1,$2,$3,'staff') RETURNING id,email,role",[id,email,hash]); await client.query("INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",[id]); await client.query("COMMIT"); return r.rows[0]; }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; } finally{ client.release(); } }
++async function bootstrapAdmin({email,hash=null,googleSub=null}){ const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query("SELECT pg_advisory_xact_lock(7734001)"); const n=(await client.query("SELECT count(*)::int n FROM users")).rows[0].n; if(n>0 && !registrationEnabled){ await client.query("ROLLBACK"); return null; } const id=crypto.randomUUID(); const accountRole=n===0?"admin":"staff"; const r=await client.query("INSERT INTO users(id,email,password_hash,google_sub,role) VALUES($1,$2,$3,$4,$5) RETURNING id,email,role",[id,email,hash,googleSub,accountRole]); await client.query("INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",[id]); await client.query("COMMIT"); return r.rows[0]; }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; } finally{ client.release(); } }
++const NET_CFG = netConfigFromEnv();
++const NET_LOOKUP = guardedLookup(NET_CFG);
++function rosFor(r,extra={}){
++  if(r.mode==="agent") throw Error("ROUTER_IS_AGENT_MODE");
++  if(net.isIP(r.host)&&!isAddressAllowed(r.host,NET_CFG)) throw Error("HOST_NOT_ALLOWED");
++  return new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,pinSha256:r.tls_fingerprint||undefined,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",lookup:NET_LOOKUP,...extra});
++}
++const AGENT_INTERVAL_SEC=30;
++function agentBase(req){
++  const configured=String(process.env.PUBLIC_BASE_URL||"").trim();
++  if(configured) return new URL(configured).origin;
++  if(process.env.NODE_ENV==="production") throw Error("PUBLIC_BASE_URL_REQUIRED");
++  return `${req.protocol}://${req.get("host")}`;
++}
++function fpNormalize(v){const f=String(v||"").replace(/[^0-9a-fA-F]/g,"").toLowerCase();if(f&&f.length!==64)throw Error("INVALID_FINGERPRINT");return f;}
++function guardRouterInput(host,port){
++  try{ return assertRouterTarget(host,port,NET_CFG); }
++  catch(e){ const err=Error(e.message); err.status=400; throw err; }
++}
+ function role(...roles){ return (req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:"FORBIDDEN"}); }
+ async function audit(userId,action,entity,entityId,details={}){ await pool.query("INSERT INTO audit_logs(id,user_id,action,entity,entity_id,details) VALUES(gen_random_uuid(),$1,$2,$3,$4,$5)",[userId,action,entity,entityId,JSON.stringify(details)]); }
+ 
+@@ -79,6 +105,17 @@ ALTER TABLE cards ADD COLUMN IF NOT EXISTS batch_id UUID;
+  ALTER TABLE cards ADD COLUMN IF NOT EXISTS qr_content TEXT;
+  ALTER TABLE cards ADD COLUMN IF NOT EXISTS portal_url TEXT;
+  ALTER TABLE cards ADD COLUMN IF NOT EXISTS ssid TEXT;
++ ALTER TABLE cards ADD COLUMN IF NOT EXISTS provision_state TEXT NOT NULL DEFAULT 'ready';
++ ALTER TABLE routers ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'direct';
++ ALTER TABLE routers ADD COLUMN IF NOT EXISTS tls_fingerprint TEXT;
++ ALTER TABLE routers ADD COLUMN IF NOT EXISTS agent_token_hash TEXT;
++ ALTER TABLE routers ADD COLUMN IF NOT EXISTS agent_last_seen TIMESTAMPTZ;
++ ALTER TABLE routers ADD COLUMN IF NOT EXISTS agent_info JSONB;
++ ALTER TABLE routers ADD COLUMN IF NOT EXISTS agent_offline_notified BOOLEAN NOT NULL DEFAULT false;
++ ALTER TABLE hotspot_profiles ADD COLUMN IF NOT EXISTS provision_state TEXT NOT NULL DEFAULT 'ready';
++ CREATE UNIQUE INDEX IF NOT EXISTS routers_agent_token_idx ON routers(agent_token_hash) WHERE agent_token_hash IS NOT NULL;
++ CREATE TABLE IF NOT EXISTS agent_jobs(id UUID PRIMARY KEY,router_id UUID NOT NULL REFERENCES routers(id) ON DELETE CASCADE,type TEXT NOT NULL,payload JSONB NOT NULL,card_id UUID,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,error TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),sent_at TIMESTAMPTZ,done_at TIMESTAMPTZ);
++ CREATE INDEX IF NOT EXISTS agent_jobs_router_status_idx ON agent_jobs(router_id,status,created_at);
+  CREATE TABLE IF NOT EXISTS app_settings(user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,theme TEXT NOT NULL DEFAULT 'light',currency TEXT NOT NULL DEFAULT 'XOF');
+  CREATE TABLE IF NOT EXISTS store_items(id UUID PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',category TEXT NOT NULL DEFAULT 'template',price NUMERIC(14,2) NOT NULL DEFAULT 0,active BOOLEAN NOT NULL DEFAULT true,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+  INSERT INTO store_items(id,name,description,category,price,active)
+@@ -94,65 +131,7 @@ ALTER TABLE cards ADD COLUMN IF NOT EXISTS batch_id UUID;
+ }
+ 
+ app.get("/health",(_,res)=>res.json({ok:true,service:"MICRO-MAX API",version:"2.0.0"}));
+-
+-// Protected administrator account recovery. Requires ADMIN_EMAIL and ADMIN_RECOVERY_SECRET.
+-app.post("/api/auth/admin-recover", loginLimiter, async (req, res) => {
+-  const expected = String(process.env.ADMIN_RECOVERY_SECRET || "");
+-  const supplied = String(req.get("x-admin-recovery-secret") || "");
+-  const a = Buffer.from(expected);
+-  const b = Buffer.from(supplied);
+-
+-  if (a.length < 32 || a.length !== b.length ||
+-      !crypto.timingSafeEqual(a, b)) {
+-    return res.status(403).json({ error: "RECOVERY_NOT_AUTHORIZED" });
+-  }
+-
+-  const email = String(req.body.email || "").trim().toLowerCase();
+-  const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+-  const password = String(req.body.password || "");
+-
+-  if (!adminEmail || email !== adminEmail)
+-    return res.status(403).json({ error: "ADMIN_EMAIL_MISMATCH" });
+-  if (password.length < 12)
+-    return res.status(400).json({ error: "PASSWORD_TOO_SHORT" });
+-
+-  const client = await pool.connect();
+-  try {
+-    await client.query("BEGIN");
+-    const found = await client.query(
+-      "SELECT id FROM users WHERE email=$1 FOR UPDATE", [email]
+-    );
+-    const hash = await bcrypt.hash(password, 12);
+-
+-    if (found.rowCount) {
+-      await client.query(
+-        "UPDATE users SET password_hash=$1, role='admin' WHERE id=$2",
+-        [hash, found.rows[0].id]
+-      );
+-    } else {
+-      const id = crypto.randomUUID();
+-      await client.query(
+-        "INSERT INTO users(id,email,password_hash,role) VALUES($1,$2,$3,'admin')",
+-        [id, email, hash]
+-      );
+-      await client.query(
+-        "INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",
+-        [id]
+-      );
+-    }
+-
+-    await client.query("COMMIT");
+-    return res.json({ ok: true });
+-  } catch (e) {
+-    await client.query("ROLLBACK");
+-    console.error("Admin recovery failed:", e.message);
+-    return res.status(500).json({ error: "ADMIN_RECOVERY_FAILED" });
+-  } finally {
+-    client.release();
+-  }
+-});
+-
+-app.post("/api/auth/register",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");if(!email||password.length<8)return res.status(400).json({error:"INVALID_INPUT"});try{const count=Number((await pool.query("SELECT count(*)::int n FROM users")).rows[0].n);let user;if(count===0){user=await bootstrapAdmin({email,hash:await bcrypt.hash(password,12)});}else if(process.env.ALLOW_REGISTRATION==="true"){user=await registerUser({email,hash:await bcrypt.hash(password,12)});}else{user=null;}if(!user)return res.status(403).json({error:count===0?"REGISTRATION_FAILED":"REGISTRATION_CLOSED"});await audit(user.id,"REGISTER","user",user.id,{role:user.role});res.status(201).json({token:sign(user),user});}catch(e){if(String(e?.code)==="23505")return res.status(409).json({error:"EMAIL_EXISTS"});res.status(500).json({error:"REGISTRATION_FAILED"});}});
++app.post("/api/auth/register",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");if(!email||password.length<8)return res.status(400).json({error:"INVALID_INPUT"});try{const user=await bootstrapAdmin({email,hash:await bcrypt.hash(password,12)});if(!user)return res.status(403).json({error:"REGISTRATION_CLOSED"});res.status(201).json({token:sign(user),user});}catch{res.status(409).json({error:"EMAIL_EXISTS"});}});
+ app.post("/api/auth/login",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");const r=await pool.query("SELECT * FROM users WHERE email=$1",[email]);if(!r.rowCount||!r.rows[0].password_hash||!(await bcrypt.compare(password,r.rows[0].password_hash)))return res.status(401).json({error:"INVALID_CREDENTIALS"});await audit(r.rows[0].id,"LOGIN","user",r.rows[0].id);res.json({token:sign(r.rows[0]),user:{id:r.rows[0].id,email:r.rows[0].email,role:r.rows[0].role}});});
+ app.post("/api/auth/google",loginLimiter,async(req,res)=>{
+   const idToken=String(req.body.idToken||"").trim();
+@@ -185,13 +164,13 @@ app.post("/api/store/:id/activate",auth,async(req,res)=>{const r=await pool.quer
+ app.get("/api/store/my",auth,async(req,res)=>{const r=await pool.query("SELECT e.created_at,i.id,i.name,i.description,i.category,i.price FROM store_entitlements e JOIN store_items i ON i.id=e.item_id WHERE e.user_id=$1 ORDER BY e.created_at DESC",[req.user.sub]);res.json({items:r.rows});});
+ app.get("/api/payment-methods",auth,async(req,res)=>{const online=process.env.ENABLE_ONLINE_PAYMENTS==="true";res.json({methods:[{id:"cash",name:"نقداً / يدوي",available:true},...(online?[{id:"binance_pay",name:"Binance Pay",available:binancePayConfigured()}]:[])]});});
+ 
+-app.get("/api/routers",auth,async(req,res)=>{const r=await pool.query("SELECT id,name,host,port,username,tls,created_at FROM routers WHERE user_id=$1 ORDER BY created_at DESC",[req.user.sub]);res.json({routers:r.rows});});
++app.get("/api/routers",auth,async(req,res)=>{const r=await pool.query("SELECT id,name,host,port,username,tls,mode,(tls_fingerprint IS NOT NULL) pinned,agent_last_seen,(mode='agent' AND agent_last_seen > now() - interval '120 seconds') online,created_at FROM routers WHERE user_id=$1 ORDER BY created_at DESC",[req.user.sub]);res.json({routers:r.rows});});
+ 
+ function tcpProbe(host, port, useTls=false, timeout=5000) {
+   return new Promise(resolve => {
+     const started=Date.now(); let settled=false;
+     const finish=(result)=>{if(settled)return;settled=true;try{socket?.destroy();}catch{};resolve({...result,latencyMs:Date.now()-started});};
+-    const socket=useTls ? tls.connect({host,port,servername:host,rejectUnauthorized:false}) : net.createConnection({host,port});
++    const socket=useTls ? tls.connect({host,port,servername:net.isIP(host)?undefined:host,rejectUnauthorized:false,lookup:NET_LOOKUP}) : net.createConnection({host,port,lookup:NET_LOOKUP});
+     const timer=setTimeout(()=>finish({ok:false,code:"TIMEOUT",message:"لم يصل رد من المنفذ خلال المهلة"}),timeout);
+     socket.once("connect",()=>{clearTimeout(timer);finish({ok:true,code:"OPEN",message:"المنفذ مفتوح ويمكن الوصول إليه"});});
+     socket.once("secureConnect",()=>{clearTimeout(timer);finish({ok:true,code:"OPEN_TLS",message:"منفذ TLS مفتوح ويمكن الوصول إليه"});});
+@@ -204,6 +183,7 @@ function privateIpv4(host) {
+   return p.length===4 && p.every(x=>Number.isInteger(x)&&x>=0&&x<=255) && (p[0]===10 || p[0]===192&&p[1]===168 || p[0]===172&&p[1]>=16&&p[1]<=31);
+ }
+ app.post("/api/routers/discover",auth,async(req,res)=>{
++  if(!NET_CFG.allowPrivate) return res.status(400).json({ok:false,error:"DISCOVERY_REQUIRES_LOCAL_DEPLOYMENT",detail:"البحث التلقائي يعمل فقط إذا شُغّل Backend داخل نفس الشبكة المحلية (ALLOW_PRIVATE_ROUTER_HOSTS=true). للراوتر البعيد استخدم وضع Agent أو API-SSL."});
+   const network=String(req.body?.network||"192.168.88.0/24").trim(); const m=network.match(/^(\d+\.\d+\.\d+)\.0\/24$/);
+   if(!m || !privateIpv4(`${m[1]}.1`)) return res.status(400).json({ok:false,error:"PRIVATE_24_NETWORK_REQUIRED",detail:"اكتشاف الراوتر يعمل فقط على شبكة خاصة بصيغة 192.168.88.0/24"});
+   const hosts=Array.from({length:254},(_,i)=>`${m[1]}.${i+1}`); const found=[]; let cursor=0;
+@@ -215,26 +195,28 @@ app.post("/api/routers/discover",auth,async(req,res)=>{
+ app.post("/api/routers/diagnose",auth,async(req,res)=>{
+   const host=String(req.body?.host||"").trim(); const port=Number(req.body?.port)||8728; const tlsMode=!!req.body?.tls;
+   if(!host)return res.status(400).json({ok:false,error:"ROUTER_INPUT_REQUIRED",steps:[]});
++  try{ guardRouterInput(host,port); }catch(e){ return res.status(400).json({ok:false,error:e.message,steps:[{name:"VALIDATION",ok:false,code:e.message,message:e.message==="PORT_NOT_ALLOWED"?"المنفذ غير مسموح (المسموح: 8728, 8729 أو حسب ROUTER_ALLOWED_PORTS)":"عنوان الراوتر غير مسموح (loopback/metadata/شبكة خاصة على سيرفر سحابي)"}]}); }
+   const steps=[]; let addresses=[];
+   try { addresses=await dns.promises.lookup(host,{all:true}); steps.push({name:"DNS",ok:true,message:`تم حل ${host}`,addresses:addresses.map(x=>x.address)}); }
+   catch(e){ steps.push({name:"DNS",ok:false,code:String(e.code||"DNS_ERROR"),message:"تعذر حل اسم المضيف من Backend"}); }
++  if(addresses.length&&!addresses.some(a=>isAddressAllowed(a.address,NET_CFG)))return res.status(400).json({ok:false,error:"HOST_NOT_ALLOWED",steps:[...steps,{name:"VALIDATION",ok:false,code:"HOST_NOT_ALLOWED",message:"العنوان يشير إلى شبكة غير مسموحة من هذا السيرفر. الراوترات المحلية تحتاج وضع Agent."}]});
+   const tcp=await tcpProbe(host,port,tlsMode); steps.push({name:tlsMode?"TCP/TLS":"TCP",...tcp});
+   let login=null;
+   if(req.body?.username && typeof req.body?.password === "string" && tcp.ok){
+     let ros;
+-    try { ros=new RouterOS({host,port,username:String(req.body.username),password:req.body.password,tls:tlsMode,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",timeout:8000}); const r=await ros.command("/system/resource/print",[]); login={ok:true,code:"AUTH_OK",message:"تم تسجيل الدخول إلى RouterOS",resource:r[0]||{}}; }
+-    catch(e){ login={ok:false,code:String(e.code||e.message||"ROUTER_LOGIN_FAILED"),message:String(e.message||e.code||"فشل تسجيل الدخول").slice(0,240)}; }
++    try { ros=new RouterOS({host,port,username:String(req.body.username),password:req.body.password,tls:tlsMode,pinSha256:fpNormalize(req.body.fingerprint)||undefined,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",lookup:NET_LOOKUP,timeout:8000}); const r=await ros.command("/system/resource/print",[]); login={ok:true,code:"AUTH_OK",message:"تم تسجيل الدخول إلى RouterOS",resource:r[0]||{}}; }
++    catch(e){ login={ok:false,code:String(e.code||e.message||"ROUTER_LOGIN_FAILED"),message:String(e.routerMessage?`${e.message}: ${e.routerMessage}`:(e.message||e.code||"فشل تسجيل الدخول")).slice(0,240)}; }
+     finally { try{await ros?.close();}catch{} }
+     steps.push({name:"RouterOS",...login});
+   } else steps.push({name:"RouterOS",ok:false,code:tcp.ok?"CREDENTIALS_NOT_TESTED":"TCP_UNREACHABLE",message:tcp.ok?"تم فتح المنفذ لكن لم تُرسل بيانات الدخول":"لا يمكن اختبار بيانات الدخول قبل فتح المنفذ"});
+   const ok=steps.every(x=>x.ok);
+   res.json({ok,source:"backend",host,port,tls:tlsMode,steps,advice:ok?"الاتصال جاهز من مكان تشغيل Backend":"إذا فشل TCP فالمشكلة شبكة/VPN/Firewall، وليست كلمة مرور التطبيق"});
+ });
+-app.post("/api/routers/test",auth,async(req,res)=>{const {host,port=8728,username,password,tls=false}=req.body;let ros;try{if(!String(host||"").trim()||!String(username||"").trim()||!String(password||""))return res.status(400).json({ok:false,error:"ROUTER_INPUT_REQUIRED",detail:"host, username and password are required"});ros=new RouterOS({host:String(host).trim(),port:Number(port)||8728,username:String(username).trim(),password,tls:!!tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});const resource=await ros.command("/system/resource/print",[]);res.json({ok:true,resource:resource[0]||{}});}catch(e){const detail=String(e?.code||e?.message||"UNKNOWN").replace(/\s+/g," ").slice(0,240);res.status(502).json({ok:false,error:"ROUTER_CONNECTION_FAILED",detail,help:tls?"تحقق من API-SSL والمنفذ 8729 والشهادة وALLOW_INSECURE_ROUTER_TLS":"تحقق من API والمنفذ 8728 وIP الراوتر والجدار الناري"});}finally{try{await ros?.close();}catch{}}});
+-app.post("/api/routers",auth,async(req,res)=>{const {name,host,port=8728,username,password,tls=false}=req.body;if(!name||!host||!username||!password)return res.status(400).json({error:"INVALID_INPUT"});const id=crypto.randomUUID();await pool.query("INSERT INTO routers(id,user_id,name,host,port,username,password_enc,tls) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",[id,req.user.sub,name,host,Number(port),username,encrypt(password),!!tls]);await audit(req.user.sub,"CREATE","router",id,{name,host});res.status(201).json({id,name,host,port:Number(port),username,tls:!!tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});});
++app.post("/api/routers/test",auth,async(req,res)=>{const {host,port=8728,username,password,tls=false,fingerprint}=req.body;let ros;try{if(!String(host||"").trim()||!String(username||"").trim()||!String(password||""))return res.status(400).json({ok:false,error:"ROUTER_INPUT_REQUIRED",detail:"host, username and password are required"});const target=guardRouterInput(host,Number(port)||8728);ros=new RouterOS({host:target.host,port:target.port,username:String(username).trim(),password,tls:!!tls,pinSha256:fpNormalize(fingerprint)||undefined,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",lookup:NET_LOOKUP});const resource=await ros.command("/system/resource/print",[]);res.json({ok:true,resource:resource[0]||{}});}catch(e){const detail=String(e?.code||e?.message||"UNKNOWN").replace(/\s+/g," ").slice(0,240);res.status(e.status||502).json({ok:false,error:e.status?e.message:"ROUTER_CONNECTION_FAILED",detail,routerMessage:e?.routerMessage||undefined,help:tls?"تحقق من API-SSL والمنفذ 8729 والشهادة وALLOW_INSECURE_ROUTER_TLS":"تحقق من API والمنفذ 8728 وIP الراوتر والجدار الناري"});}finally{try{await ros?.close();}catch{}}});
++app.post("/api/routers",auth,async(req,res)=>{const {name,host,port=8728,username,password,tls=false,fingerprint}=req.body;if(!name||!host||!username||!password)return res.status(400).json({error:"INVALID_INPUT"});let target,fp;try{target=guardRouterInput(host,Number(port)||8728);fp=fpNormalize(fingerprint);}catch(e){return res.status(e.status||400).json({error:e.message});}const id=crypto.randomUUID();await pool.query("INSERT INTO routers(id,user_id,name,host,port,username,password_enc,tls,tls_fingerprint,mode) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'direct')",[id,req.user.sub,String(name).trim().slice(0,80),target.host,target.port,String(username).trim(),encrypt(password),!!tls,fp||null]);await audit(req.user.sub,"CREATE","router",id,{name,host:target.host,mode:"direct",pinned:!!fp});res.status(201).json({id,name,host:target.host,port:target.port,username,tls:!!tls,mode:"direct",pinned:!!fp,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});});
+ app.delete("/api/routers/:id",auth,role("admin"),async(req,res)=>{await pool.query("DELETE FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);await audit(req.user.sub,"DELETE","router",req.params.id);res.status(204).end();});
+ async function getRouter(req,id){const r=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[id,req.user.sub]);if(!r.rowCount)throw Error("ROUTER_NOT_FOUND");return r.rows[0];}
+-async function withRos(req,id,fn){const router=await getRouter(req,id);const ros=new RouterOS({host:router.host,port:router.port,username:router.username,password:decrypt(router.password_enc),tls:router.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});try{return await fn(ros,router);}finally{await ros.close().catch(()=>{});}}
++async function withRos(req,id,fn){const router=await getRouter(req,id);const ros=rosFor(router);try{return await fn(ros,router);}finally{await ros.close().catch(()=>{});}}
+ app.get("/api/routers/:id/hotspot/users",auth,async(req,res)=>{try{const items=await withRos(req,req.params.id,async ros=>await ros.command("/ip/hotspot/user/print",[]));res.json(items);}catch(e){res.status(502).json({error:"HOTSPOT_USERS_QUERY_FAILED",detail:e.message});}});
+ app.get("/api/routers/:id/network/:kind",auth,async(req,res)=>{const commands={interfaces:"/interface/print","dhcp-leases":"/ip/dhcp-server/lease/print",arp:"/ip/arp/print","dns-static":"/ip/dns/static/print","ip-addresses":"/ip/address/print",routes:"/ip/route/print",firewall:"/ip/firewall/filter/print",queues:"/queue/simple/print",logs:"/log/print"};const cmd=commands[req.params.kind];if(!cmd)return res.status(404).json({error:"NETWORK_KIND_NOT_FOUND"});try{const items=await withRos(req,req.params.id,async ros=>await ros.command(cmd,[]));res.json({kind:req.params.kind,items});}catch(e){res.status(502).json({error:"NETWORK_QUERY_FAILED",detail:e.message});}});
+ app.post("/api/routers/:id/terminal",auth,role("admin"),async(req,res)=>{
+@@ -273,6 +255,11 @@ function profilePayload(body){
+ 
+ app.get("/api/routers/:id/hotspot-profiles",auth,async(req,res)=>{
+   try{
++    const rr=await getRouter(req,req.params.id);
++    if(rr.mode==="agent"){
++      const l=await pool.query("SELECT name,price,duration_minutes,rate_limit,session_timeout,idle_timeout,shared_users,enabled,provision_state FROM hotspot_profiles WHERE router_id=$1 ORDER BY name",[rr.id]);
++      return res.json({mode:"agent",profiles:l.rows.map(x=>({name:x.name,rateLimit:x.rate_limit||"",sessionTimeout:x.session_timeout||"",idleTimeout:x.idle_timeout||"",sharedUsers:Number(x.shared_users||1),price:Number(x.price||0),durationMinutes:Number(x.duration_minutes||0),enabled:x.enabled!==false,provisionState:x.provision_state}))});
++    }
+     const items=await withRos(req,req.params.id,async ros=>{
+       const [routerProfiles,local]=await Promise.all([
+         ros.command("/ip/hotspot/user/profile/print",[]),
+@@ -287,6 +274,20 @@ app.get("/api/routers/:id/hotspot-profiles",auth,async(req,res)=>{
+ app.post("/api/routers/:id/hotspot-profiles",auth,async(req,res)=>{
+   try{
+     const p=profilePayload(req.body);
++    const rr=await getRouter(req,req.params.id);
++    if(rr.mode==="agent"){
++      const payload={name:p.name,sharedUsers:p.sharedUsers,rateLimit:p.rateLimit,sessionTimeout:p.sessionTimeout,idleTimeout:p.idleTimeout};
++      const jobId=crypto.randomUUID();
++      // validate now (fails fast with a clear error instead of at the router)
++      renderJobScript([{id:jobId,type:"hotspot-profile-set",payload}],{baseUrl:"https://validate.invalid",token:"mmag_"+"a".repeat(30)});
++      const q=await pool.query(`INSERT INTO hotspot_profiles(id,router_id,name,price,duration_minutes,rate_limit,session_timeout,idle_timeout,shared_users,enabled,provision_state)
++        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,true,'pending')
++        ON CONFLICT(router_id,name) DO UPDATE SET price=0,duration_minutes=EXCLUDED.duration_minutes,rate_limit=EXCLUDED.rate_limit,session_timeout=EXCLUDED.session_timeout,idle_timeout=EXCLUDED.idle_timeout,shared_users=EXCLUDED.shared_users,enabled=true,provision_state='pending',updated_at=now()
++        RETURNING *`,[crypto.randomUUID(),rr.id,p.name,p.price,p.durationMinutes,p.rateLimit,p.sessionTimeout,p.idleTimeout,p.sharedUsers]);
++      await pool.query("INSERT INTO agent_jobs(id,router_id,type,payload) VALUES($1,$2,'hotspot-profile-set',$3)",[jobId,rr.id,JSON.stringify(payload)]);
++      await audit(req.user.sub,"UPSERT","hotspot_profile",rr.id,{name:p.name,mode:"agent"});
++      return res.status(202).json({profile:q.rows[0],provisioning:"pending",note:"سيُنشأ البروفايل على الراوتر خلال دقيقة تقريباً عند اتصال الـ Agent."});
++    }
+     const result=await withRos(req,req.params.id,async ros=>{
+       const existing=await ros.command("/ip/hotspot/user/profile/print",[]);
+       const found=existing.find(x=>x.name===p.name);
+@@ -351,7 +352,7 @@ app.get("/api/routers/:id/hotspot-login",auth,async(req,res)=>{
+   let ros;
+   try{
+     const r=await getRouterForUser(req,req.params.id);
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
++    ros=rosFor(r);
+     await ros.connect();
+     const files=await ros.command("/file/print",["?name=hotspot/login.html"]);
+     const f=files[0]||{};
+@@ -378,7 +379,7 @@ app.post("/api/routers/:id/hotspot-login/publish",auth,role("admin"),async(req,r
+     if(content.length<100 || content.length>500000) return res.status(400).json({error:"INVALID_LOGIN_HTML_SIZE"});
+     const validation=validateLoginHtml(content);
+     if(!validation.valid) return res.status(400).json({error:"LOGIN_HTML_INCOMPATIBLE",validation});
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
++    ros=rosFor(r);
+     await ros.connect();
+     const current=await ros.command("/file/print",["?name=hotspot/login.html"]);
+     const old=String(current[0]?.contents||"");
+@@ -399,7 +400,7 @@ app.get("/api/routers/:id/hotspot-login/backups",auth,async(req,res)=>{
+   let ros;
+   try{
+     const r=await getRouterForUser(req,req.params.id);
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
++    ros=rosFor(r);
+     await ros.connect();
+     const files=await ros.command("/file/print",[]);
+     const backups=files.filter(f=>/^hotspot\/login\.html\.micromax-[A-Za-z0-9_.-]+\.bak$/.test(String(f.name||""))).map(f=>({name:f.name,size:Number(f.size||0),creationTime:f.creation_time||f["creation-time"]||null})).sort((a,b)=>String(b.creationTime).localeCompare(String(a.creationTime)));
+@@ -414,7 +415,7 @@ app.post("/api/routers/:id/hotspot-login/restore",auth,role("admin"),async(req,r
+     const r=await getRouterForUser(req,req.params.id);
+     const backup=String(req.body.backupName||"").trim();
+     if(!/^hotspot\/login\.html\.micromax-[A-Za-z0-9_.-]+\.bak$/.test(backup)) return res.status(400).json({error:"INVALID_BACKUP_NAME"});
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
++    ros=rosFor(r);
+     await ros.connect();
+     const b=await ros.command("/file/print",[`?name=${backup}`]);
+     const content=String(b[0]?.contents||"");
+@@ -446,7 +447,7 @@ app.get("/api/routers/:id/hotspot-pages",auth,async(req,res)=>{
+   let ros;
+   try{
+     const r=await getRouterForUser(req,req.params.id);
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
++    ros=rosFor(r);
+     await ros.connect();
+     const result={routerId:r.id,pages:{}};
+     for(const page of ["login","status"]){const name=`hotspot/${page}.html`;const f=(await ros.command("/file/print",[`?name=${name}`]))[0]||{};const content=String(f.contents||"");result.pages[page]={file:name,content,validation:validateHotspotPage(page,content),updatedAt:f.creation_time||f["creation-time"]||null};}
+@@ -468,7 +469,7 @@ app.post("/api/routers/:id/hotspot-pages/publish",auth,role("admin"),async(req,r
+     if(content.length<100 || content.length>500000)return res.status(400).json({error:"INVALID_HOTSPOT_HTML_SIZE"});
+     const validation=validateHotspotPage(page,content); if(!validation.valid)return res.status(400).json({error:"HOTSPOT_HTML_INCOMPATIBLE",validation});
+     const r=await getRouterForUser(req,req.params.id);
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"}); await ros.connect();
++    ros=rosFor(r); await ros.connect();
+     const file=`hotspot/${page}.html`; const current=await ros.command("/file/print",[`?name=${file}`]); const old=String(current[0]?.contents||"");
+     const backup=`${file}.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`; if(old)try{await ros.command("/file/add",[`=name=${backup}`,`=contents=${old}`]);}catch{}
+     const target=current[0]?.[".id"]||current[0]?.id; if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]); else await ros.command("/file/add",[`=name=${file}`,`=contents=${content}`]);
+@@ -498,7 +499,7 @@ app.post("/api/routers/:id/cards/preflight",auth,async(req,res)=>{
+     const routerQ=await pool.query("SELECT id,host,port,username,tls FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);
+     if(!routerQ.rowCount)throw Error("ROUTER_NOT_FOUND");
+     const r=routerQ.rows[0];
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt((await pool.query("SELECT password_enc FROM routers WHERE id=$1",[req.params.id])).rows[0].password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
++    ros=rosFor((await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub])).rows[0]||(()=>{throw Error("ROUTER_NOT_FOUND")})());
+     await ros.connect();
+     const profiles=await ros.command("/ip/hotspot/user/profile/print",[]);
+     const profileVerified=profiles.some(x=>String(x.name||"")===String(plan.profile_name));
+@@ -537,7 +538,7 @@ app.post("/api/routers/:id/qr-preflight",auth,async(req,res)=>{
+     const routerQ=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);
+     if(!routerQ.rowCount)throw Error("ROUTER_NOT_FOUND");
+     const r=routerQ.rows[0];
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
++    ros=rosFor(r);
+     await ros.connect();
+     const hotspotProfiles=await ros.command("/ip/hotspot/profile/print",[]);
+     const hotspotServers=await ros.command("/ip/hotspot/print",[]);
+@@ -546,25 +547,31 @@ app.post("/api/routers/:id/qr-preflight",auth,async(req,res)=>{
+     const controllerHost=String(url.host);
+     let portalStatus=null,portalReachable=false,html="",fetchError=null;
+     try{
+-      const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),5000);
+-      const response=await fetch(url,{redirect:"follow",signal:controller.signal,headers:{"User-Agent":"MICRO-MAX-HotSpot-QR-Check/1.0"}});
+-      clearTimeout(timer); portalStatus=response.status; html=(await response.text()).slice(0,500000); portalReachable=response.ok;
++      const response=await safeGet(url.toString(),{cfg:NET_CFG});
++      portalStatus=response.status; html=response.body; portalReachable=response.ok;
+     }catch(e){fetchError=e.message||"PORTAL_UNREACHABLE";}
++    // The portal is usually on a private IP the API cannot reach: fall back to the real login.html stored on the router.
++    let source="portal-http",fileRead=false;
++    if(!portalReachable){
++      try{const f=(await ros.command("/file/print",["?name=hotspot/login.html"]))[0];if(f&&f.contents){html=String(f.contents);fileRead=true;source="router-file";}}catch{}
++    }
++    const analysis=analyzeLoginHtml(html);
+     const hasLoginForm=/<form[^>]+action=["'][^"']*\/login/i.test(html)||/<form[^>]*>/i.test(html)&&/name=["']username["']/i.test(html)&&/name=["']password["']/i.test(html);
+-    const hasAutoSubmit=/\.submit\s*\(|requestSubmit\s*\(/i.test(html);
++    const hasAutoSubmit=analysis.autoLogin;
+     const papAllowed=loginBy.some(v=>v.toLowerCase().includes("http-pap"));
+     const httpsAllowed=loginBy.some(v=>v.toLowerCase().includes("https"));
+     const chapOnly=loginBy.length>0 && loginBy.every(v=>v.toLowerCase().includes("http-chap")||v.toLowerCase().includes("cookie"));
+     let mode="portal-prefill";
+-    let ready=portalReachable && hasLoginForm && (papAllowed || httpsAllowed || !chapOnly);
++    let ready=(portalReachable||fileRead) && hasLoginForm && (papAllowed || httpsAllowed || !chapOnly);
+     if(ready && hasAutoSubmit && (papAllowed||httpsAllowed)) mode="auto-submit";
+     const warnings=[];
+-    if(!portalReachable)warnings.push("HOTSPOT_PORTAL_NOT_REACHABLE_FROM_API");
++    if(!portalReachable&&!fileRead)warnings.push("HOTSPOT_PORTAL_NOT_REACHABLE_FROM_API");
++    for(const w of analysis.warnings)if(!warnings.includes(w))warnings.push(w);
+     if(portalReachable&&!hasLoginForm)warnings.push("LOGIN_FORM_NOT_DETECTED");
+     if(chapOnly)warnings.push("CHAP_REQUIRES_LOGIN_PAGE_CHALLENGE_HANDLING");
+     if(mode==="portal-prefill")warnings.push("QR_OPENS_REAL_HOTSPOT_LOGIN_PAGE;_AUTO_LOGIN_REQUIRES_COMPATIBLE_LOGIN_HTML");
+     res.json({
+-      ready,mode,portal:{url:portalUrl,host:controllerHost,status:portalStatus,reachable:portalReachable,loginFormDetected:hasLoginForm,autoSubmitDetected:hasAutoSubmit,fetchError},
++      ready,mode,source,analysis,portal:{url:portalUrl,host:controllerHost,status:portalStatus,reachable:portalReachable,loginFormDetected:hasLoginForm,autoSubmitDetected:hasAutoSubmit,fetchError},
+       router:{verified:true,hotspotServers:hotspotServers.length,loginBy,papAllowed,httpsAllowed,chapOnly},
+       recommendedQr:`${portalUrl.replace(/\/$/,"")}?username={USERNAME}&password={PASSWORD}&dst=${encodeURIComponent(url.origin+"/")}`,
+       planId:planId||null,
+@@ -608,10 +615,14 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
+     const routerQ=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);
+     if(!routerQ.rowCount)throw Error("ROUTER_NOT_FOUND");
+     const r=routerQ.rows[0];
+-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+-    await ros.connect();
+-    const profiles=await ros.command("/ip/hotspot/user/profile/print",[]);
+-    if(!profiles.some(x=>x.name===plan.profile_name))throw Error("HOTSPOT_PROFILE_NOT_FOUND");
++    const agentMode=r.mode==="agent";
++    if(agentMode){ rosSafe(plan.profile_name); }
++    else{
++      ros=rosFor(r);
++      await ros.connect();
++      const profiles=await ros.command("/ip/hotspot/user/profile/print",[]);
++      if(!profiles.some(x=>x.name===plan.profile_name))throw Error("HOTSPOT_PROFILE_NOT_FOUND");
++    }
+ 
+     // MikroTik generates the usernames/passwords itself (RouterOS :rndstr). Duplicates against the
+     // database are detected after read-back, removed from the router and regenerated.
+@@ -619,8 +630,11 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
+     const pin=String(req.body.passwordMode||"userpass")==="pin";
+     if(pin)assertPinStrength(usernameLetters,usernameDigits);
+     const dbHas=async names=>{const q=await pool.query("SELECT username FROM cards WHERE router_id=$1 AND username=ANY($2::text[])",[req.params.id,names]);return new Set(q.rows.map(x=>x.username));};
+-    routerTouched=true;
+-    const made=await generateBatch({ros,count,prefix,digits:usernameDigits,letters:usernameLetters,passLen,pin,profile:plan.profile_name,batchId,dbHas});
++    routerTouched=!agentMode;
++    const limitUptime=req.body.enforceDuration===true?hotspotDuration(plan.duration_minutes):"";
++    const made=agentMode
++      ? generateCredentials({count,prefix,digits:usernameDigits,letters:usernameLetters,passLen,pin,taken:new Set((await pool.query("SELECT username FROM cards WHERE router_id=$1 AND username LIKE $2",[req.params.id,prefix+"%"])).rows.map(x=>x.username))})
++      : await generateBatch({ros,count,prefix,digits:usernameDigits,letters:usernameLetters,passLen,pin,profile:plan.profile_name,batchId,dbHas,limitUptime});
+     for(const m of made)created.push({...m,id:crypto.randomUUID()});
+ 
+     // Persist in chunks. Passwords are stored encrypted; the QR is rebuilt on read (never stored in clear).
+@@ -631,11 +645,16 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
+         const chunk=created.slice(i,i+250);
+         const values=[]; const params=[];
+         chunk.forEach((c,j)=>{
+-          const o=j*11;
+-          values.push(`($${o+1},$${o+2},$${o+3},$${o+4},$${o+5},$${o+6},$${o+7},$${o+8},$${o+9},$${o+10},$${o+11})`);
+-          params.push(c.id,req.params.id,c.username,encPass(c.password),plan.profile_name,plan.price,plan.id,plan.currency,batchId,qrBase,ssid||null);
++          const o=j*12;
++          values.push(`($${o+1},$${o+2},$${o+3},$${o+4},$${o+5},$${o+6},$${o+7},$${o+8},$${o+9},$${o+10},$${o+11},$${o+12})`);
++          params.push(c.id,req.params.id,c.username,encPass(c.password),plan.profile_name,plan.price,plan.id,plan.currency,batchId,qrBase,ssid||null,agentMode?"pending":"ready");
+         });
+-        await client.query(`INSERT INTO cards(id,router_id,username,password,profile,price,plan_id,price_currency,batch_id,portal_url,ssid) VALUES ${values.join(",")}`,params);
++        await client.query(`INSERT INTO cards(id,router_id,username,password,profile,price,plan_id,price_currency,batch_id,portal_url,ssid,provision_state) VALUES ${values.join(",")}`,params);
++      }
++      if(agentMode){
++        for(const c of created){
++          await client.query("INSERT INTO agent_jobs(id,router_id,type,payload,card_id) VALUES($1,$2,'hotspot-user-add',$3,$4)",[crypto.randomUUID(),req.params.id,JSON.stringify({username:c.username,password:c.password,profile:plan.profile_name,comment:`MICRO-MAX:${batchId}`,limitUptime}),c.id]);
++        }
+       }
+       await client.query("COMMIT"); committed=true;
+     }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; }
+@@ -643,7 +662,7 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
+ 
+     await audit(req.user.sub,"CREATE","cards",req.params.id,{count,planId,price:Number(plan.price),currency:plan.currency,batchId,generatedBy:"mikrotik",usernameDigits,usernameLetters});
+     res.status(201).json({
+-      success:true,count,batchId,generatedBy:"mikrotik",pricingSource:"micromax_plan",planId,planName:plan.name,price:Number(plan.price),currency:plan.currency,
++      success:true,count,batchId,generatedBy:agentMode?"agent":"mikrotik",provisioning:agentMode?"pending":"done",pricingSource:"micromax_plan",planId,planName:plan.name,price:Number(plan.price),currency:plan.currency,
+       usernameFormat:{prefix,letters:usernameLetters,digits:usernameDigits,totalLength:prefix.length+usernameLetters+usernameDigits,passwordMode:pin?"pin":"userpass",passwordLength:passLen},
+       validation:{profileVerified:true,duplicateCheck:true,usernameCollisionCheck:true,routerVerified:true,qrSigned:true},
+       cards:created.map(c=>({id:c.id,username:c.username,password:c.password,passwordMode:pin?"pin":"userpass",profile:plan.profile_name,planId:plan.id,planName:plan.name,price:Number(plan.price),currency:plan.currency,durationMinutes:Number(plan.duration_minutes||0),rateLimit:plan.rate_limit||"",sessionTimeout:plan.session_timeout||"",idleTimeout:plan.idle_timeout||"",sharedUsers:Number(plan.shared_users||1),qrContent:buildQrUrl({portalUrl:qrBase,username:c.username,password:pin?"":c.password,cardId:c.id,secret:QR_SECRET}),wifiQr:buildWifiQr(ssid)}))
+@@ -656,7 +675,7 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
+ });
+ 
+ // ---- Smart detection: DB <-> MikroTik reconciliation (read-only unless apply=true) ----
+-async function rosForRouter(req,id){const q=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[id,req.user.sub]);if(!q.rowCount)throw Error("ROUTER_NOT_FOUND");const r=q.rows[0];return new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS==="true"});}
++async function rosForRouter(req,id){const q=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[id,req.user.sub]);if(!q.rowCount)throw Error("ROUTER_NOT_FOUND");const r=q.rows[0];return rosFor(r);}
+ app.post("/api/routers/:id/cards/audit",auth,async(req,res)=>{
+   let ros=null;
+   try{
+@@ -704,10 +723,22 @@ app.post("/api/cards/scan",auth,async(req,res)=>{
+ app.get("/api/cards",auth,async(req,res)=>{const r=await pool.query("SELECT c.*,r.name router_name,p.name plan_name,p.currency plan_currency,hp.duration_minutes profile_duration_minutes,hp.rate_limit profile_rate_limit,hp.session_timeout profile_session_timeout,hp.idle_timeout profile_idle_timeout,hp.shared_users profile_shared_users FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE r.user_id=$1 ORDER BY c.created_at DESC LIMIT 1000",[req.user.sub]);res.json({cards:r.rows.map(cardOut)});});
+ 
+ // Smart Batch Center: reporting and safe lifecycle operations. Does not change card pricing/profile/username.
++// Cards of one batch in the shape the app prints (only unsold cards by default, so sold cards are never reprinted by mistake).
++app.get("/api/card-batches/:id/print-cards",auth,async(req,res)=>{
++  try{
++    if(!/^[0-9a-f-]{36}$/.test(req.params.id))return res.status(400).json({error:"INVALID_BATCH"});
++    const all=req.query.status==="all";
++    const q=await pool.query(`SELECT c.*,p.name plan_name,hp.duration_minutes FROM cards c JOIN routers r ON r.id=c.router_id
++      LEFT JOIN hotspot_plans p ON p.id=c.plan_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile
++      WHERE c.batch_id=$1 AND r.user_id=$2 ${all?"":"AND c.status='available'"} ORDER BY c.created_at,c.username LIMIT 5000`,[req.params.id,req.user.sub]);
++    const cards=q.rows.map(r=>{const o=cardOut(r);return{id:o.id,username:o.username,password:o.password,passwordMode:o.passwordMode,planName:r.plan_name||r.profile,profile:r.profile,price:Number(r.price||0),currency:r.price_currency||"XOF",durationMinutes:Number(r.duration_minutes||0),qrContent:o.qrContent,wifiQr:o.wifiQr,status:r.status};});
++    res.json({count:cards.length,cards});
++  }catch(e){ console.error("print-cards",e); res.status(500).json({error:"PRINT_CARDS_FAILED"}); }
++});
+ app.get("/api/card-batches",auth,async(req,res)=>{try{const r=await pool.query(`SELECT c.batch_id,MIN(c.created_at) created_at,COUNT(*)::int total,COUNT(*) FILTER(WHERE c.status='available')::int available,COUNT(*) FILTER(WHERE c.status='sold')::int sold,COUNT(*) FILTER(WHERE c.status='used')::int used,COUNT(*) FILTER(WHERE c.status='expired')::int expired,COUNT(*) FILTER(WHERE c.status='disabled')::int disabled,MIN(c.plan_id) plan_id,MIN(p.name) plan_name,MIN(r.name) router_name,MIN(c.price_currency) currency,MIN(c.price) price FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE r.user_id=$1 AND c.batch_id IS NOT NULL GROUP BY c.batch_id ORDER BY MIN(c.created_at) DESC LIMIT 500`,[req.user.sub]);res.json({batches:r.rows});}catch(e){res.status(500).json({error:"BATCH_QUERY_FAILED",detail:e.message});}});
+ app.get("/api/card-batches/:id",auth,async(req,res)=>{try{const r=await pool.query(`SELECT c.*,r.name router_name,p.name plan_name,p.currency plan_currency FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE c.batch_id=$1 AND r.user_id=$2 ORDER BY c.created_at DESC`,[req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:"BATCH_NOT_FOUND"});res.json({batchId:req.params.id,cards:r.rows.map(cardOut)});}catch(e){res.status(500).json({error:"BATCH_DETAIL_FAILED",detail:e.message});}});
+ app.post("/api/card-batches/:id/disable",auth,async(req,res)=>{const client=await pool.connect();let routerId=null;try{await client.query("BEGIN");const q=await client.query(`SELECT c.id,c.router_id,c.username,c.status FROM cards c JOIN routers r ON r.id=c.router_id WHERE c.batch_id=$1 AND r.user_id=$2 FOR UPDATE`,[req.params.id,req.user.sub]);if(!q.rowCount)throw Error("BATCH_NOT_FOUND");routerId=q.rows[0].router_id;const candidates=q.rows.filter(x=>["available","expired"].includes(x.status));for(const c of candidates)await client.query("UPDATE cards SET status='disabled' WHERE id=$1",[c.id]);await client.query("COMMIT");await audit(req.user.sub,"DISABLE","card_batch",req.params.id,{changed:candidates.length,protected:q.rows.length-candidates.length});res.json({success:true,batchId:req.params.id,disabled:candidates.length,protected:q.rows.length-candidates.length});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();}});
+-app.delete("/api/card-batches/:id",auth,async(req,res)=>{const client=await pool.connect();let ros=null;try{await client.query("BEGIN");const q=await client.query(`SELECT c.*,r.host,r.port,r.username router_username,r.password_enc,r.tls FROM cards c JOIN routers r ON r.id=c.router_id WHERE c.batch_id=$1 AND r.user_id=$2 FOR UPDATE`,[req.params.id,req.user.sub]);if(!q.rowCount)throw Error("BATCH_NOT_FOUND");const protectedCards=q.rows.filter(x=>!["available","expired","disabled"].includes(x.status));if(protectedCards.length)throw Error("BATCH_CONTAINS_SOLD_OR_USED_CARDS");const deletable=q.rows.filter(x=>["available","expired","disabled"].includes(x.status));for(const c of deletable)await client.query("DELETE FROM cards WHERE id=$1",[c.id]);await client.query("COMMIT");try{const r=q.rows[0];ros=new RouterOS({host:r.host,port:r.port,username:r.router_username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});await ros.connect();const users=await ros.command("/ip/hotspot/user/print",[`?comment=MICRO-MAX:${req.params.id}`]);for(const u of users){if(u[".id"])await ros.command("/ip/hotspot/user/remove",[`=.id=${u[".id"]}`]);}}catch{}await audit(req.user.sub,"DELETE","card_batch",req.params.id,{deleted:deletable.length});res.json({success:true,batchId:req.params.id,deleted:deletable.length});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();try{await ros?.close();}catch{}}});
++app.delete("/api/card-batches/:id",auth,async(req,res)=>{const client=await pool.connect();let ros=null;try{await client.query("BEGIN");const q=await client.query(`SELECT c.*,r.host,r.port,r.username router_username,r.password_enc,r.tls,r.tls_fingerprint,r.mode router_mode FROM cards c JOIN routers r ON r.id=c.router_id WHERE c.batch_id=$1 AND r.user_id=$2 FOR UPDATE`,[req.params.id,req.user.sub]);if(!q.rowCount)throw Error("BATCH_NOT_FOUND");const protectedCards=q.rows.filter(x=>!["available","expired","disabled"].includes(x.status));if(protectedCards.length)throw Error("BATCH_CONTAINS_SOLD_OR_USED_CARDS");const deletable=q.rows.filter(x=>["available","expired","disabled"].includes(x.status));for(const c of deletable)await client.query("DELETE FROM cards WHERE id=$1",[c.id]);await client.query("COMMIT");try{const r=q.rows[0];if(r.router_mode!=="agent"){ros=rosFor({...r,username:r.router_username,mode:r.router_mode});await ros.connect();}if(r.router_mode==="agent"){for(const c of deletable)await pool.query("INSERT INTO agent_jobs(id,router_id,type,payload) VALUES($1,$2,'hotspot-user-remove',$3)",[crypto.randomUUID(),c.router_id,JSON.stringify({username:c.username})]);}else{const users=await ros.command("/ip/hotspot/user/print",[`?comment=MICRO-MAX:${req.params.id}`]);for(const u of users){if(u[".id"])await ros.command("/ip/hotspot/user/remove",[`=.id=${u[".id"]}`]);}}}catch{}await audit(req.user.sub,"DELETE","card_batch",req.params.id,{deleted:deletable.length});res.json({success:true,batchId:req.params.id,deleted:deletable.length});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();try{await ros?.close();}catch{}}});
+ app.get("/api/card-batches/:id/csv",auth,async(req,res)=>{try{const r=await pool.query(`SELECT c.username,c.password,c.profile,c.status,c.price,c.price_currency,c.plan_id,c.batch_id,c.created_at,c.sold_at,r.name router_name,p.name plan_name FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE c.batch_id=$1 AND r.user_id=$2 ORDER BY c.created_at`,[req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:"BATCH_NOT_FOUND"});const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;const lines=["username,password,profile,status,price,currency,plan_id,batch_id,created_at,sold_at,router,plan"];for(const x of r.rows)lines.push([x.username,decPass(x.password),x.profile,x.status,x.price,x.price_currency,x.plan_id,x.batch_id,x.created_at?.toISOString?.()||x.created_at,x.sold_at?.toISOString?.()||x.sold_at,x.router_name,x.plan_name].map(esc).join(","));res.setHeader("Content-Type","text/csv; charset=utf-8");res.setHeader("Content-Disposition",`attachment; filename="micromax-batch-${req.params.id}.csv"`);res.send("\uFEFF"+lines.join("\n"));}catch(e){res.status(500).json({error:"BATCH_CSV_FAILED",detail:e.message});}});
+ 
+ const CARD_REPORT_COLUMNS = [
+@@ -773,7 +804,7 @@ app.get("/api/reports/cards.pdf", auth, async (req, res) => {
+     doc.end();
+   } catch (e) { res.status(500).json({ error: "CARD_REPORT_PDF_FAILED", detail: e.message }); }
+ });
+-app.post("/api/sales",auth,async(req,res)=>{const {cardId,paymentMethod="cash",reference=null}=req.body;const requestedAmount=req.body.amount; if(!cardId)return res.status(400).json({error:"CARD_REQUIRED"});if(paymentMethod!=="cash" && process.env.ENABLE_ONLINE_PAYMENTS!=="true")return res.status(403).json({error:"ONLINE_PAYMENTS_DISABLED"});const client=await pool.connect();try{await client.query("BEGIN");const c=await client.query("SELECT c.*,hp.duration_minutes profile_duration_minutes FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile WHERE c.id=$1 AND r.user_id=$2 FOR UPDATE",[cardId,req.user.sub]);if(!c.rowCount||c.rows[0].status!=="available")throw Error("CARD_NOT_AVAILABLE");const card=c.rows[0];const planPrice=Number(card.price||0);const numericAmount=planPrice;if(!Number.isFinite(numericAmount)||numericAmount<=0)return res.status(400).json({error:"PLAN_PRICE_NOT_SET",plan:card.plan_name||card.profile});const saleId=crypto.randomUUID();const finalCash=paymentMethod==="cash";await client.query("UPDATE cards SET status='sold',sold_at=now() WHERE id=$1",[cardId]);await client.query("INSERT INTO sales(id,card_id,seller_id,amount,payment_method,payment_status,reference) VALUES($1,$2,$3,$4,$5,$6,$7)",[saleId,cardId,req.user.sub,numericAmount,paymentMethod,finalCash?"success":"pending",reference]);await client.query("COMMIT");await audit(req.user.sub,"CREATE","sale",saleId,{cardId,amount:numericAmount,paymentMethod,paymentStatus:finalCash?"success":"pending",profile:card.profile,plan:card.plan_name||null,profileDurationMinutes:Number(card.profile_duration_minutes||0)});res.status(201).json({saleId,status:finalCash?"success":"pending",amount:numericAmount,profile:card.profile,durationMinutes:Number(card.profile_duration_minutes||0),card:finalCash?{username:card.username,password:decPass(card.password),profile:card.profile,price:numericAmount}:undefined});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();}});
++app.post("/api/sales",auth,async(req,res)=>{const {cardId,paymentMethod="cash",reference=null}=req.body;const requestedAmount=req.body.amount; if(!cardId)return res.status(400).json({error:"CARD_REQUIRED"});if(paymentMethod!=="cash" && process.env.ENABLE_ONLINE_PAYMENTS!=="true")return res.status(403).json({error:"ONLINE_PAYMENTS_DISABLED"});const client=await pool.connect();try{await client.query("BEGIN");const c=await client.query("SELECT c.*,hp.duration_minutes profile_duration_minutes FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile WHERE c.id=$1 AND r.user_id=$2 FOR UPDATE",[cardId,req.user.sub]);if(!c.rowCount||c.rows[0].status!=="available")throw Error("CARD_NOT_AVAILABLE");const card=c.rows[0];const planPrice=Number(card.price||0);const numericAmount=planPrice;if(!Number.isFinite(numericAmount)||numericAmount<=0)throw Error("PLAN_PRICE_NOT_SET");if(card.provision_state&&card.provision_state!=="ready")throw Error(card.provision_state==="pending"?"CARD_PROVISIONING_PENDING":"CARD_PROVISIONING_FAILED");const saleId=crypto.randomUUID();const finalCash=paymentMethod==="cash";await client.query("UPDATE cards SET status='sold',sold_at=now() WHERE id=$1",[cardId]);await client.query("INSERT INTO sales(id,card_id,seller_id,amount,payment_method,payment_status,reference) VALUES($1,$2,$3,$4,$5,$6,$7)",[saleId,cardId,req.user.sub,numericAmount,paymentMethod,finalCash?"success":"pending",reference]);await client.query("COMMIT");await audit(req.user.sub,"CREATE","sale",saleId,{cardId,amount:numericAmount,paymentMethod,paymentStatus:finalCash?"success":"pending",profile:card.profile,plan:card.plan_name||null,profileDurationMinutes:Number(card.profile_duration_minutes||0)});res.status(201).json({saleId,status:finalCash?"success":"pending",amount:numericAmount,profile:card.profile,durationMinutes:Number(card.profile_duration_minutes||0),card:finalCash?{username:card.username,password:decPass(card.password),profile:card.profile,price:numericAmount}:undefined});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();}});
+ app.get("/api/sales",auth,async(req,res)=>{const r=await pool.query("SELECT s.*,c.username card_username FROM sales s LEFT JOIN cards c ON c.id=s.card_id WHERE s.seller_id=$1 ORDER BY s.created_at DESC LIMIT 1000",[req.user.sub]);res.json({sales:r.rows});});
+ app.post("/api/payments/intents",auth,async(req,res)=>{
+   const { saleId, provider="cash" } = req.body;
+@@ -893,22 +924,22 @@ function hotspotBackupPattern(kind){ return kind === "status" ? /^hotspot\/statu
+ function validateHotspot(kind, content){ return kind === "status" ? validateStatusHtml(content) : validateLoginHtml(content); }
+ 
+ async function readHotspotFile(req,id,kind){
+-  const r=await getRouterForUser(req,id); const ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
++  const r=await getRouterForUser(req,id); const ros=rosFor(r);
+   try{ await ros.connect(); const file=hotspotFileName(kind); const files=await ros.command("/file/print",[`?name=${file}`]); const f=files[0]||{}; const content=String(f.contents||""); return {router:r,file,content,validation:validateHotspot(kind,content),updatedAt:f.creation_time||f["creation-time"]||null}; } finally { try{await ros.close();}catch{} }
+ }
+ 
+ app.get("/api/routers/:id/hotspot-status",auth,async(req,res)=>{try{res.json(await readHotspotFile(req,req.params.id,"status"));}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_READ_FAILED",detail:e.message});}});
+ app.post("/api/routers/:id/hotspot-status/validate",auth,async(req,res)=>{try{await getRouterForUser(req,req.params.id);res.json(validateStatusHtml(String(req.body.content||"")));}catch(e){res.status(400).json({valid:false,error:"HOTSPOT_STATUS_VALIDATE_FAILED",detail:e.message});}});
+ app.post("/api/routers/:id/hotspot-status/publish",auth,role("admin"),async(req,res)=>{
+-  let ros; try{const r=await getRouterForUser(req,req.params.id); const content=String(req.body.content||""); if(content.length<100||content.length>500000)return res.status(400).json({error:"INVALID_STATUS_HTML_SIZE"}); const validation=validateStatusHtml(content); if(!validation.valid)return res.status(400).json({error:"STATUS_HTML_INCOMPATIBLE",validation}); ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"}); await ros.connect(); const current=await ros.command("/file/print",["?name=hotspot/status.html"]); const old=String(current[0]?.contents||""); const backupName=`hotspot/status.html.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`; if(old){try{await ros.command("/file/add",[`=name=${backupName}`,`=contents=${old}`]);}catch{}} const target=current[0]?.[".id"]||current[0]?.id; if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]); else await ros.command("/file/add",["=name=hotspot/status.html",`=contents=${content}`]); await audit(req.user.sub,"PUBLISH","hotspot_status",req.params.id,{backup:backupName,bytes:Buffer.byteLength(content,"utf8")}); res.json({ok:true,file:"hotspot/status.html",backup:old?backupName:null,validation}); }catch(e){res.status(502).json({ok:false,error:"HOTSPOT_STATUS_PUBLISH_FAILED",detail:e.message});} finally{try{await ros?.close();}catch{}}
++  let ros; try{const r=await getRouterForUser(req,req.params.id); const content=String(req.body.content||""); if(content.length<100||content.length>500000)return res.status(400).json({error:"INVALID_STATUS_HTML_SIZE"}); const validation=validateStatusHtml(content); if(!validation.valid)return res.status(400).json({error:"STATUS_HTML_INCOMPATIBLE",validation}); ros=rosFor(r); await ros.connect(); const current=await ros.command("/file/print",["?name=hotspot/status.html"]); const old=String(current[0]?.contents||""); const backupName=`hotspot/status.html.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`; if(old){try{await ros.command("/file/add",[`=name=${backupName}`,`=contents=${old}`]);}catch{}} const target=current[0]?.[".id"]||current[0]?.id; if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]); else await ros.command("/file/add",["=name=hotspot/status.html",`=contents=${content}`]); await audit(req.user.sub,"PUBLISH","hotspot_status",req.params.id,{backup:backupName,bytes:Buffer.byteLength(content,"utf8")}); res.json({ok:true,file:"hotspot/status.html",backup:old?backupName:null,validation}); }catch(e){res.status(502).json({ok:false,error:"HOTSPOT_STATUS_PUBLISH_FAILED",detail:e.message});} finally{try{await ros?.close();}catch{}}
+ });
+-app.get("/api/routers/:id/hotspot-status/backups",auth,async(req,res)=>{let ros;try{const r=await getRouterForUser(req,req.params.id);ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});await ros.connect();const files=await ros.command("/file/print",[]);const backups=files.filter(f=>hotspotBackupPattern("status").test(String(f.name||""))).map(f=>({name:f.name,size:Number(f.size||0),creationTime:f.creation_time||f["creation-time"]||null})).sort((a,b)=>String(b.creationTime).localeCompare(String(a.creationTime)));res.json({backups});}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_BACKUPS_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
+-app.post("/api/routers/:id/hotspot-status/restore",auth,role("admin"),async(req,res)=>{let ros;try{const r=await getRouterForUser(req,req.params.id);const backup=String(req.body.backupName||"").trim();if(!hotspotBackupPattern("status").test(backup))return res.status(400).json({error:"INVALID_BACKUP_NAME"});ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});await ros.connect();const b=await ros.command("/file/print",[`?name=${backup}`]);const content=String(b[0]?.contents||"");const validation=validateStatusHtml(content);if(!validation.valid)return res.status(400).json({error:"BACKUP_INCOMPATIBLE",validation});const current=await ros.command("/file/print",["?name=hotspot/status.html"]);const target=current[0]?.[".id"]||current[0]?.id;if(!target)throw Error("STATUS_HTML_NOT_FOUND");await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]);await audit(req.user.sub,"RESTORE","hotspot_status",req.params.id,{backup});res.json({ok:true,backup});}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_RESTORE_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
++app.get("/api/routers/:id/hotspot-status/backups",auth,async(req,res)=>{let ros;try{const r=await getRouterForUser(req,req.params.id);ros=rosFor(r);await ros.connect();const files=await ros.command("/file/print",[]);const backups=files.filter(f=>hotspotBackupPattern("status").test(String(f.name||""))).map(f=>({name:f.name,size:Number(f.size||0),creationTime:f.creation_time||f["creation-time"]||null})).sort((a,b)=>String(b.creationTime).localeCompare(String(a.creationTime)));res.json({backups});}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_BACKUPS_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
++app.post("/api/routers/:id/hotspot-status/restore",auth,role("admin"),async(req,res)=>{let ros;try{const r=await getRouterForUser(req,req.params.id);const backup=String(req.body.backupName||"").trim();if(!hotspotBackupPattern("status").test(backup))return res.status(400).json({error:"INVALID_BACKUP_NAME"});ros=rosFor(r);await ros.connect();const b=await ros.command("/file/print",[`?name=${backup}`]);const content=String(b[0]?.contents||"");const validation=validateStatusHtml(content);if(!validation.valid)return res.status(400).json({error:"BACKUP_INCOMPATIBLE",validation});const current=await ros.command("/file/print",["?name=hotspot/status.html"]);const target=current[0]?.[".id"]||current[0]?.id;if(!target)throw Error("STATUS_HTML_NOT_FOUND");await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]);await audit(req.user.sub,"RESTORE","hotspot_status",req.params.id,{backup});res.json({ok:true,backup});}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_RESTORE_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
+ 
+ app.post("/api/routers/:id/hotspot-design/publish",auth,role("admin"),async(req,res)=>{
+   const {loginHtml,statusHtml}=req.body||{}; if(typeof loginHtml!=="string"||typeof statusHtml!=="string")return res.status(400).json({error:"LOGIN_AND_STATUS_REQUIRED"});
+   const lv=validateLoginHtml(loginHtml), sv=validateStatusHtml(statusHtml); if(!lv.valid||!sv.valid)return res.status(400).json({error:"HOTSPOT_DESIGN_INVALID",login:lv,status:sv});
+-  try{await getRouterForUser(req,req.params.id); const results={}; for(const [kind,content] of [["login",loginHtml],["status",statusHtml]]){const r=await getRouterForUser(req,req.params.id);const ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});try{await ros.connect();const file=hotspotFileName(kind);const current=await ros.command("/file/print",[`?name=${file}`]);const old=String(current[0]?.contents||"");const backupName=`${file}.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`;if(old){try{await ros.command("/file/add",[`=name=${backupName}`,`=contents=${old}`]);}catch{}}const target=current[0]?.[".id"]||current[0]?.id;if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]);else await ros.command("/file/add",[`=name=${file}`,`=contents=${content}`]);results[kind]={file,backup:old?backupName:null};}finally{try{await ros.close();}catch{}}}await audit(req.user.sub,"PUBLISH","hotspot_design",req.params.id,{loginBytes:Buffer.byteLength(loginHtml),statusBytes:Buffer.byteLength(statusHtml)});res.json({ok:true,results});}catch(e){res.status(502).json({error:"HOTSPOT_DESIGN_PUBLISH_FAILED",detail:e.message});}
++  try{await getRouterForUser(req,req.params.id); const results={}; for(const [kind,content] of [["login",loginHtml],["status",statusHtml]]){const r=await getRouterForUser(req,req.params.id);const ros=rosFor(r);try{await ros.connect();const file=hotspotFileName(kind);const current=await ros.command("/file/print",[`?name=${file}`]);const old=String(current[0]?.contents||"");const backupName=`${file}.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`;if(old){try{await ros.command("/file/add",[`=name=${backupName}`,`=contents=${old}`]);}catch{}}const target=current[0]?.[".id"]||current[0]?.id;if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]);else await ros.command("/file/add",[`=name=${file}`,`=contents=${content}`]);results[kind]={file,backup:old?backupName:null};}finally{try{await ros.close();}catch{}}}await audit(req.user.sub,"PUBLISH","hotspot_design",req.params.id,{loginBytes:Buffer.byteLength(loginHtml),statusBytes:Buffer.byteLength(statusHtml)});res.json({ok:true,results});}catch(e){res.status(502).json({error:"HOTSPOT_DESIGN_PUBLISH_FAILED",detail:e.message});}
+ });
+ 
+ app.get("/api/themes/:routerId",auth,async(req,res)=>{const r=await pool.query("SELECT * FROM hotspot_themes t JOIN routers r ON r.id=t.router_id WHERE t.router_id=$1 AND r.user_id=$2",[req.params.routerId,req.user.sub]);res.json(r.rows[0]||null);});
+@@ -950,4 +981,196 @@ app.post("/api/backup/restore",auth,role("admin"),async(req,res)=>{
+   }catch(e){await client.query("ROLLBACK");res.status(400).json({error:"BACKUP_RESTORE_FAILED",detail:e.message});}finally{client.release();}
+ });
+ 
+-const port=Number(process.env.PORT||8080);init().then(()=>app.listen(port,()=>console.log(`MICRO-MAX API on :${port}`))).catch(e=>{console.error(e);process.exit(1)});
++
++// ================= Router onboarding: Agent (remote, no open ports) and API-SSL (public IP) =================
++const agentLimiter=rateLimit({windowMs:60*1000,max:30,standardHeaders:true,legacyHeaders:false,keyGenerator:req=>hashToken(String(req.headers["x-agent-token"]||req.ip)).slice(0,24)});
++app.use("/api/agent",express.text({type:"*/*",limit:"16kb"}));
++async function agentAuth(req,res,next){
++  const token=String(req.headers["x-agent-token"]||"");
++  if(!/^mmag_[A-Za-z0-9_-]{20,}$/.test(token))return res.status(401).type("text/plain").send("# unauthorized\n");
++  try{
++    const q=await pool.query("SELECT id,user_id,name FROM routers WHERE agent_token_hash=$1 AND mode='agent'",[hashToken(token)]);
++    if(!q.rowCount)return res.status(401).type("text/plain").send("# unauthorized\n");
++    req.agent={router:q.rows[0],token}; next();
++  }catch{ res.status(500).type("text/plain").send("# error\n"); }
++}
++app.post("/api/agent/sync",agentLimiter,agentAuth,async(req,res)=>{
++  try{
++    const rid=req.agent.router.id; const info=parseReport(typeof req.body==="string"?req.body:"");
++    const up=await pool.query("WITH old AS (SELECT agent_offline_notified f FROM routers WHERE id=$1) UPDATE routers SET agent_last_seen=now(),agent_info=$2,agent_offline_notified=false WHERE id=$1 RETURNING (SELECT f FROM old) was_offline",[rid,JSON.stringify(info)]);
++    if(up.rows[0]?.was_offline)await pool.query("INSERT INTO notifications(id,user_id,title,body,level) VALUES($1,$2,$3,$4,'info')",[crypto.randomUUID(),req.agent.router.user_id,`الراوتر ${req.agent.router.name} عاد للاتصال`,"استؤنف وصول الاتصال من الراوتر وسيتم تنفيذ المهام المعلقة."]);
++    // jobs delivered but never acknowledged are retried (max 5 attempts)
++    await pool.query("UPDATE agent_jobs SET status=CASE WHEN attempts>=5 THEN 'failed' ELSE 'pending' END,error=CASE WHEN attempts>=5 THEN 'NO_ACK' ELSE error END WHERE router_id=$1 AND status='sent' AND sent_at < now() - interval '2 minutes'",[rid]);
++    await pool.query("UPDATE cards SET provision_state='failed' WHERE provision_state='pending' AND id IN (SELECT card_id FROM agent_jobs WHERE router_id=$1 AND status='failed' AND card_id IS NOT NULL)",[rid]);
++    const j=await pool.query("UPDATE agent_jobs SET status='sent',sent_at=now(),attempts=attempts+1 WHERE id IN (SELECT id FROM agent_jobs WHERE router_id=$1 AND status='pending' ORDER BY created_at LIMIT 300 FOR UPDATE SKIP LOCKED) RETURNING id,type,payload",[rid]);
++    const ok=[];
++    for(const job of j.rows){
++      try{ renderJobScript([job],{baseUrl:agentBase(req),token:req.agent.token}); ok.push(job); }
++      catch(e){ await pool.query("UPDATE agent_jobs SET status='failed',error=$2,done_at=now() WHERE id=$1",[job.id,String(e.message).slice(0,120)]); if(job.payload) await pool.query("UPDATE cards SET provision_state='failed' WHERE id=(SELECT card_id FROM agent_jobs WHERE id=$1)",[job.id]); }
++    }
++    res.type("text/plain").send(renderJobScript(ok,{baseUrl:agentBase(req),token:req.agent.token}));
++  }catch(e){ console.error("agent sync",e); res.status(500).type("text/plain").send("# error\n"); }
++});
++app.get("/api/agent/ack",agentLimiter,agentAuth,async(req,res)=>{
++  try{
++    const ids=String(req.query.j||"").split(",").filter(Boolean),okFlag=req.query.s==="ok";
++    if(!ids.length||ids.length>100||!ids.every(i=>/^[0-9a-f-]{36}$/.test(i)))return res.status(400).type("text/plain").send("bad");
++    const u=await pool.query("UPDATE agent_jobs SET status=$3,done_at=now(),error=$4 WHERE id=ANY($1::uuid[]) AND router_id=$2 AND status IN ('sent','pending') RETURNING card_id,type,payload",[ids,req.agent.router.id,okFlag?"done":"failed",okFlag?null:"ROUTER_REJECTED"]);
++    const cardIds=u.rows.map(r=>r.card_id).filter(Boolean);
++    if(cardIds.length)await pool.query("UPDATE cards SET provision_state=$2 WHERE id=ANY($1::uuid[])",[cardIds,okFlag?"ready":"failed"]);
++    for(const r of u.rows)if(r.type==="hotspot-profile-set")await pool.query("UPDATE hotspot_profiles SET provision_state=$3 WHERE router_id=$1 AND name=$2",[req.agent.router.id,r.payload?.name,okFlag?"ready":"failed"]);
++    res.type("text/plain").send("ok");
++  }catch{ res.status(500).type("text/plain").send("error"); }
++});
++
++// Import the profiles that really exist on the MikroTik so cards can be generated from them (button "عرض بروفايلات الراوتر").
++app.post("/api/routers/:id/hotspot-profiles/import",auth,async(req,res)=>{
++  let ros;
++  try{
++    const r=await getRouter(req,req.params.id);
++    let rows;
++    if(r.mode==="agent"){
++      const names=Array.isArray(r.agent_info?.profiles)?r.agent_info.profiles:[];
++      if(!r.agent_last_seen)return res.status(409).json({error:"AGENT_NOT_CONNECTED"});
++      if(!names.length)return res.status(409).json({error:"AGENT_PROFILES_NOT_REPORTED",detail:"شغّل سكربت الـ Agent المحدّث (rotate) ليرسل قائمة البروفايلات."});
++      rows=names.map(name=>({name,rate_limit:"",session_timeout:"",idle_timeout:"",shared_users:1,duration_minutes:0}));
++    }else{
++      ros=rosFor(r); await ros.connect();
++      rows=(await ros.command("/ip/hotspot/user/profile/print",[])).map(mapRouterProfile).filter(x=>x.name);
++    }
++    let added=0,updated=0;
++    for(const p of rows){
++      // price and manual duration are owned by MICRO-MAX: never overwritten by the import
++      const q=await pool.query(`INSERT INTO hotspot_profiles(id,router_id,name,price,duration_minutes,rate_limit,session_timeout,idle_timeout,shared_users,enabled,provision_state)
++        VALUES($1,$2,$3,0,$4,$5,$6,$7,$8,true,'ready')
++        ON CONFLICT(router_id,name) DO UPDATE SET
++          rate_limit=CASE WHEN $9 THEN hotspot_profiles.rate_limit ELSE EXCLUDED.rate_limit END,
++          session_timeout=CASE WHEN $9 THEN hotspot_profiles.session_timeout ELSE EXCLUDED.session_timeout END,
++          idle_timeout=CASE WHEN $9 THEN hotspot_profiles.idle_timeout ELSE EXCLUDED.idle_timeout END,
++          shared_users=CASE WHEN $9 THEN hotspot_profiles.shared_users ELSE EXCLUDED.shared_users END,
++          duration_minutes=CASE WHEN $9 OR EXCLUDED.duration_minutes=0 THEN hotspot_profiles.duration_minutes ELSE EXCLUDED.duration_minutes END,
++          provision_state='ready',updated_at=now() RETURNING (xmax=0) inserted`,
++        [crypto.randomUUID(),r.id,p.name,p.duration_minutes,p.rate_limit,p.session_timeout,p.idle_timeout,p.shared_users,r.mode==="agent"]);
++      q.rows[0].inserted?added++:updated++;
++    }
++    await audit(req.user.sub,"IMPORT","hotspot_profiles",r.id,{added,updated});
++    const l=await pool.query(`SELECT hp.name,hp.rate_limit,hp.session_timeout,hp.idle_timeout,hp.shared_users,hp.duration_minutes,
++      (SELECT p.id FROM hotspot_plans p WHERE p.router_id=hp.router_id AND p.profile_name=hp.name AND p.active=true ORDER BY p.created_at LIMIT 1) plan_id,
++      (SELECT p.price FROM hotspot_plans p WHERE p.router_id=hp.router_id AND p.profile_name=hp.name AND p.active=true ORDER BY p.created_at LIMIT 1) plan_price
++      FROM hotspot_profiles hp WHERE hp.router_id=$1 ORDER BY hp.name`,[r.id]);
++    res.json({added,updated,profiles:l.rows.map(x=>({name:x.name,rateLimit:x.rate_limit,sessionTimeout:x.session_timeout,idleTimeout:x.idle_timeout,sharedUsers:x.shared_users,durationMinutes:x.duration_minutes,planId:x.plan_id,planPrice:x.plan_price===null?null:Number(x.plan_price),readyForCards:!!x.plan_id&&Number(x.plan_price)>0}))});
++  }catch(e){
++    const code=e.message==="ROUTER_NOT_FOUND"?404:502;
++    res.status(code).json({error:code===502?"PROFILE_IMPORT_FAILED":e.message,detail:String(e?.code||e?.message||"").slice(0,200)});
++  }finally{ if(ros)await ros.close().catch(()=>{}); }
++});
++
++app.post("/api/routers/agent/enroll",auth,async(req,res)=>{
++  try{
++    const name=String(req.body?.name||"").trim().slice(0,80); if(!name)return res.status(400).json({error:"INVALID_INPUT"});
++    const base=agentBase(req); const token=newAgentToken(); const id=crypto.randomUUID();
++    await pool.query("INSERT INTO routers(id,user_id,name,host,port,username,password_enc,tls,mode,agent_token_hash) VALUES($1,$2,$3,'agent',0,'agent',$4,true,'agent',$5)",[id,req.user.sub,name,encrypt(crypto.randomBytes(16).toString("hex")),hashToken(token)]);
++    await audit(req.user.sub,"CREATE","router",id,{name,mode:"agent"});
++    res.status(201).json({id,name,mode:"agent",intervalSec:AGENT_INTERVAL_SEC,agent:{source:agentSource({baseUrl:base,token}),policy:AGENT_POLICY,interval:AGENT_INTERVAL_SEC+"s",caUrl:"https://curl.se/ca/cacert.pem"},script:buildEnrollScript({baseUrl:base,token,intervalSec:AGENT_INTERVAL_SEC}),note:"الصق السكربت في Winbox > New Terminal. يظهر الراوتر متصلاً خلال حوالي دقيقة. الرمز لا يُعرض مرة أخرى؛ استخدم rotate لإصدار سكربت جديد."});
++  }catch(e){ res.status(e.message==="PUBLIC_BASE_URL_REQUIRED"?500:400).json({error:e.message}); }
++});
++app.post("/api/routers/:id/agent/rotate",auth,async(req,res)=>{
++  try{
++    const r=await getRouter(req,req.params.id); if(r.mode!=="agent")return res.status(400).json({error:"NOT_AGENT_ROUTER"});
++    const token=newAgentToken();
++    await pool.query("UPDATE routers SET agent_token_hash=$2 WHERE id=$1",[r.id,hashToken(token)]);
++    await audit(req.user.sub,"ROTATE","router_agent",r.id);
++    res.json({id:r.id,agent:{source:agentSource({baseUrl:agentBase(req),token}),policy:AGENT_POLICY,interval:AGENT_INTERVAL_SEC+"s",caUrl:"https://curl.se/ca/cacert.pem"},script:buildEnrollScript({baseUrl:agentBase(req),token,intervalSec:AGENT_INTERVAL_SEC,includeCa:false})});
++  }catch(e){ res.status(e.message==="ROUTER_NOT_FOUND"?404:400).json({error:e.message}); }
++});
++app.get("/api/routers/:id/agent/status",auth,async(req,res)=>{
++  try{
++    const r=await getRouter(req,req.params.id); if(r.mode!=="agent")return res.status(400).json({error:"NOT_AGENT_ROUTER"});
++    const c=await pool.query("SELECT status,count(*)::int n FROM agent_jobs WHERE router_id=$1 AND created_at > now() - interval '7 days' GROUP BY status",[r.id]);
++    const jobs=Object.fromEntries(c.rows.map(x=>[x.status,x.n]));
++    const online=!!r.agent_last_seen&&Date.now()-new Date(r.agent_last_seen).getTime()<120000;
++    res.json({id:r.id,online,lastSeen:r.agent_last_seen,intervalSec:AGENT_INTERVAL_SEC,info:r.agent_info||{},jobs});
++  }catch(e){ res.status(e.message==="ROUTER_NOT_FOUND"?404:400).json({error:e.message}); }
++});
++app.post("/api/routers/direct-setup",auth,role("admin"),async(req,res)=>{
++  try{
++    const allowFrom=Array.isArray(req.body?.allowFrom)?req.body.allowFrom.slice(0,20):[];
++    const port=Number(req.body?.port)||8729;
++    if(!NET_CFG.routerPorts.includes(port))return res.status(400).json({error:"PORT_NOT_ALLOWED"});
++    const apiPass=crypto.randomBytes(18).toString("base64url").replace(/[^A-Za-z0-9]/g,"A").slice(0,24);
++    const script=buildDirectSetupScript({allowFrom,apiUser:"micromax",apiPass,port});
++    res.json({apiUser:"micromax",apiPassword:apiPass,port,tls:true,script,warning:allowFrom.length?null:"لم تحدد allowFrom: منفذ API-SSL سيكون مفتوحاً لكل الإنترنت. ضع عناوين Outbound IPs الخاصة بسيرفرك.",next:"شغّل السكربت على الراوتر، انسخ البصمة (fingerprint) التي يطبعها، ثم أضف الراوتر بنفس البيانات مع fingerprint."});
++  }catch(e){ res.status(400).json({error:e.message}); }
++});
++
++app.get("/api/insights",auth,async(req,res)=>{
++  try{
++    const plans=await pool.query(`SELECT p.id plan_id,p.name,p.price,p.currency,
++      count(c.id) FILTER (WHERE c.status='available' AND c.provision_state='ready')::int available,
++      count(c.id) FILTER (WHERE c.sold_at > now() - interval '7 days')::int sold_7d,
++      count(c.id) FILTER (WHERE c.sold_at > now() - interval '30 days')::int sold_30d,
++      COALESCE(sum(c.price) FILTER (WHERE c.sold_at > now() - interval '30 days'),0) revenue_30d
++      FROM hotspot_plans p JOIN routers r ON r.id=p.router_id LEFT JOIN cards c ON c.plan_id=p.id
++      WHERE r.user_id=$1 AND p.active=true GROUP BY p.id ORDER BY p.name`,[req.user.sub]);
++    let tz=String(process.env.APP_TIMEZONE||"UTC"); if(!/^[A-Za-z_\/+-]{1,40}$/.test(tz))tz="UTC";
++    let hours;
++    try{hours=await pool.query(`SELECT extract(hour from c.sold_at AT TIME ZONE $2)::int h,count(*)::int n FROM cards c JOIN routers r ON r.id=c.router_id WHERE r.user_id=$1 AND c.sold_at > now() - interval '30 days' GROUP BY 1`,[req.user.sub,tz]);}
++    catch{hours=await pool.query(`SELECT extract(hour from c.sold_at AT TIME ZONE 'UTC')::int h,count(*)::int n FROM cards c JOIN routers r ON r.id=c.router_id WHERE r.user_id=$1 AND c.sold_at > now() - interval '30 days' GROUP BY 1`,[req.user.sub]);tz="UTC";}
++    res.json({timezone:tz,...buildInsights({plans:plans.rows,hours:hours.rows})});
++  }catch(e){ console.error("insights",e); res.status(500).json({error:"INSIGHTS_FAILED"}); }
++});
++
++
++// ================= Professional tooling: security audit, fleet overview, config doctor =================
++app.get("/api/routers/:id/security-audit",auth,async(req,res)=>{
++  let ros;
++  try{
++    const r=await getRouter(req,req.params.id);
++    ros=rosFor(r); await ros.connect();
++    const safe=async path=>{try{return await ros.command(path,[]);}catch{return null;}};
++    const resource=(await safe("/system/resource/print"))?.[0]||null;
++    const data={
++      resource,services:await safe("/ip/service/print"),users:await safe("/user/print"),firewall:await safe("/ip/firewall/filter/print"),
++      dns:(await safe("/ip/dns/print"))?.[0]||null,discovery:(await safe("/ip/neighbor/discovery-settings/print"))?.[0]||null,
++      macServer:(await safe("/tool/mac-server/print"))?.[0]||null,ssh:(await safe("/ip/ssh/print"))?.[0]||null,hotspotProfiles:await safe("/ip/hotspot/profile/print")
++    };
++    const unreadable=Object.entries(data).filter(([,v])=>v===null).map(([k])=>k);
++    await audit(req.user.sub,"SECURITY_AUDIT","router",r.id,{});
++    res.json({routerId:r.id,name:r.name,readOnly:true,unreadable,...auditSecurity(data,{apiTls:!!r.tls})});
++  }catch(e){
++    const code=e.message==="ROUTER_NOT_FOUND"?404:e.message==="ROUTER_IS_AGENT_MODE"?400:502;
++    res.status(code).json({error:code===502?"SECURITY_AUDIT_FAILED":e.message,detail:String(e?.code||e?.message||"").slice(0,200)});
++  }finally{ if(ros)await ros.close().catch(()=>{}); }
++});
++
++app.get("/api/fleet",auth,async(req,res)=>{
++  try{
++    const q=await pool.query("SELECT id,name,host,port,tls,mode,agent_last_seen,agent_info FROM routers WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200",[req.user.sub]);
++    const rows=q.rows;
++    if(req.query.probe==="1"){
++      const direct=rows.filter(r=>r.mode!=="agent").slice(0,30);
++      await Promise.all(direct.map(async r=>{
++        if(net.isIP(r.host)&&!isAddressAllowed(r.host,NET_CFG)){r.probe=null;return;}
++        try{const p=await tcpProbe(r.host,r.port,!!r.tls,2500);r.probe={ok:!!p.ok,latencyMs:p.latencyMs};}catch{r.probe={ok:false};}
++      }));
++    }
++    res.json(fleetSummary(rows.map(({host,port,tls,...rest})=>rest)));
++  }catch(e){ console.error("fleet",e); res.status(500).json({error:"FLEET_FAILED"}); }
++});
++
++app.get("/api/system/doctor",auth,role("admin"),async(req,res)=>{
++  let dbOk=true; try{await pool.query("SELECT 1");}catch{dbOk=false;}
++  res.json(configDoctor({...process.env},{dbOk}));
++});
++
++function startMonitor(){
++  const tick=async()=>{
++    try{
++      const q=await pool.query("UPDATE routers SET agent_offline_notified=true WHERE mode='agent' AND agent_last_seen IS NOT NULL AND agent_last_seen < now() - interval '5 minutes' AND agent_offline_notified=false RETURNING id,user_id,name");
++      for(const r of q.rows)await pool.query("INSERT INTO notifications(id,user_id,title,body,level) VALUES($1,$2,$3,$4,'warning')",[crypto.randomUUID(),r.user_id,`الراوتر ${r.name} غير متصل`,"لم يصل أي اتصال من الراوتر منذ أكثر من 5 دقائق. تحقق من الكهرباء والإنترنت."]);
++    }catch(e){ console.error("monitor",e.message); }
++  };
++  setInterval(tick,60000).unref();
++}
++
++const port=Number(process.env.PORT||8080);init().then(()=>{app.listen(port,()=>console.log(`MICRO-MAX API on :${port}`));startMonitor();}).catch(e=>{console.error(e);process.exit(1)});
+diff --git a/backend/test/agent.test.mjs b/backend/test/agent.test.mjs
+new file mode 100644
+index 0000000..3974740
+--- /dev/null
++++ b/backend/test/agent.test.mjs
+@@ -0,0 +1,113 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { newAgentToken, hashToken, tokenMatches, rosSafe, renderJobScript, parseReport, buildEnrollScript, buildDirectSetupScript, generateCredentials, normalizeBaseUrl } from "../src/agent.js";
++
++const base = "https://example.onrender.com";
++const uuid = "123e4567-e89b-12d3-a456-426614174000";
++
++test("token generation and matching", () => {
++  const t = newAgentToken();
++  assert.match(t, /^mmag_[A-Za-z0-9_-]{40,}$/);
++  assert.equal(tokenMatches(t, hashToken(t)), true);
++  assert.equal(tokenMatches(t + "x", hashToken(t)), false);
++  assert.equal(tokenMatches(t, "zz"), false);
++});
++test("rosSafe rejects script-injection characters", () => {
++  for (const bad of ['a"b', "a$b", "a[b", "a]b", "a\\b", "a;b", "a\nb", "a`b", "x".repeat(65)]) assert.throws(() => rosSafe(bad), /UNSAFE_VALUE/, bad);
++  assert.equal(rosSafe("Plan 1GB_ok-1.5@x:y"), "Plan 1GB_ok-1.5@x:y");
++  assert.equal(rosSafe("باقة يومية"), "باقة يومية");
++});
++test("renderJobScript builds idempotent add and remove with acks", () => {
++  const t = newAgentToken();
++  const out = renderJobScript([
++    { id: uuid, type: "hotspot-user-add", payload: { username: "MM123456", password: "ABC234", profile: "1 Day", comment: "MICRO-MAX:" + uuid } },
++    { id: uuid, type: "hotspot-user-remove", payload: { username: "MM123456" } }
++  ], { baseUrl: base, token: t });
++  assert.match(out, /\[:len \[\/ip hotspot user find where name="MM123456"\]\] = 0/);
++  assert.match(out, /\/ip hotspot user remove \[find where name="MM123456"\]/);
++  assert.match(out, /api\/agent\/ack\?j=123e4567[^"]*&s=ok/);
++  assert.match(out, /check-certificate=yes-without-crl/);
++});
++test("renderJobScript refuses unsafe values, unknown types, bad ids and http", () => {
++  const t = newAgentToken();
++  assert.throws(() => renderJobScript([{ id: uuid, type: "hotspot-user-add", payload: { username: 'x"; /system reset-configuration; "', password: "a", profile: "p" } }], { baseUrl: base, token: t }), /UNSAFE_VALUE/);
++  assert.throws(() => renderJobScript([{ id: uuid, type: "system-reset", payload: {} }], { baseUrl: base, token: t }), /UNKNOWN_JOB_TYPE/);
++  assert.throws(() => renderJobScript([{ id: "x", type: "hotspot-user-remove", payload: { username: "a" } }], { baseUrl: base, token: t }), /BAD_JOB_ID/);
++  assert.throws(() => renderJobScript([], { baseUrl: "http://x.com", token: t }), /HTTPS/);
++  assert.throws(() => renderJobScript([], { baseUrl: base, token: "bad" }), /BAD_TOKEN/);
++});
++test("renderJobScript with no jobs is a harmless comment", () => {
++  assert.equal(renderJobScript([], { baseUrl: base, token: newAgentToken() }).trim(), "# MICRO-MAX jobs (0)");
++});
++test("parseReport keeps only known keys and sanitizes", () => {
++  const r = parseReport("v=7.15 (stable)&board=hAP ax2&cpu=12&uptime=1w2d3h&active=5&name=Shop 1&evil=1&cpu2=9");
++  assert.deepEqual(r, { v: "7.15 (stable)", board: "hAP ax2", cpu: 12, uptime: "1w2d3h", active: 5, name: "Shop 1" });
++  assert.equal(parseReport("cpu=abc").cpu, 0);
++  assert.deepEqual(parseReport(null), {});
++  assert.equal(parseReport("name=a\"$[x]").name, "ax");
++});
++test("enroll script: structure and escaping inside source string", () => {
++  const t = newAgentToken();
++  const s = buildEnrollScript({ baseUrl: base, token: t, intervalSec: 5000 });
++  assert.match(s, /\/system scheduler add name=micromax-agent interval=300s start-time=startup/);
++  assert.match(s, /certificate import/);
++  const m = s.match(/\/system script add name=micromax-agent policy=\S+ source="(.*)"\n/);
++  assert.ok(m, "script add line present on a single line");
++  const src = m[1];
++  assert.ok(!/(^|[^\\])\$/.test(src), "every $ is escaped");
++  assert.ok(!/(^|[^\\])"/.test(src), "every quote is escaped");
++  assert.ok(src.includes(t) && src.includes(base) && src.includes('/api/agent/sync'));
++  assert.equal(buildEnrollScript({ baseUrl: base, token: t, includeCa: false }).includes("cacert"), false);
++  assert.match(buildEnrollScript({ baseUrl: base, token: t, intervalSec: 1 }), /interval=10s/);
++});
++test("direct (API-SSL) setup script", () => {
++  const s = buildDirectSetupScript({ allowFrom: ["203.0.113.5", "198.51.100.0/24"], apiPass: "Abcdefghijkl1234" });
++  assert.match(s, /\/ip service set api-ssl certificate=micromax-api port=8729 disabled=no address=203\.0\.113\.5,198\.51\.100\.0\/24/);
++  assert.match(s, /\/ip service set api disabled=yes/);
++  assert.match(s, /fingerprint/);
++  assert.throws(() => buildDirectSetupScript({ allowFrom: ["1.1.1.1; /x"], apiPass: "Abcdefghijkl1234" }), /BAD_CIDR/);
++  assert.throws(() => buildDirectSetupScript({ apiPass: "short" }), /WEAK_PASSWORD/);
++  assert.throws(() => buildDirectSetupScript({ apiPass: 'Abcdefghijkl"1234' }), /UNSAFE_VALUE/);
++  assert.doesNotThrow(() => buildDirectSetupScript({ apiPass: "Abcdefghijkl1234" }));
++});
++test("normalizeBaseUrl", () => {
++  assert.equal(normalizeBaseUrl("https://a.com/path?x=1"), "https://a.com");
++  assert.throws(() => normalizeBaseUrl("http://a.com"), /HTTPS/);
++});
++test("generateCredentials: unique, avoids taken, honors pin mode and space limits", () => {
++  const c = generateCredentials({ count: 500, prefix: "MM", digits: 4, letters: 0, passLen: 8 });
++  assert.equal(new Set(c.map(x => x.username)).size, 500);
++  assert.ok(c.every(x => /^MM\d{4}$/.test(x.username) && x.password.length === 8));
++  const pin = generateCredentials({ count: 5, prefix: "MM", digits: 8, letters: 0, pin: true });
++  assert.ok(pin.every(x => x.password === x.username));
++  const taken = new Set(Array.from({ length: 9990 }, (_, i) => "MM" + String(i).padStart(4, "0")));
++  const rest = generateCredentials({ count: 10, prefix: "MM", digits: 4, letters: 0, taken });
++  assert.ok(rest.every(x => !taken.has(x.username)));
++  assert.throws(() => generateCredentials({ count: 20, prefix: "MM", digits: 1, letters: 0 }), /EXHAUSTED/);
++});
++
++test("hotspot-profile-set job: idempotent add-or-set, validated values", () => {
++  const t = newAgentToken();
++  const out = renderJobScript([{ id: uuid, type: "hotspot-profile-set", payload: { name: "يومي-2M", sharedUsers: 1, rateLimit: "2M/5M", sessionTimeout: "1d", idleTimeout: "10m" } }], { baseUrl: base, token: t });
++  assert.match(out, /\/ip hotspot user profile find where name="يومي-2M"\]\] = 0/);
++  assert.match(out, /profile add name="يومي-2M" shared-users=1 rate-limit=2M\/5M session-timeout=1d idle-timeout=10m/);
++  assert.match(out, /else=\{ \/ip hotspot user profile set \[find where name="يومي-2M"\]/);
++  assert.match(out, /s=ok/);
++  const bad = p => () => renderJobScript([{ id: uuid, type: "hotspot-profile-set", payload: { name: "x", ...p } }], { baseUrl: base, token: t });
++  assert.throws(bad({ rateLimit: "2M/5M; /system reset-configuration" }), /UNSAFE_VALUE/);
++  assert.throws(bad({ sessionTimeout: "1d\"; x" }), /UNSAFE_VALUE/);
++  assert.throws(bad({ sharedUsers: 0 }), /UNSAFE_VALUE/);
++  assert.throws(bad({ sharedUsers: 5000 }), /UNSAFE_VALUE/);
++  assert.throws(() => renderJobScript([{ id: uuid, type: "hotspot-profile-set", payload: { name: 'a"b' } }], { baseUrl: base, token: t }), /UNSAFE_VALUE/);
++});
++
++import { agentSource, AGENT_POLICY } from "../src/agent.js";
++test("agentSource is the raw (unescaped) script pushed through the RouterOS API", () => {
++  const t = newAgentToken();
++  const src = agentSource({ baseUrl: base, token: t });
++  assert.ok(src.includes('\n') && !src.includes('\\n'), "real newlines");
++  assert.ok(src.includes(`:local tk "${t}";`) && src.includes(`${base}"`));
++  assert.ok(src.includes('$d') && !src.includes('\\$'), "no terminal-style escaping");
++  assert.equal(AGENT_POLICY, "read,write,test,policy,ftp,sensitive");
++  assert.throws(() => agentSource({ baseUrl: base, token: "bad" }), /BAD_TOKEN/);
++});
+diff --git a/backend/test/insights.test.mjs b/backend/test/insights.test.mjs
+new file mode 100644
+index 0000000..bd62de0
+--- /dev/null
++++ b/backend/test/insights.test.mjs
+@@ -0,0 +1,30 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { buildInsights } from "../src/insights.js";
++
++test("runway, status and restock suggestion", () => {
++  const r = buildInsights({ plans: [
++    { plan_id: "a", name: "يومي", price: 5, available: 10, sold_7d: 70, sold_30d: 300, revenue_30d: 1500 },
++    { plan_id: "b", name: "أسبوعي", price: 20, available: 0, sold_7d: 7, sold_30d: 20, revenue_30d: 400 },
++    { plan_id: "c", name: "شهري", price: 50, available: 100, sold_7d: 1, sold_30d: 4, revenue_30d: 200 },
++    { plan_id: "d", name: "خامل", price: 1, available: 5, sold_7d: 0, sold_30d: 0, revenue_30d: 0 },
++    { plan_id: "e", name: "فارغ", price: 1, available: 0, sold_7d: 0, sold_30d: 0, revenue_30d: 0 }
++  ], hours: [{ h: 20, n: 50 }, { h: 21, n: 80 }, { h: 9, n: 5 }, { h: 3, n: 1 }, { h: 25, n: 99 }] });
++  const by = Object.fromEntries(r.plans.map(p => [p.planId, p]));
++  assert.equal(by.a.dailyRate, 10);              // 0.6*10 + 0.4*10
++  assert.equal(by.a.status, "critical");         // 10 cards / 10 per day = 1 day
++  assert.equal(by.a.suggestedRestock, 110);      // ceil(10*10*1.15)=115 -> minus 10 = 105 -> rounded to 110
++  assert.equal(by.b.status, "out");
++  assert.equal(by.c.status, "ok");
++  assert.equal(by.c.suggestedRestock, 0);
++  assert.equal(by.d.status, "idle");
++  assert.equal(by.e.status, "empty");
++  assert.equal(by.d.daysLeft, null);
++  assert.deepEqual(r.alerts.map(a => a.planId).sort(), ["a", "b"]);
++  assert.deepEqual(r.peakHours.map(x => x.hour), [21, 20, 9]);
++  assert.equal(r.bestPlan.planId, "a");
++});
++test("empty input is safe", () => {
++  const r = buildInsights({});
++  assert.deepEqual(r, { plans: [], alerts: [], peakHours: [], bestPlan: null });
++});
+diff --git a/backend/test/netguard.test.mjs b/backend/test/netguard.test.mjs
+new file mode 100644
+index 0000000..c7d6949
+--- /dev/null
++++ b/backend/test/netguard.test.mjs
+@@ -0,0 +1,45 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { classifyIp, isAddressAllowed, assertRouterTarget, validHostname, parsePorts, guardedLookup, safeGet } from "../src/netguard.js";
++
++const cfgPublic = { allowPrivate: false, routerPorts: [8728, 8729], portalPorts: [80, 443] };
++const cfgLan = { ...cfgPublic, allowPrivate: true };
++
++test("classifyIp", () => {
++  for (const ip of ["127.0.0.1", "0.0.0.0", "169.254.169.254", "::1", "fe80::1", "224.0.0.1", "::ffff:127.0.0.1", "not-an-ip"]) assert.equal(classifyIp(ip), "blocked", ip);
++  for (const ip of ["10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.88.1", "100.64.0.1", "fd00::1"]) assert.equal(classifyIp(ip), "private", ip);
++  for (const ip of ["8.8.8.8", "172.32.0.1", "172.15.0.1", "1.1.1.1", "2606:4700::1111"]) assert.equal(classifyIp(ip), "public", ip);
++});
++test("private only allowed for local deployments, blocked never", () => {
++  assert.equal(isAddressAllowed("192.168.88.1", cfgPublic), false);
++  assert.equal(isAddressAllowed("192.168.88.1", cfgLan), true);
++  assert.equal(isAddressAllowed("169.254.169.254", cfgLan), false);
++  assert.equal(isAddressAllowed("127.0.0.1", cfgLan), false);
++});
++test("assertRouterTarget", () => {
++  assert.deepEqual(assertRouterTarget("8.8.8.8", 8729, cfgPublic), { host: "8.8.8.8", port: 8729 });
++  assert.throws(() => assertRouterTarget("8.8.8.8", 22, cfgPublic), /PORT_NOT_ALLOWED/);
++  assert.throws(() => assertRouterTarget("127.0.0.1", 8728, cfgPublic), /HOST_NOT_ALLOWED/);
++  assert.throws(() => assertRouterTarget("192.168.1.1", 8728, cfgPublic), /HOST_NOT_ALLOWED/);
++  assert.doesNotThrow(() => assertRouterTarget("192.168.1.1", 8728, cfgLan));
++  assert.throws(() => assertRouterTarget("bad host!", 8728, cfgPublic), /INVALID_HOST/);
++  assert.doesNotThrow(() => assertRouterTarget("router.example.com", 8728, cfgPublic));
++});
++test("validHostname / parsePorts", () => {
++  assert.equal(validHostname("a.b-c.example.com"), true);
++  assert.equal(validHostname("-bad.com"), false);
++  assert.equal(validHostname("a b"), false);
++  assert.deepEqual(parsePorts("8728, 8729,x,99999", [1]), [8728, 8729]);
++  assert.deepEqual(parsePorts("", [1]), [1]);
++});
++test("guardedLookup blocks localhost at connect time", async () => {
++  const lookup = guardedLookup(cfgPublic);
++  const err = await new Promise(r => lookup("localhost", {}, e => r(e)));
++  assert.ok(err); assert.equal(err.code, "HOST_NOT_ALLOWED");
++});
++test("safeGet rejects loopback, bad ports and metadata", async () => {
++  await assert.rejects(safeGet("http://127.0.0.1:80/", { cfg: cfgPublic }), /HOST_NOT_ALLOWED/);
++  await assert.rejects(safeGet("http://example.com:22/", { cfg: cfgPublic }), /PORT_NOT_ALLOWED/);
++  await assert.rejects(safeGet("ftp://example.com/", { cfg: cfgPublic }), /HTTP_OR_HTTPS/);
++  await assert.rejects(safeGet("http://169.254.169.254/latest/meta-data", { cfg: cfgLan }), /HOST_NOT_ALLOWED/);
++});
+diff --git a/backend/test/profiles.test.mjs b/backend/test/profiles.test.mjs
+new file mode 100644
+index 0000000..1d788d0
+--- /dev/null
++++ b/backend/test/profiles.test.mjs
+@@ -0,0 +1,52 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { parseRosDuration, mapRouterProfile } from "../src/profiles.js";
++import { renderJobScript, parseReport, buildEnrollScript, newAgentToken } from "../src/agent.js";
++
++const base = "https://example.onrender.com";
++const mk = i => ({ id: `123e4567-e89b-12d3-a456-4266141${String(i).padStart(5, "0")}`, type: "hotspot-user-add", payload: { username: "MM" + i, password: "pw" + i, profile: "1 Day" } });
++
++test("parseRosDuration", () => {
++  assert.equal(parseRosDuration("1d"), 1440);
++  assert.equal(parseRosDuration("1w2d3h4m"), 10080 + 2880 + 180 + 4);
++  assert.equal(parseRosDuration("1d12:00:00"), 1440 + 720);
++  assert.equal(parseRosDuration("30m"), 30);
++  assert.equal(parseRosDuration("00:00:00"), 0);
++  assert.equal(parseRosDuration(""), 0);
++  assert.equal(parseRosDuration(undefined), 0);
++});
++test("mapRouterProfile", () => {
++  assert.deepEqual(mapRouterProfile({ name: "Daily", "rate-limit": "2M/5M", "session-timeout": "1d", "idle-timeout": "10m", "shared-users": "2" }),
++    { name: "Daily", rate_limit: "2M/5M", session_timeout: "1d", idle_timeout: "10m", shared_users: 2, duration_minutes: 1440 });
++  assert.equal(mapRouterProfile({ name: "x" }).shared_users, 1);
++  assert.equal(mapRouterProfile({ name: "x", "shared-users": "unlimited" }).shared_users, 1);
++});
++test("bulk user-add jobs are chunked: one ack per 25 cards, ids comma-separated", () => {
++  const jobs = Array.from({ length: 60 }, (_, i) => mk(i));
++  const out = renderJobScript(jobs, { baseUrl: base, token: newAgentToken() });
++  const lines = out.trim().split("\n").slice(1);
++  assert.equal(lines.length, 3);                    // 25 + 25 + 10
++  assert.equal((lines[0].match(/\/ip hotspot user add/g) || []).length, 25);
++  assert.equal((lines[2].match(/\/ip hotspot user add/g) || []).length, 10);
++  assert.match(lines[0], /\$bad = 0\) do=\{ \/tool fetch url="[^"]*ack\?j=([0-9a-f-]{36},){24}[0-9a-f-]{36}&s=ok/);
++  assert.match(lines[0], /&s=fail/);
++  assert.equal((out.match(/user find where name=/g) || []).length, 60, "every add stays idempotent");
++});
++test("chunk is flushed before a non-add job keeps order", () => {
++  const t = newAgentToken();
++  const out = renderJobScript([mk(1), { id: mk(2).id, type: "hotspot-user-remove", payload: { username: "MM9" } }, mk(3)], { baseUrl: base, token: t });
++  const l = out.trim().split("\n").slice(1);
++  assert.equal(l.length, 3);
++  assert.match(l[0], /user add name="MM1"/); assert.match(l[1], /user remove/); assert.match(l[2], /user add name="MM3"/);
++});
++test("heartbeat reports profile names; parseReport sanitizes them", () => {
++  const r = parseReport("v=7.15&cpu=3&pf=default|1 Day|Week 2M|bad\"name|x$y|1 Day|");
++  assert.deepEqual(r.profiles, ["default", "1 Day", "Week 2M"]);
++  assert.equal(r.cpu, 3);
++  assert.deepEqual(parseReport("cpu=1").profiles, undefined);
++  const s = buildEnrollScript({ baseUrl: base, token: newAgentToken() });
++  assert.match(s, /hotspot user profile find/);
++  assert.match(s, /&pf=/);
++  const m = s.match(/\/system script add name=micromax-agent policy=\S+ source="(.*)"\n/);
++  assert.ok(m && !/(^|[^\\])"/.test(m[1]) && !/(^|[^\\])\$[^\\]/.test(m[1].replace(/\\\$/g, "")) , "source stays a single escaped line");
++});
+diff --git a/backend/test/qr.test.mjs b/backend/test/qr.test.mjs
+new file mode 100644
+index 0000000..d35a264
+--- /dev/null
++++ b/backend/test/qr.test.mjs
+@@ -0,0 +1,95 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import vm from "node:vm";
++import { buildQrUrl, parseQr, verifyQr, qrSecretFrom, buildWifiQr } from "../src/cards.js";
++import { analyzeLoginHtml } from "../src/qrcheck.js";
++
++const secret = qrSecretFrom("test-key");
++const portal = "http://192.168.88.1/login";
++const cardId = "123e4567-e89b-12d3-a456-426614174000";
++const tpl = f => fs.readFileSync(new URL(`../../hotspot-templates/${f}`, import.meta.url), "utf8");
++
++// Runs the REAL shipped template script against a stubbed browser, exactly as a phone would after scanning the QR.
++function scan(file, qrUrl, { errorText = "$(error)", storage = new Map(), now = 1_000_000 } = {}) {
++  const html = tpl(file);
++  const u = new URL(qrUrl);
++  const form = { username: { value: "", addEventListener() {} }, password: { value: "" }, submitted: 0, addEventListener() {}, querySelector: () => ({ textContent: "" }), submit() { this.submitted++; } };
++  const calls = { replaceState: [] };
++  const sandbox = {
++    location: { search: u.search, pathname: u.pathname },
++    history: { replaceState: (...a) => calls.replaceState.push(a) },
++    sessionStorage: { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) },
++    document: { forms: [form], getElementById: () => ({ href: "" }), querySelectorAll: () => [], querySelector: () => ({ textContent: errorText }) },
++    Date: { now: () => now }, URLSearchParams, encodeURIComponent, Number, String
++  };
++  vm.createContext(sandbox);
++  for (const m of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) vm.runInContext(m[1], sandbox);
++  return { form, calls, storage };
++}
++
++test("user+password QR: scanning logs in with no typing (login.html)", () => {
++  const qr = buildQrUrl({ portalUrl: portal, username: "MM123456", password: "ABC234XY", cardId, secret });
++  const { form, calls } = scan("login.html", qr);
++  assert.equal(form.submitted, 1);
++  assert.equal(form.username.value, "MM123456");
++  assert.equal(form.password.value, "ABC234XY");
++  assert.equal(calls.replaceState.length, 1, "credentials stripped from the address bar / history");
++  assert.equal(calls.replaceState[0][2], "/login");
++});
++test("code-only (PIN) QR carries no password and still logs in (login.html and login-code.html)", () => {
++  const qr = buildQrUrl({ portalUrl: portal, username: "MM12345678", password: "", cardId, secret });
++  assert.ok(!new URL(qr).searchParams.has("password"));
++  for (const f of ["login.html", "login-code.html"]) {
++    const { form } = scan(f, qr);
++    assert.equal(form.submitted, 1, f);
++    assert.equal(form.username.value, "MM12345678", f);
++    assert.equal(form.password.value, "MM12345678", f);
++  }
++});
++test("no auto-submit after a failed login, and loop protection within 15s", () => {
++  const qr = buildQrUrl({ portalUrl: portal, username: "MM1", password: "pw123456", cardId, secret });
++  assert.equal(scan("login.html", qr, { errorText: "invalid username or password" }).form.submitted, 0);
++  const storage = new Map();
++  assert.equal(scan("login.html", qr, { storage, now: 1_000_000 }).form.submitted, 1);
++  assert.equal(scan("login.html", qr, { storage, now: 1_005_000 }).form.submitted, 0);
++  assert.equal(scan("login.html", qr, { storage, now: 1_020_000 }).form.submitted, 1, "a later re-scan works again");
++});
++test("QR without auto=1 only prefills", () => {
++  const qr = buildQrUrl({ portalUrl: portal, username: "MM1", password: "pw123456", cardId, secret }).replace("&auto=1", "");
++  const { form } = scan("login.html", qr);
++  assert.equal(form.submitted, 0);
++  assert.equal(form.password.value, "pw123456");
++});
++test("QR content round-trips and signature detects tampering", () => {
++  const qr = buildQrUrl({ portalUrl: portal, username: "MM123456", password: "ABC234XY", cardId, secret });
++  const p = parseQr(qr);
++  assert.equal(p.username, "MM123456"); assert.equal(p.password, "ABC234XY"); assert.equal(p.cardId, cardId);
++  assert.equal(verifyQr(secret, p), true);
++  assert.equal(verifyQr(secret, { ...p, username: "MM999999" }), false);
++  assert.equal(new URL(qr).searchParams.get("dst"), "http://192.168.88.1/");
++});
++test("special characters in credentials survive URL encoding", () => {
++  const qr = buildQrUrl({ portalUrl: portal, username: "MM1", password: "a&b=c d", cardId, secret });
++  assert.equal(parseQr(qr).password, "a&b=c d");
++  assert.equal(scan("login.html", qr).form.password.value, "a&b=c d");
++});
++test("Wi-Fi QR format", () => {
++  assert.equal(buildWifiQr("Cafe WiFi"), "WIFI:T:nopass;S:Cafe WiFi;;");
++  assert.equal(buildWifiQr("A;B"), "WIFI:T:nopass;S:A\\;B;;");
++  assert.equal(buildWifiQr(""), null);
++  assert.equal(buildWifiQr("x".repeat(33)), null);
++});
++test("static analysis: shipped templates are auto-login capable, a plain login page is not", () => {
++  for (const f of ["login.html", "login-code.html"]) {
++    const a = analyzeLoginHtml(tpl(f));
++    assert.equal(a.autoLogin, true, f);
++    assert.equal(a.stripsCredentials, true, f);
++    assert.deepEqual(a.warnings, [], f);
++  }
++  const plain = '<form action="$(link-login-only)" method="post"><input name="username"><input name="password"></form>';
++  const b = analyzeLoginHtml(plain);
++  assert.equal(b.autoLogin, false);
++  assert.ok(b.warnings.includes("LOGIN_HTML_DOES_NOT_AUTO_SUBMIT_FROM_QR"));
++  assert.ok(analyzeLoginHtml("<html></html>").warnings.includes("LOGIN_FORM_NOT_DETECTED"));
++});
+diff --git a/backend/test/routeros-pin.test.mjs b/backend/test/routeros-pin.test.mjs
+new file mode 100644
+index 0000000..3738916
+--- /dev/null
++++ b/backend/test/routeros-pin.test.mjs
+@@ -0,0 +1,34 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import tls from "node:tls";
++import crypto from "node:crypto";
++import { execFileSync } from "node:child_process";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { RouterOS } from "../src/routeros.js";
++
++function makeCert() {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mm-"));
++  try {
++    execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", path.join(dir, "k.pem"), "-out", path.join(dir, "c.pem"), "-days", "2", "-subj", "/CN=router.test"], { stdio: "ignore" });
++  } catch { return null; }
++  const cert = fs.readFileSync(path.join(dir, "c.pem")); const key = fs.readFileSync(path.join(dir, "k.pem"));
++  const fp = new crypto.X509Certificate(cert).fingerprint256;
++  return { cert, key, fp };
++}
++
++const c = makeCert();
++test("certificate pinning: wrong pin rejected, right pin accepted", { skip: !c && "openssl not available" }, async () => {
++  const server = tls.createServer({ cert: c.cert, key: c.key }, sock => { sock.on("error", () => {}); sock.on("data", () => sock.end()); });
++  await new Promise(r => server.listen(0, "127.0.0.1", r));
++  const port = server.address().port;
++  const mk = pin => new RouterOS({ host: "127.0.0.1", port, username: "u", password: "p", tls: true, pinSha256: pin, timeout: 1500 });
++  const bad = mk("00".repeat(32));
++  await assert.rejects(bad.connect(), e => e.code === "CERT_PIN_MISMATCH");
++  const good = mk(c.fp);
++  await assert.rejects(good.connect(), e => e.code !== "CERT_PIN_MISMATCH"); // passes TLS pin, then fails at RouterOS login (server just closes)
++  const unpinned = new RouterOS({ host: "127.0.0.1", port, username: "u", password: "p", tls: true, timeout: 1500 });
++  await assert.rejects(unpinned.connect(), e => /self[- ]signed|SELF_SIGNED|UNABLE_TO/i.test(String(e.code || e.message)));
++  server.close();
++});
+diff --git a/backend/test/security.test.mjs b/backend/test/security.test.mjs
+new file mode 100644
+index 0000000..397fe66
+--- /dev/null
++++ b/backend/test/security.test.mjs
+@@ -0,0 +1,85 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { auditSecurity } from "../src/security.js";
++import { fleetSummary, configDoctor } from "../src/fleet.js";
++
++const hardened = {
++  resource: { version: "7.15.3 (stable)" },
++  services: [
++    { name: "telnet", disabled: "true" }, { name: "ftp", disabled: "true" }, { name: "www", disabled: "true" }, { name: "api", disabled: "true" },
++    { name: "winbox", disabled: "false", address: "203.0.113.5/32" }, { name: "ssh", disabled: "false", address: "203.0.113.5/32" }, { name: "api-ssl", disabled: "false", address: "198.51.100.7/32" }
++  ],
++  users: [{ name: "boss", disabled: "false" }, { name: "admin", disabled: "true" }],
++  firewall: [{ chain: "input", action: "accept", disabled: "false" }, { chain: "input", action: "drop", disabled: "false" }],
++  dns: { "allow-remote-requests": "true" }, discovery: { "discover-interface-list": "LAN" }, macServer: { "allowed-interface-list": "LAN" },
++  ssh: { "strong-crypto": "true" }, hotspotProfiles: [{ "login-by": "http-pap,https" }]
++};
++const bad = {
++  resource: { version: "6.48.6 (long-term)" },
++  services: [
++    { name: "telnet", disabled: "false", address: "" }, { name: "ftp", disabled: "false" }, { name: "www", disabled: "false" }, { name: "api", disabled: "false" },
++    { name: "winbox", disabled: "false", address: "" }, { name: "ssh", disabled: "false", address: "0.0.0.0/0" }, { name: "api-ssl", disabled: "false", address: "" }
++  ],
++  users: [{ name: "admin", disabled: "false" }],
++  firewall: [{ chain: "forward", action: "accept", disabled: "false" }, { chain: "input", action: "drop", disabled: "true" }],
++  dns: { "allow-remote-requests": "true" }, discovery: { "discover-interface-list": "all" }, macServer: { "allowed-interface-list": "all" },
++  ssh: { "strong-crypto": "false" }, hotspotProfiles: [{ "login-by": "http-pap" }]
++};
++
++test("hardened router scores A with no findings", () => {
++  const r = auditSecurity(hardened, { apiTls: true });
++  assert.equal(r.score, 100); assert.equal(r.grade, "A"); assert.deepEqual(r.findings, []); assert.equal(r.fixScript, "");
++});
++test("bad router: all key findings, low score", () => {
++  const r = auditSecurity(bad, { apiTls: false });
++  const ids = r.findings.map(f => f.id);
++  for (const id of ["SVC_TELNET", "SVC_FTP", "SVC_WWW", "SVC_API_PLAIN", "SVC_WINBOX_OPEN", "SVC_SSH_OPEN", "SVC_APISSL_OPEN", "FW_NO_INPUT_DROP", "DNS_OPEN_RESOLVER", "DISCOVERY_ALL", "MACSERVER_ALL", "ADMIN_DEFAULT_USER", "SSH_WEAK_CRYPTO", "OS_V6", "HOTSPOT_PAP_HTTP"]) assert.ok(ids.includes(id), id);
++  assert.ok(r.score <= 20, String(r.score)); assert.equal(r.grade, "F");
++  assert.equal(r.counts.high, 4);
++});
++test("safe fix script excludes risky/needs-input fixes and never disables the API we use", () => {
++  const r = auditSecurity(bad, { apiTls: false });
++  assert.match(r.fixScript, /\/ip service disable telnet/);
++  assert.match(r.fixScript, /\/ip service disable ftp/);
++  assert.match(r.fixScript, /strong-crypto=yes/);
++  assert.ok(!/disable api\b/.test(r.fixScript), "plain API (our own connection) must not be disabled");
++  assert.ok(!/<[A-Z-]+/.test(r.fixScript), "no placeholders in auto-safe script");
++  assert.ok(!/firewall/.test(r.fixScript) && !/user disable/.test(r.fixScript));
++  const tls = auditSecurity(bad, { apiTls: true });
++  assert.match(tls.fixScript, /\/ip service disable api/);
++});
++test("DNS finding needs missing input-drop; missing data sections are tolerated", () => {
++  const ok = auditSecurity({ ...hardened, firewall: [{ chain: "input", action: "drop", disabled: "false" }] }, { apiTls: true });
++  assert.ok(!ok.findings.some(f => f.id === "DNS_OPEN_RESOLVER"));
++  const partial = auditSecurity({ resource: { version: "7.1" } });
++  assert.equal(partial.score, 100);
++  assert.doesNotThrow(() => auditSecurity({}));
++});
++
++const NOW = Date.parse("2026-10-08T12:00:00Z");
++test("fleetSummary statuses and attention list", () => {
++  const f = fleetSummary([
++    { id: "1", name: "A", mode: "agent", agent_last_seen: "2026-10-08T11:59:30Z", agent_info: { cpu: 10, active: 7, uptime: "1d", v: "7.15", board: "hAP" } },
++    { id: "2", name: "B", mode: "agent", agent_last_seen: "2026-10-08T11:50:00Z", agent_info: { cpu: 5, active: 3 } },
++    { id: "3", name: "C", mode: "agent", agent_last_seen: null },
++    { id: "4", name: "D", mode: "direct", probe: { ok: true, latencyMs: 40 } },
++    { id: "5", name: "E", mode: "direct", probe: { ok: false } },
++    { id: "6", name: "F", mode: "direct" },
++    { id: "7", name: "G", mode: "agent", agent_last_seen: "2026-10-08T11:59:50Z", agent_info: { cpu: 93, active: 10 } }
++  ], NOW);
++  assert.deepEqual([f.total, f.online, f.offline, f.pending, f.unknown], [7, 3, 2, 1, 1]);
++  assert.equal(f.activeUsers, 20);
++  assert.equal(f.avgCpu, 52);                       // (10 + 93) / 2 online agents with cpu
++  assert.deepEqual(f.attention.map(i => i.id).sort(), ["2", "5", "7"]);
++  assert.deepEqual(f.attention.find(i => i.id === "7").issues, ["HIGH_CPU"]);
++  assert.deepEqual(fleetSummary([], NOW).routers, []);
++});
++test("configDoctor", () => {
++  const good = configDoctor({ NODE_ENV: "production", JWT_SECRET: "a".repeat(40), ROUTER_ENCRYPTION_KEY: "b".repeat(40), CORS_ORIGIN: "https://x.com", PUBLIC_BASE_URL: "https://x.onrender.com", TRUST_PROXY: "true", ALLOW_REGISTRATION: "false" });
++  assert.equal(good.healthy, true); assert.equal(good.warnings, 0);
++  const bad2 = configDoctor({ NODE_ENV: "production", JWT_SECRET: "short", ROUTER_ENCRYPTION_KEY: "short", CORS_ORIGIN: "*", ALLOW_INSECURE_ROUTER_TLS: "true", ALLOW_REGISTRATION: "true", RENDER: "true", ALLOW_PRIVATE_ROUTER_HOSTS: "true", ENABLE_ONLINE_PAYMENTS: "true" }, { dbOk: false });
++  assert.equal(bad2.healthy, false);
++  const failing = bad2.checks.filter(c => !c.ok).map(c => c.id);
++  for (const id of ["DB", "JWT_SECRET", "ENC_KEY", "CORS", "PUBLIC_BASE_URL", "INSECURE_TLS", "REGISTRATION", "TRUST_PROXY", "PRIVATE_ON_CLOUD", "PAYMENTS"]) assert.ok(failing.includes(id), id);
++  assert.equal(configDoctor({ JWT_SECRET: "x".repeat(40), ROUTER_ENCRYPTION_KEY: "x".repeat(40) }).checks.find(c => c.id === "SECRETS_DISTINCT").ok, false);
++});
+diff --git a/backend/test/smoke.mjs b/backend/test/smoke.mjs
+index 112e93a..b070c81 100644
+--- a/backend/test/smoke.mjs
++++ b/backend/test/smoke.mjs
+@@ -9,7 +9,7 @@ assert.match(server, /helmet/);
+ assert.match(server, /CORS_ORIGIN must be an explicit allowlist/);
+ assert.match(server, /BACKUP_EXPORT_FAILED/);
+ assert.match(server, /rr\.user_id=\$2/);
+-assert.match(routeros, /rejectUnauthorized:!this\.allowInsecureTls/);
++assert.match(routeros, /rejectUnauthorized:pin\?false:!this\.allowInsecureTls/);
+ assert.match(server, /REGISTRATION_CLOSED/);
+ assert.match(server, /generateBatch/);
+ assert.doesNotMatch(server, /randomBytes\(8\)\.toString\("base64url"\)/);
+diff --git a/hotspot-templates/login-code.html b/hotspot-templates/login-code.html
+index f487e37..1751795 100644
+--- a/hotspot-templates/login-code.html
++++ b/hotspot-templates/login-code.html
+@@ -1,4 +1,4 @@
+ <!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MICRO-MAX</title><style>:root{--p:#22d3ee}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Arial,sans-serif;background:linear-gradient(145deg,#020617,#0f172a);color:#f8fafc;padding:20px}.card{width:min(430px,100%);padding:28px;border:1px solid #ffffff24;border-radius:28px;background:#ffffff14}.brand{font-size:28px;font-weight:900}.muted{color:#94a3b8;font-size:13px;margin:6px 0 20px}input,button{width:100%;padding:15px;margin-top:10px;border-radius:14px;font-size:18px}input{border:1px solid #ffffff33;background:#0005;color:#fff;text-align:center;letter-spacing:2px;text-transform:uppercase}button{border:0;background:var(--p);color:#001018;font-weight:900}.error{color:#fb7185;margin:10px 0}</style></head><body><main class="card"><div class="brand">MICRO-MAX</div><div class="muted">أدخل كود الكرت فقط</div><div class="error">$(error)</div>
+ <!-- Code-only login: the card code is sent as both username and password. Requires http-pap (or https) login. -->
+ <form name="login" action="$(link-login-only)" method="post"><input type="hidden" name="dst" value="$(link-orig)"><input name="username" autocomplete="off" autocapitalize="characters" placeholder="كود الكرت" required><input type="hidden" name="password" value=""><button type="submit">دخول إلى الإنترنت</button></form></main>
+-<script>(function(){var f=document.forms[0];function sync(){f.password.value=f.username.value}f.username.addEventListener('input',sync);f.addEventListener('submit',sync);try{var q=new URLSearchParams(location.search),u=q.get('username');if(u){f.username.value=u;sync();if(q.get('auto')==='1'&&!sessionStorage.getItem('mmauto')){sessionStorage.setItem('mmauto','1');f.submit();}}}catch(e){}})();</script></body></html>
++<script>(function(){var f=document.forms[0];function sync(){f.password.value=f.username.value}f.username.addEventListener('input',sync);f.addEventListener('submit',sync);try{var q=new URLSearchParams(location.search),u=q.get('username');if(u){f.username.value=u;sync();if(history.replaceState)history.replaceState(null,'',location.pathname);var st=document.querySelector('.error')||{},msg=String(st.textContent||'').trim(),failed=msg!==''&&msg.indexOf('$(')!==0,key='mmauto:'+u,now=Date.now(),last=Number(sessionStorage.getItem(key)||0);if(q.get('auto')==='1'&&!failed&&now-last>15000){sessionStorage.setItem(key,String(now));f.submit();}}}catch(e){}})();</script></body></html>
+diff --git a/hotspot-templates/login.html b/hotspot-templates/login.html
+index 0ca8b86..f4f6e6b 100644
+--- a/hotspot-templates/login.html
++++ b/hotspot-templates/login.html
+@@ -4,4 +4,4 @@
+ <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>بوابة الإنترنت</title>
+ <style>
+ :root{--ink:#f8fafc;--muted:#9fb0c7;--line:rgba(255,255,255,.14);--panel:rgba(10,22,41,.78);--accent:#38d9c4;--accent2:#5b8cff;--danger:#fb7185}*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:18px;display:grid;place-items:center;background:radial-gradient(circle at 15% 10%,#155e75 0,transparent 34%),radial-gradient(circle at 90% 90%,#312e81 0,transparent 35%),#050b16;color:var(--ink);font-family:Tahoma,Arial,sans-serif}.shell{width:min(460px,100%);position:relative}.glow{position:absolute;inset:-2px;border-radius:32px;background:linear-gradient(135deg,var(--accent),transparent 38%,var(--accent2));filter:blur(18px);opacity:.26;z-index:-1}.card{border:1px solid var(--line);border-radius:30px;padding:26px;background:var(--panel);backdrop-filter:blur(22px);box-shadow:0 30px 100px #0009}.brand{display:flex;align-items:center;gap:12px;margin-bottom:6px}.logo{width:48px;height:48px;border-radius:16px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 10px 30px #38d9c455}.logo svg{width:26px;fill:#06111f}.brand strong{font-size:25px;letter-spacing:.5px}.sub{color:var(--muted);font-size:13px;margin:0 0 20px}.status{min-height:22px;color:var(--danger);font-size:13px;margin:8px 0}.field{position:relative;margin:11px 0}.field svg{position:absolute;right:15px;top:15px;width:20px;fill:var(--muted);transition:.2s}.field input{width:100%;height:52px;padding:0 48px 0 14px;border:1px solid var(--line);border-radius:16px;background:#020817aa;color:var(--ink);font-size:15px;outline:0;transition:.22s}.field input:focus{border-color:var(--accent);box-shadow:0 0 0 4px #38d9c422,0 10px 26px #0003;transform:translateY(-1px)}.field input:focus+svg{fill:var(--accent);transform:scale(1.08)}button,.wa{width:100%;border:0;border-radius:16px;min-height:52px;font-weight:800;font-size:15px;cursor:pointer;transition:.18s}.primary{margin-top:8px;background:linear-gradient(135deg,var(--accent),#75f0d1);color:#06201e;box-shadow:0 12px 28px #38d9c433}.primary:active,.plan:active,.wa:active{transform:scale(.98)}.plans{margin-top:22px}.plans h2{font-size:15px;margin:0 0 10px}.plan-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.plan{border:1px solid var(--line);border-radius:15px;background:#ffffff08;color:var(--ink);padding:11px 6px;font-size:12px}.plan.selected{border-color:var(--accent);background:#38d9c41b;color:#bffff4}.plan b{display:block;font-size:14px;margin-bottom:4px}.wa{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:13px;text-decoration:none;background:#25d366;color:#052512}.wa svg{width:20px;fill:currentColor}.foot{text-align:center;color:var(--muted);font-size:11px;margin-top:18px}@media(max-width:370px){.card{padding:20px}.plan-grid{grid-template-columns:1fr 1fr}}
+-</style></head><body><main class="shell"><div class="glow"></div><section class="card"><header class="brand"><span class="logo"><svg viewBox="0 0 24 24"><path d="M12 2a9 9 0 0 0-9 9v3a3 3 0 0 0 3 3h2v-7H5a7 7 0 0 1 14 0h-3v7h2a3 3 0 0 0 3-3v-3a9 9 0 0 0-9-9Zm-1 17h2v3h-2v-3Z"/></svg></span><strong>بوابة الإنترنت</strong></header><p class="sub">اتصال سريع وآمن — اختر باقتك ثم أدخل بيانات الكرت</p><div class="status">$(error)</div><form action="$(link-login-only)" method="post" autocomplete="on"><input type="hidden" name="dst" value="$(link-orig)"><label class="field"><input name="username" autocomplete="username" placeholder="اسم المستخدم" required><svg viewBox="0 0 24 24"><path d="M12 12a5 5 0 1 0 0-10 5 5 0 0 0 0 10Zm0 2c-5 0-9 2.5-9 5.5V22h18v-2.5c0-3-4-5.5-9-5.5Z"/></svg></label><label class="field"><input type="password" name="password" autocomplete="current-password" placeholder="كلمة المرور" required><svg viewBox="0 0 24 24"><path d="M17 8h-1V6a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Zm-5 9a2 2 0 1 1 0-4 2 2 0 0 1 0 4Zm2-9h-4V6a2 2 0 1 1 4 0v2Z"/></svg></label><button class="primary" type="submit">دخول إلى الإنترنت</button></form><div class="plans"><h2>اختر الباقة المناسبة</h2><div class="plan-grid"><button class="plan" data-plan="اقتصادية"><b>اقتصادية</b>سرعة أساسية</button><button class="plan" data-plan="متقدمة"><b>متقدمة</b>سرعة أعلى</button><button class="plan" data-plan="VIP"><b>VIP</b>أولوية قصوى</button></div></div><a class="wa" id="wa" href="https://wa.me/218930090401" target="_blank" rel="noopener"><span>واتساب: +218 93 009 0401 — استفسار وشراء باقة</span></a><div class="foot">أدخل بيانات الكرت الموجودة لديك أو تواصل مع الدعم</div></section></main><script>(function(){var wa=document.getElementById('wa');document.querySelectorAll('.plan').forEach(function(b){b.addEventListener('click',function(){document.querySelectorAll('.plan').forEach(function(x){x.classList.remove('selected')});b.classList.add('selected');wa.href='https://wa.me/218930090401?text='+encodeURIComponent('مرحباً، أريد الاستفسار عن باقة '+b.dataset.plan+' لشبكة Wi-Fi');});});try{var q=new URLSearchParams(location.search),u=q.get('username'),p=q.get('password'),f=document.forms[0];if(u)f.username.value=u;if(p)f.password.value=p;else if(u&&!q.has('password'))f.password.value=u;var key='mmauto:'+u;if(q.get('auto')==='1'&&u&&f.password.value&&!sessionStorage.getItem(key)){sessionStorage.setItem(key,'1');f.submit();}}catch(e){}})();</script></body></html>
++</style></head><body><main class="shell"><div class="glow"></div><section class="card"><header class="brand"><span class="logo"><svg viewBox="0 0 24 24"><path d="M12 2a9 9 0 0 0-9 9v3a3 3 0 0 0 3 3h2v-7H5a7 7 0 0 1 14 0h-3v7h2a3 3 0 0 0 3-3v-3a9 9 0 0 0-9-9Zm-1 17h2v3h-2v-3Z"/></svg></span><strong>بوابة الإنترنت</strong></header><p class="sub">اتصال سريع وآمن — اختر باقتك ثم أدخل بيانات الكرت</p><div class="status">$(error)</div><form action="$(link-login-only)" method="post" autocomplete="on"><input type="hidden" name="dst" value="$(link-orig)"><label class="field"><input name="username" autocomplete="username" placeholder="اسم المستخدم" required><svg viewBox="0 0 24 24"><path d="M12 12a5 5 0 1 0 0-10 5 5 0 0 0 0 10Zm0 2c-5 0-9 2.5-9 5.5V22h18v-2.5c0-3-4-5.5-9-5.5Z"/></svg></label><label class="field"><input type="password" name="password" autocomplete="current-password" placeholder="كلمة المرور" required><svg viewBox="0 0 24 24"><path d="M17 8h-1V6a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Zm-5 9a2 2 0 1 1 0-4 2 2 0 0 1 0 4Zm2-9h-4V6a2 2 0 1 1 4 0v2Z"/></svg></label><button class="primary" type="submit">دخول إلى الإنترنت</button></form><div class="plans"><h2>اختر الباقة المناسبة</h2><div class="plan-grid"><button class="plan" data-plan="اقتصادية"><b>اقتصادية</b>سرعة أساسية</button><button class="plan" data-plan="متقدمة"><b>متقدمة</b>سرعة أعلى</button><button class="plan" data-plan="VIP"><b>VIP</b>أولوية قصوى</button></div></div><a class="wa" id="wa" href="https://wa.me/218930090401" target="_blank" rel="noopener"><span>واتساب: +218 93 009 0401 — استفسار وشراء باقة</span></a><div class="foot">أدخل بيانات الكرت الموجودة لديك أو تواصل مع الدعم</div></section></main><script>(function(){var wa=document.getElementById('wa');document.querySelectorAll('.plan').forEach(function(b){b.addEventListener('click',function(){document.querySelectorAll('.plan').forEach(function(x){x.classList.remove('selected')});b.classList.add('selected');wa.href='https://wa.me/218930090401?text='+encodeURIComponent('مرحباً، أريد الاستفسار عن باقة '+b.dataset.plan+' لشبكة Wi-Fi');});});try{var q=new URLSearchParams(location.search),u=q.get('username'),p=q.get('password'),f=document.forms[0];if(u)f.username.value=u;if(p)f.password.value=p;else if(u&&!q.has('password'))f.password.value=u;if(u&&history.replaceState)history.replaceState(null,'',location.pathname);var st=document.querySelector('.status')||{},msg=String(st.textContent||'').trim(),failed=msg!==''&&msg.indexOf('$(')!==0,key='mmauto:'+u,now=Date.now(),last=Number(sessionStorage.getItem(key)||0);if(q.get('auto')==='1'&&u&&f.password.value&&!failed&&now-last>15000){sessionStorage.setItem(key,String(now));var b=f.querySelector('button[type=submit]');if(b)b.textContent='\u062c\u0627\u0631\u064d \u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u062f\u062e\u0648\u0644\u2026';f.submit();}}catch(e){}})();</script></body></html>
