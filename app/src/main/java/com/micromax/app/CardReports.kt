@@ -1,5 +1,7 @@
 package com.micromax.app
 
+import androidx.compose.material3.MaterialTheme
+
 import android.content.ContentValues
 import android.content.Context
 import android.provider.MediaStore
