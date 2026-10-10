@@ -31,8 +31,9 @@ export function usernameRegex(prefix, letters, digits) {
 }
 
 // ---- RouterOS script: MikroTik itself generates usernames/passwords --------
-export function buildGenScript({ count, prefix, digits, letters, passLen, pin, profile, comment }) {
+export function buildGenScript({ count, prefix, digits, letters, passLen, pin, profile, comment, limitUptime = "" }) {
   assertSafeProfile(profile);
+  if (limitUptime && !/^\d{1,5}[smhdw]$/.test(limitUptime)) throw new Error("UNSAFE_LIMIT_UPTIME");
   if (!/^[A-Za-z0-9:_\-]+$/.test(comment)) throw new Error("UNSAFE_COMMENT");
   const parts = [`"${sanitizePrefix(prefix)}"`];
   if (letters > 0) parts.push(`[:rndstr length=${letters} from="${USER_LETTERS}"]`);
@@ -47,7 +48,7 @@ export function buildGenScript({ count, prefix, digits, letters, passLen, pin, p
     `  :local u (${nameExpr})`,
     "  :if ([:len [/ip hotspot user find where name=$u]] = 0) do={",
     `    :local p ${passExpr}`,
-    `    /ip hotspot user add name=$u password=$p profile="${profile}" comment="${comment}"`,
+    `    /ip hotspot user add name=$u password=$p profile="${profile}" comment="${comment}"${limitUptime ? ` limit-uptime=${limitUptime}` : ""}`,
     "    :set made ($made + 1)",
     "  }",
     "}"
@@ -76,7 +77,7 @@ async function runGenScript(ros, source) {
  * resolves duplicates against the database. Regenerates until the count is met.
  * dbHas(names) => Promise<Set<string>> of usernames already stored for this router.
  */
-export async function generateBatch({ ros, count, prefix, digits, letters, passLen = 8, pin = false, profile, batchId, dbHas, maxRounds = 6, chunk = 500 }) {
+export async function generateBatch({ ros, count, prefix, digits, letters, passLen = 8, pin = false, profile, batchId, dbHas, maxRounds = 6, chunk = 500, limitUptime = "" }) {
   if (letters + digits === 0) throw new Error("USERNAME_FORMAT_EMPTY");
   const comment = `MICRO-MAX:${batchId}`;
   const kept = [];
@@ -84,7 +85,7 @@ export async function generateBatch({ ros, count, prefix, digits, letters, passL
   for (let round = 0; round < maxRounds && kept.length < count; round++) {
     const need = count - kept.length;
     for (let left = need; left > 0; left -= chunk) {
-      await runGenScript(ros, buildGenScript({ count: Math.min(chunk, left), prefix, digits, letters, passLen, pin, profile, comment }));
+      await runGenScript(ros, buildGenScript({ count: Math.min(chunk, left), prefix, digits, letters, passLen, pin, profile, comment, limitUptime }));
     }
     const batchUsers = await ros.command("/ip/hotspot/user/print", [`?comment=${comment}`]);
     const names = batchUsers.map(u => String(u.name || "")).filter(n => !kept.some(k => k.username === n));

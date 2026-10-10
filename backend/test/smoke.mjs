@@ -9,7 +9,7 @@ assert.match(server, /helmet/);
 assert.match(server, /CORS_ORIGIN must be an explicit allowlist/);
 assert.match(server, /BACKUP_EXPORT_FAILED/);
 assert.match(server, /rr\.user_id=\$2/);
-assert.match(routeros, /rejectUnauthorized:!this\.allowInsecureTls/);
+assert.match(routeros, /rejectUnauthorized:pin\?false:!this\.allowInsecureTls/);
 assert.match(server, /REGISTRATION_CLOSED/);
 assert.match(server, /generateBatch/);
 assert.doesNotMatch(server, /randomBytes\(8\)\.toString\("base64url"\)/);
