@@ -1,4 +1,5 @@
 name: MICRO-MAX Release
+run-name: MICRO-MAX v3.1.0 Release #${{ github.run_number }}
 on:
   workflow_dispatch:
   push:

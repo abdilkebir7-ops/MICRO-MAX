@@ -8,7 +8,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -47,13 +47,13 @@ fun HotspotVisualEditorPage(api: Api, router: JSONObject?) {
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) { Text("محرر HotSpot البصري", fontSize = 28.sp, fontWeight = FontWeight.Black); Text("قوالب جاهزة • معاينة مباشرة • نشر login.html و status.html", fontSize = 12.sp, color = TextMuted) }
-            Icon(Icons.Default.Web, null, tint = Accent, modifier = Modifier.size(32.dp))
+            Column(Modifier.weight(1f)) { Text("محرر HotSpot البصري",style=MaterialTheme.typography.headlineMedium); Text("قوالب جاهزة • معاينة مباشرة • نشر login.html و status.html", fontSize = 12.sp, color = TextMuted) }
+            Icon(MmIcons.Web, null, tint = Accent, modifier = Modifier.size(32.dp))
         }
         if (router == null) {
-            GlassCard { Icon(Icons.Default.Router, null, tint = Accent); Text("اختر راوتر MikroTik أولاً", fontWeight = FontWeight.Bold); Text("بعد اختيار الراوتر يمكنك تصميم الصفحات ونشرها مع نسخة احتياطية.", color = TextMuted) }
+            GlassCard { Icon(MmIcons.Router, null, tint = Accent); Text("اختر راوتر MikroTik أولاً", fontWeight = FontWeight.Bold); Text("بعد اختيار الراوتر يمكنك تصميم الصفحات ونشرها مع نسخة احتياطية.", color = TextMuted) }
         } else {
-            Surface(color = Accent.copy(alpha = .08f), shape = RoundedCornerShape(14.dp)) { Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Router, null, tint = Accent); Spacer(Modifier.width(8.dp)); Text(router.optString("name", "Router"), fontWeight = FontWeight.Bold); Spacer(Modifier.width(8.dp)); Text(router.optString("host", ""), fontSize = 11.sp, color = TextMuted) } }
+            Surface(color = Accent.copy(alpha = .08f), shape = RoundedCornerShape(14.dp)) { Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) { Icon(MmIcons.Router, null, tint = Accent); Spacer(Modifier.width(8.dp)); Text(router.optString("name", "Router"), fontWeight = FontWeight.Bold); Spacer(Modifier.width(8.dp)); Text(router.optString("host", ""), fontSize = 11.sp, color = TextMuted) } }
             GlassCard {
                 Text("قوالب جاهزة", fontWeight = FontWeight.Black, fontSize = 19.sp)
                 Text("اختر تصميمًا ثم عدّل النصوص والألوان بصريًا.", color = TextMuted, fontSize = 12.sp)
@@ -65,14 +65,14 @@ fun HotspotVisualEditorPage(api: Api, router: JSONObject?) {
                     }
                 }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { FilterChip(tab == 0, { tab = 0 }, { Text("login.html") }, leadingIcon = { Icon(Icons.Default.Login, null) }); FilterChip(tab == 1, { tab = 1 }, { Text("status.html") }, leadingIcon = { Icon(Icons.Default.Speed, null) }) }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { FilterChip(tab == 0, { tab = 0 }, { Text("login.html") }, leadingIcon = { Icon(Icons.Outlined.Login, null) }); FilterChip(tab == 1, { tab = 1 }, { Text("status.html") }, leadingIcon = { Icon(MmIcons.Gauge, null) }) }
             GlassCard { Text("المعاينة المباشرة", fontWeight = FontWeight.Black, fontSize = 20.sp); if (tab == 0) LoginPreview(brand, title, subtitle, primary, background, button) else StatusPreview(brand, primary, background) }
             GlassCard {
                 Text("التحرير البصري", fontWeight = FontWeight.Black, fontSize = 19.sp)
-                AppField(brand, { brand = it }, "اسم الشبكة", Icons.Default.Business)
-                AppField(title, { title = it }, "العنوان", Icons.Default.Title)
-                AppField(subtitle, { subtitle = it }, "الوصف", Icons.Default.Description)
-                AppField(button, { button = it }, "نص الزر", Icons.Default.TouchApp)
+                AppField(brand, { brand = it }, "اسم الشبكة", Icons.Outlined.Business)
+                AppField(title, { title = it }, "العنوان", Icons.Outlined.Title)
+                AppField(subtitle, { subtitle = it }, "الوصف", Icons.Outlined.Description)
+                AppField(button, { button = it }, "نص الزر", Icons.Outlined.TouchApp)
                 Text("اللون الرئيسي", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextMuted)
                 Swatches(primary) { primary = it }
                 Text("لون الخلفية", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextMuted)
@@ -82,7 +82,7 @@ fun HotspotVisualEditorPage(api: Api, router: JSONObject?) {
                 Text("النشر إلى MikroTik", fontWeight = FontWeight.Black, fontSize = 19.sp)
                 Text("سيتم التحقق من المتغيرات المطلوبة وإنشاء Backup قبل النشر.", fontSize = 11.sp, color = TextMuted)
                 msg?.let { Text(it, fontSize = 11.sp, color = if (it.startsWith("تم")) Green else Red) }
-                Button(enabled = !saving, onClick = { scope.launch { saving = true; msg = null; try { val body = JSONObject().put("loginHtml", login).put("statusHtml", status); api.post("/api/routers/${router.optString("id")}/hotspot-design/publish", body.toString()); msg = "تم نشر login.html و status.html مع Backup تلقائي" } catch (e: Exception) { msg = e.message ?: "فشل النشر" } finally { saving = false } } }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.CloudUpload, null); Spacer(Modifier.width(7.dp)); Text(if (saving) "جاري النشر…" else "نشر التصميم للراوتر") }
+                Button(enabled = !saving, onClick = { scope.launch { saving = true; msg = null; try { val body = JSONObject().put("loginHtml", login).put("statusHtml", status); api.post("/api/routers/${router.optString("id")}/hotspot-design/publish", body.toString()); msg = "تم نشر login.html و status.html مع Backup تلقائي" } catch (e: Exception) { msg = e.message ?: "فشل النشر" } finally { saving = false } } }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Outlined.CloudUpload, null); Spacer(Modifier.width(7.dp)); Text(if (saving) "جاري النشر…" else "نشر التصميم للراوتر") }
             }
         }
     }
@@ -90,7 +90,7 @@ fun HotspotVisualEditorPage(api: Api, router: JSONObject?) {
 
 @Composable private fun Swatches(selected: String, onSelect: (String) -> Unit) {
     val colors = listOf("#2563EB", "#22D3EE", "#8B5CF6", "#D4A84F", "#F59E0B", "#EF476F", "#102B2A", "#F1F5F9", "#07111F")
-    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(10.dp)) { colors.forEach { value -> Box(Modifier.size(38.dp).background(parseHotspotColor(value, Color.Gray), RoundedCornerShape(50)).clickable { onSelect(value) }, contentAlignment = Alignment.Center) { if (selected.equals(value, true)) Icon(Icons.Default.Check, null, tint = if (value == "#F1F5F9") Color.Black else Color.White) } } }
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(10.dp)) { colors.forEach { value -> Box(Modifier.size(38.dp).background(parseHotspotColor(value, Color.Gray), RoundedCornerShape(50)).clickable { onSelect(value) }, contentAlignment = Alignment.Center) { if (selected.equals(value, true)) Icon(MmIcons.Check, null, tint = if (value == "#F1F5F9") Color.Black else Color.White) } } }
 }
 
 private fun parseHotspotColor(v: String, fallback: Color) = try { Color(android.graphics.Color.parseColor(v)) } catch (_: Exception) { fallback }

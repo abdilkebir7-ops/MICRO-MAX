@@ -12,7 +12,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -37,15 +37,15 @@ fun DesignStudioPage(api: Api, router: JSONObject?, activity: MainActivity, init
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("استوديو التصميم والطباعة", fontSize = 28.sp, fontWeight = FontWeight.Black)
+                Text("استوديو التصميم والطباعة",style=MaterialTheme.typography.headlineMedium)
                 Text("القوالب • المعاينة • التوليد • الطباعة التجارية", color = StudioMuted, fontSize = 13.sp)
             }
-            Icon(Icons.Default.AutoAwesome, null, tint = StudioAccent, modifier = Modifier.size(30.dp))
+            Icon(MmIcons.Sparkle, null, tint = StudioAccent, modifier = Modifier.size(30.dp))
         }
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("تصميم الكرت", "صفحات HotSpot", "الطباعة").forEachIndexed { i, label ->
                 FilterChip(selected = tab == i, onClick = { tab = i }, label = { Text(label) }, leadingIcon = {
-                    Icon(if (i == 0) Icons.Default.CreditCard else if (i == 1) Icons.Default.Web else Icons.Default.Print, null)
+                    Icon(if (i == 0) Icons.Outlined.CreditCard else if (i == 1) MmIcons.Web else MmIcons.Print, null)
                 })
             }
         }
@@ -80,7 +80,7 @@ private fun CardDesignStudio(api: Api, router: JSONObject?, initialTemplate: Str
     val templateDescriptions = mapOf("Modern Wave" to "عصري • تدرج أزرق", "Midnight Glass" to "داكن • زجاجي", "VIP Neon" to "جريء • نيون", "Classic Gold" to "كلاسيكي • فاخر", "Minimal Mono" to "بسيط • أبيض وأسود", "Clean White" to "نظيف • تجاري", "Coffee House" to "مقهى • دافئ", "Hotel Luxe" to "فندق • راقٍ", "School Clean" to "تعليمي • واضح", "Market Orange" to "متجر • حيوي")
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         GlassCard {
-            Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("مكتبة القوالب", fontWeight = FontWeight.Black, fontSize = 20.sp); Text("اختر نقطة بداية احترافية ثم خصص كل تفصيل", color = StudioMuted, fontSize = 12.sp) }; Icon(Icons.Default.AutoAwesome, null, tint = StudioOrange) }
+            Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("مكتبة القوالب", fontWeight = FontWeight.Black, fontSize = 20.sp); Text("اختر نقطة بداية احترافية ثم خصص كل تفصيل", color = StudioMuted, fontSize = 12.sp) }; Icon(MmIcons.Sparkle, null, tint = StudioOrange) }
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 templates.forEach { name ->
                     val swatch = parseStudioColor(templateColors[name] ?: primary, StudioAccent)
@@ -96,14 +96,14 @@ private fun CardDesignStudio(api: Api, router: JSONObject?, initialTemplate: Str
             Text(if (monochrome) "وضع الطباعة: أبيض وأسود — ترتيب محسّن للطابعات المكتبية والحرارية." else "المعاينة الملونة — فعّل وضع أبيض وأسود قبل الطباعة التجارية.", color = StudioMuted, fontSize = 11.sp)
         }
         GlassCard {
-            Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("محرر المحتوى", fontWeight = FontWeight.Black, fontSize = 19.sp); Text("النصوص والهوية البصرية", color = StudioMuted, fontSize = 11.sp) }; IconButton({ advanced = !advanced }) { Icon(if (advanced) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null, tint = StudioAccent) } }
-            AppField(title, { title = it }, "العنوان الرئيسي", Icons.Default.Title)
-            AppField(subtitle, { subtitle = it }, "الوصف العربي", Icons.Default.Translate)
-            AppField(support, { support = it }, "معلومات الدعم أو المتجر", Icons.Default.SupportAgent)
-            AppField(price, { price = it }, "السعر الظاهر على الكرت", Icons.Default.Payments)
-            if (advanced) { AppField(primary, { primary = it }, "اللون الرئيسي HEX", Icons.Default.Palette); Text("خيارات الهوية والطباعة", fontWeight = FontWeight.Bold, color = StudioOrange); Row(verticalAlignment = Alignment.CenterVertically) { Switch(showBrand, { showBrand = it }); Text("إظهار اسم النظام على الكرت", Modifier.weight(1f)) }; Text("مغلق افتراضيًا حتى يكون الكرت محايدًا وقابلًا لإعادة البيع.", fontSize = 10.sp, color = StudioMuted); Row(verticalAlignment = Alignment.CenterVertically) { Switch(monochrome, { monochrome = it }); Text("وضع أبيض وأسود للطباعة", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showPrice, { showPrice = it }); Text("إظهار السعر", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showQr, { showQr = it }); Text("إظهار QR Code", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showBarcode, { showBarcode = it }); Text("إظهار Barcode", Modifier.weight(1f)) } }
+            Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("محرر المحتوى", fontWeight = FontWeight.Black, fontSize = 19.sp); Text("النصوص والهوية البصرية", color = StudioMuted, fontSize = 11.sp) }; IconButton({ advanced = !advanced }) { Icon(if (advanced) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null, tint = StudioAccent) } }
+            AppField(title, { title = it }, "العنوان الرئيسي", Icons.Outlined.Title)
+            AppField(subtitle, { subtitle = it }, "الوصف العربي", Icons.Outlined.Translate)
+            AppField(support, { support = it }, "معلومات الدعم أو المتجر", Icons.Outlined.SupportAgent)
+            AppField(price, { price = it }, "السعر الظاهر على الكرت", MmIcons.Money)
+            if (advanced) { AppField(primary, { primary = it }, "اللون الرئيسي HEX", MmIcons.Palette); Text("خيارات الهوية والطباعة", fontWeight = FontWeight.Bold, color = StudioOrange); Row(verticalAlignment = Alignment.CenterVertically) { Switch(showBrand, { showBrand = it }); Text("إظهار اسم النظام على الكرت", Modifier.weight(1f)) }; Text("مغلق افتراضيًا حتى يكون الكرت محايدًا وقابلًا لإعادة البيع.", fontSize = 10.sp, color = StudioMuted); Row(verticalAlignment = Alignment.CenterVertically) { Switch(monochrome, { monochrome = it }); Text("وضع أبيض وأسود للطباعة", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showPrice, { showPrice = it }); Text("إظهار السعر", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showQr, { showQr = it }); Text("إظهار QR Code", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showBarcode, { showBarcode = it }); Text("إظهار Barcode", Modifier.weight(1f)) } }
             message?.let { Text(it, color = if (it.startsWith("تم")) StudioMint else StudioRed, fontSize = 12.sp) }
-            Button(onClick = { if (routerId == null) { message = "اختر راوتر أولاً لحفظ هوية HotSpot"; return@Button }; scope.launch { saving = true; try { api.post("/api/themes/$routerId", JSONObject().put("name", template).put("primaryColor", primary).put("background", "#FFFFFF").put("logoUrl", if (showBrand) "MICRO-MAX" else "").put("title", title).put("subtitle", subtitle).put("price", price).put("showPrice", showPrice).put("showQr", showQr).put("showBarcode", showBarcode).put("showBrand", showBrand).toString()); message = "تم حفظ تصميم $template للراوتر" } catch (e: Exception) { message = e.message } finally { saving = false } } }, enabled = !saving, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Save, null); Spacer(Modifier.width(7.dp)); Text(if (saving) "جاري الحفظ…" else "حفظ الهوية والتصميم") }
+            Button(onClick = { if (routerId == null) { message = "اختر راوتر أولاً لحفظ هوية HotSpot"; return@Button }; scope.launch { saving = true; try { api.post("/api/themes/$routerId", JSONObject().put("name", template).put("primaryColor", primary).put("background", "#FFFFFF").put("logoUrl", if (showBrand) "MICRO-MAX" else "").put("title", title).put("subtitle", subtitle).put("price", price).put("showPrice", showPrice).put("showQr", showQr).put("showBarcode", showBarcode).put("showBrand", showBrand).toString()); message = "تم حفظ تصميم $template للراوتر" } catch (e: Exception) { message = e.message } finally { saving = false } } }, enabled = !saving, modifier = Modifier.fillMaxWidth()) { Icon(MmIcons.Check, null); Spacer(Modifier.width(7.dp)); Text(if (saving) "جاري الحفظ…" else "حفظ الهوية والتصميم") }
         }
     }
 }
@@ -147,10 +147,10 @@ private fun HotspotPageStudio(api: Api, router: JSONObject?) {
                 Text("واجهة الزائر", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 Text("صمم login.html و status.html مع معاينة قبل النشر. النشر يحتاج دور Admin ويُنشئ نسخة احتياطية.", color = StudioMuted, fontSize = 12.sp)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = page == "login", onClick = { page = "login"; content = defaultHotspotHtml("login"); status = null }, label = { Text("login.html") }, leadingIcon = { Icon(Icons.Default.Login, null) })
-                    FilterChip(selected = page == "status", onClick = { page = "status"; content = defaultHotspotHtml("status"); status = null }, label = { Text("status.html") }, leadingIcon = { Icon(Icons.Default.Dashboard, null) })
+                    FilterChip(selected = page == "login", onClick = { page = "login"; content = defaultHotspotHtml("login"); status = null }, label = { Text("login.html") }, leadingIcon = { Icon(Icons.Outlined.Login, null) })
+                    FilterChip(selected = page == "status", onClick = { page = "status"; content = defaultHotspotHtml("status"); status = null }, label = { Text("status.html") }, leadingIcon = { Icon(Icons.Outlined.Dashboard, null) })
                 }
-                AppField(content, { content = it }, "HTML المصدر", Icons.Default.Code)
+                AppField(content, { content = it }, "HTML المصدر", MmIcons.Code)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = {
                         scope.launch {
@@ -203,15 +203,15 @@ private fun PrinterStudio(activity: MainActivity) {
             Text("مركز الطباعة", fontWeight = FontWeight.Bold, fontSize = 18.sp)
             Text("تحكم في مقاس الورق وعدد الكروت في الورقة. التصميم الافتراضي أبيض وأسود ومناسب لمعظم طابعات A4 والحرارية.", color = StudioMuted, fontSize = 12.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("A4", "80mm Thermal", "Custom").forEach { FilterChip(selected = paper == it, onClick = { paper = it }, label = { Text(it) }) } }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { AppField(columns, { columns = it.filter(Char::isDigit) }, "أعمدة", Icons.Default.ViewColumn); AppField(rows, { rows = it.filter(Char::isDigit) }, "صفوف", Icons.Default.GridView) }
-            AppField(copies, { copies = it.filter(Char::isDigit) }, "عدد النسخ", Icons.Default.ContentCopy)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { AppField(columns, { columns = it.filter(Char::isDigit) }, "أعمدة", Icons.Outlined.ViewColumn); AppField(rows, { rows = it.filter(Char::isDigit) }, "صفوف", Icons.Outlined.GridView) }
+            AppField(copies, { copies = it.filter(Char::isDigit) }, "عدد النسخ", MmIcons.Copy)
             Button(onClick = { prefs.edit().putString("paper", paper).putInt("columns", columns.toIntOrNull() ?: 2).putInt("rows", rows.toIntOrNull() ?: 4).putInt("copies", copies.toIntOrNull() ?: 1).apply(); saved = true }, modifier = Modifier.fillMaxWidth()) { Text(if (saved) "تم حفظ إعدادات الطابعة" else "حفظ إعدادات الطباعة") }
         }
         GlassCard {
             Text("معاينة ورقة الطباعة", fontWeight = FontWeight.Bold, fontSize = 18.sp)
             PrintSheetPreview(columns.toIntOrNull() ?: 2, rows.toIntOrNull() ?: 4)
             Text("MICRO-MAX يظهر مرة واحدة في أعلى كل كرت • استخدم Actual size / 100% في نافذة الطباعة.", color = StudioMuted, fontSize = 11.sp)
-            Button(onClick = { activity.printBitmap(composePrintSheet(columns.toIntOrNull() ?: 2, rows.toIntOrNull() ?: 4)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Print, null); Spacer(Modifier.width(8.dp)); Text("فتح نافذة الطباعة") }
+            Button(onClick = { activity.printBitmap(composePrintSheet(columns.toIntOrNull() ?: 2, rows.toIntOrNull() ?: 4)) }, modifier = Modifier.fillMaxWidth()) { Icon(MmIcons.Print, null); Spacer(Modifier.width(8.dp)); Text("فتح نافذة الطباعة") }
         }
     }
 }

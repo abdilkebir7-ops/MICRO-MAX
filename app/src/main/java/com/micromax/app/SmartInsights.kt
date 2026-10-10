@@ -52,31 +52,31 @@ private fun memorySignal(r: JSONObject?, total: String, free: String): Float {
 @Composable
 fun InsightsPanel(dash: JSONObject?, onOpenNetwork: () -> Unit) {
     val insights = routerInsights(dash)
-    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .7f))) {
+    Surface(shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
         Column(Modifier.fillMaxWidth().padding(17.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                SymbolTile(Icons.Outlined.TipsAndUpdates, Tangerine, size = 40.dp)
+                SymbolTile(MmIcons.Sparkle, Tangerine, size = 40.dp)
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("مرصد الشبكة", fontWeight = FontWeight.Bold, fontSize = 17.sp, color = MaterialTheme.colorScheme.onSurface)
-                    Text("توصيات مبنية على آخر قراءة", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("مرصد الشبكة", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
+                    Text("توصيات مبنية على آخر قراءة", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Text("مباشر", fontSize = 11.sp, color = Teal)
+                LedDot(Link, size = 5.dp, live = true); Text("مباشر", style = MaterialTheme.typography.labelSmall, color = Link)
             }
             insights.take(2).forEach { insight ->
-                val tint = if (insight.urgent) Color(0xFFCB4562) else if (insight.title.startsWith("لا توجد")) Teal else Tangerine
+                val tint = if (insight.urgent) Fault else if (insight.title.startsWith("لا توجد")) Teal else Tangerine
                 Surface(color = tint.copy(alpha = .08f), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(13.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(insight.title, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = tint)
-                        Text(insight.detail, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(insight.title, style = MaterialTheme.typography.labelLarge, color = tint)
+                        Text(insight.detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
             TextButton(onClick = onOpenNetwork, modifier = Modifier.align(Alignment.End)) {
                 Text("فحص أدوات الشبكة")
                 Spacer(Modifier.width(5.dp))
-                Icon(Icons.Outlined.ArrowBackIosNew, null, Modifier.size(13.dp))
+                Icon(MmIcons.ChevronL, null, Modifier.size(16.dp))
             }
         }
     }

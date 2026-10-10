@@ -20,16 +20,27 @@ function sentence(words) {
 }
 
 export class RouterOS {
-  constructor({host, port=8728, username, password, tls=false, ca, allowInsecureTls=false, timeout=10000}) {
+  constructor({host, port=8728, username, password, tls=false, ca, allowInsecureTls=false, timeout=10000, lookup, pinSha256}) {
     this.host=host; this.port=port; this.username=username; this.password=password;
     this.tls=tls; this.ca=ca; this.allowInsecureTls=allowInsecureTls; this.timeout=timeout; this.socket=null; this.buffer=Buffer.alloc(0);
+    this.lookup=lookup||undefined;
+    this.pinSha256=pinSha256?String(pinSha256).replace(/[^0-9a-fA-F]/g,"").toLowerCase():"";
   }
   async connect() {
     this.socket = await new Promise((resolve,reject)=>{
-      const s = (this.tls ? tls.connect({host:this.host,port:this.port,ca:this.ca || undefined,rejectUnauthorized:!this.allowInsecureTls})
-                          : net.createConnection({host:this.host,port:this.port}));
+      const pin=this.pinSha256;
+      // With a pinned fingerprint (router self-signed certificate) the chain check is replaced by the pin.
+      const s = (this.tls ? tls.connect({host:this.host,port:this.port,ca:this.ca || undefined,lookup:this.lookup,rejectUnauthorized:pin?false:!this.allowInsecureTls,servername:net.isIP(this.host)?undefined:this.host})
+                          : net.createConnection({host:this.host,port:this.port,lookup:this.lookup}));
       const timer=setTimeout(()=>{s.destroy();reject(new Error("TIMEOUT"))},this.timeout);
-      s.once("connect",()=>{clearTimeout(timer);resolve(s)});
+      s.once(this.tls?"secureConnect":"connect",()=>{
+        clearTimeout(timer);
+        if(this.tls&&pin){
+          const fp=String(s.getPeerCertificate()?.fingerprint256||"").replace(/:/g,"").toLowerCase();
+          if(fp!==pin){s.destroy();return reject(Object.assign(new Error("CERT_PIN_MISMATCH"),{code:"CERT_PIN_MISMATCH"}));}
+        }
+        resolve(s);
+      });
       s.once("error",e=>{clearTimeout(timer);reject(e)});
     });
     await this.write(sentence(["/login"]));
@@ -45,7 +56,11 @@ export class RouterOS {
       await this.write(sentence(["/login",`=name=${this.username}`,`=password=${this.password}`]));
       reply=await this.readSentenceSet();
     }
-    if (reply.some(x=>x.startsWith("!trap"))) throw new Error("AUTH_FAILED");
+    if (reply.some(x=>x.startsWith("!trap"))) {
+      const err=new Error("AUTH_FAILED"); err.code="AUTH_FAILED";
+      err.routerMessage=String((reply.find(x=>x.startsWith("=message="))||"").slice(9)).slice(0,160);
+      throw err;
+    }
   }
   async write(buf) {
     return new Promise((resolve,reject)=>{
@@ -85,10 +100,15 @@ export class RouterOS {
   async readBytes(n) {
     while(this.buffer.length<n) {
       const chunk=await new Promise((resolve,reject)=>{
+        const sock=this.socket;
+        if(!sock||sock.destroyed)return reject(Object.assign(new Error("CONNECTION_CLOSED"),{code:"CONNECTION_CLOSED"}));
+        // A silent or closed router must fail fast instead of hanging the HTTP request forever.
+        const timer=setTimeout(()=>{cleanup();try{sock.destroy();}catch{}reject(Object.assign(new Error("TIMEOUT"),{code:"TIMEOUT"}));},this.timeout);
         const onData=d=>{cleanup();resolve(d)};
         const onErr=e=>{cleanup();reject(e)};
-        const cleanup=()=>{this.socket.off("data",onData);this.socket.off("error",onErr)};
-        this.socket.once("data",onData); this.socket.once("error",onErr);
+        const onEnd=()=>{cleanup();reject(Object.assign(new Error("CONNECTION_CLOSED"),{code:"CONNECTION_CLOSED"}))};
+        const cleanup=()=>{clearTimeout(timer);sock.off("data",onData);sock.off("error",onErr);sock.off("end",onEnd);sock.off("close",onEnd)};
+        sock.once("data",onData); sock.once("error",onErr); sock.once("end",onEnd); sock.once("close",onEnd);
       });
       this.buffer=Buffer.concat([this.buffer,chunk]);
     }

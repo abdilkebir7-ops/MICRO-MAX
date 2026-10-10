@@ -15,6 +15,13 @@ import PDFDocument from "pdfkit";
 import ExcelJS from "exceljs";
 import { RouterOS } from "./routeros.js";
 import { assertPinStrength, buildWifiQr, generateBatch, sanitizePrefix, usernameSpace, usernameRegex, qrSecretFrom, buildQrUrl, parseQr, auditCards, scanVerdict, classifyRouterUser } from "./cards.js";
+import { analyzeLoginHtml } from "./qrcheck.js";
+import { mapRouterProfile } from "./profiles.js";
+import { auditSecurity } from "./security.js";
+import { fleetSummary, configDoctor } from "./fleet.js";
+import { buildInsights } from "./insights.js";
+import { assertRouterTarget, guardedLookup, netConfigFromEnv, safeGet, isAddressAllowed } from "./netguard.js";
+import { agentSource, AGENT_POLICY, newAgentToken, hashToken, renderJobScript, parseReport, buildEnrollScript, buildDirectSetupScript, generateCredentials, rosSafe } from "./agent.js";
 import { binancePayConfigured, createBinancePayOrder, queryBinancePayOrder, verifyBinancePayNotification } from "./binancePay.js";
 
 dotenv.config();
@@ -23,7 +30,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const app = express();
 const allowedOrigins = String(process.env.CORS_ORIGIN || "").split(",").map(x => x.trim()).filter(Boolean);
 if (allowedOrigins.includes("*") && process.env.NODE_ENV === "production") throw new Error("CORS_ORIGIN must be an explicit allowlist in production");
-app.set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : false);
+app.set("trust proxy", (process.env.TRUST_PROXY === "true" || !!process.env.RENDER) ? 1 : false);
 app.disable("x-powered-by");
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin(origin, callback) {
@@ -33,9 +40,10 @@ app.use(cors({ origin(origin, callback) {
 app.use(express.json({ limit: "2mb", verify: (req, _res, buf) => { req.rawBody = Buffer.from(buf); } }));
 
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
-const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, skip: req => req.path === "/health" });
+const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, skip: req => req.path === "/health" || req.path.startsWith("/agent/") });
 app.use("/api", apiLimiter);
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID || undefined);
+const registrationEnabled = String(process.env.ALLOW_REGISTRATION || "true").toLowerCase() === "true";
 const configuredJwtSecret = String(process.env.JWT_SECRET || "");
 const configuredEncryptionSecret = String(process.env.ROUTER_ENCRYPTION_KEY || "");
 const devMode = ["development","test"].includes(process.env.NODE_ENV);
@@ -53,8 +61,26 @@ function auth(req,res,next){ const h=req.headers.authorization||""; try{ const t
 const decPass = v => String(v||"").startsWith("enc:") ? decrypt(String(v).slice(4)) : String(v||"");
 const encPass = v => "enc:" + encrypt(v);
 function cardOut(row){ const password = decPass(row.password); const passwordMode = password===row.username?"pin":"userpass"; const qr = row.portal_url ? buildQrUrl({portalUrl:row.portal_url,username:row.username,password:passwordMode==="pin"?"":password,cardId:row.id,secret:QR_SECRET}) : (row.qr_content||null); return { ...row, password, passwordMode, qr_content: qr, qrContent: qr, wifiQr: buildWifiQr(row.ssid) }; }
-async function bootstrapAdmin({email,hash=null,googleSub=null}){ const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query("SELECT pg_advisory_xact_lock(7734001)"); const n=(await client.query("SELECT count(*)::int n FROM users")).rows[0].n; if(n>0){ await client.query("ROLLBACK"); return null; } const id=crypto.randomUUID(); const r=await client.query("INSERT INTO users(id,email,password_hash,google_sub,role) VALUES($1,$2,$3,$4,'admin') RETURNING id,email,role",[id,email,hash,googleSub]); await client.query("INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",[id]); await client.query("COMMIT"); return r.rows[0]; }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; } finally{ client.release(); } }
-async function registerUser({email,hash}){ const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query("SELECT pg_advisory_xact_lock(7734002)"); const exists=await client.query("SELECT id FROM users WHERE email=$1",[email]); if(exists.rowCount){ await client.query("ROLLBACK"); return null; } const id=crypto.randomUUID(); const r=await client.query("INSERT INTO users(id,email,password_hash,role) VALUES($1,$2,$3,'staff') RETURNING id,email,role",[id,email,hash]); await client.query("INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",[id]); await client.query("COMMIT"); return r.rows[0]; }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; } finally{ client.release(); } }
+async function bootstrapAdmin({email,hash=null,googleSub=null,name=""}){ const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query("SELECT pg_advisory_xact_lock(7734001)"); const n=(await client.query("SELECT count(*)::int n FROM users")).rows[0].n; if(n>0 && !registrationEnabled){ await client.query("ROLLBACK"); return null; } const id=crypto.randomUUID(); const accountRole=n===0?"admin":"owner"; const r=await client.query("INSERT INTO users(id,email,password_hash,google_sub,role,display_name) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,email,role,display_name",[id,email,hash,googleSub,accountRole,String(name||"").trim().slice(0,60)]); await client.query("INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",[id]); await client.query("COMMIT"); return r.rows[0]; }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; } finally{ client.release(); } }
+const NET_CFG = netConfigFromEnv();
+const NET_LOOKUP = guardedLookup(NET_CFG);
+function rosFor(r,extra={}){
+  if(r.mode==="agent") throw Error("ROUTER_IS_AGENT_MODE");
+  if(net.isIP(r.host)&&!isAddressAllowed(r.host,NET_CFG)) throw Error("HOST_NOT_ALLOWED");
+  return new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,pinSha256:r.tls_fingerprint||undefined,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",lookup:NET_LOOKUP,...extra});
+}
+const AGENT_INTERVAL_SEC=30;
+function agentBase(req){
+  const configured=String(process.env.PUBLIC_BASE_URL||"").trim();
+  if(configured) return new URL(configured).origin;
+  if(process.env.NODE_ENV==="production") throw Error("PUBLIC_BASE_URL_REQUIRED");
+  return `${req.protocol}://${req.get("host")}`;
+}
+function fpNormalize(v){const f=String(v||"").replace(/[^0-9a-fA-F]/g,"").toLowerCase();if(f&&f.length!==64)throw Error("INVALID_FINGERPRINT");return f;}
+function guardRouterInput(host,port){
+  try{ return assertRouterTarget(host,port,NET_CFG); }
+  catch(e){ const err=Error(e.message); err.status=400; throw err; }
+}
 function role(...roles){ return (req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:"FORBIDDEN"}); }
 async function audit(userId,action,entity,entityId,details={}){ await pool.query("INSERT INTO audit_logs(id,user_id,action,entity,entity_id,details) VALUES(gen_random_uuid(),$1,$2,$3,$4,$5)",[userId,action,entity,entityId,JSON.stringify(details)]); }
 
@@ -62,6 +88,7 @@ async function init(){
  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;
  CREATE TABLE IF NOT EXISTS users(id UUID PRIMARY KEY,email TEXT UNIQUE NOT NULL,password_hash TEXT,google_sub TEXT UNIQUE,role TEXT NOT NULL DEFAULT 'staff',created_at TIMESTAMPTZ NOT NULL DEFAULT now());
  ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT UNIQUE;
+ ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT '';
  ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
  CREATE TABLE IF NOT EXISTS routers(id UUID PRIMARY KEY,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,name TEXT NOT NULL,host TEXT NOT NULL,port INTEGER NOT NULL DEFAULT 8728,username TEXT NOT NULL,password_enc TEXT NOT NULL,tls BOOLEAN NOT NULL DEFAULT false,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
  CREATE TABLE IF NOT EXISTS cards(id UUID PRIMARY KEY,router_id UUID NOT NULL REFERENCES routers(id) ON DELETE CASCADE,username TEXT NOT NULL,password TEXT NOT NULL,profile TEXT NOT NULL DEFAULT 'default',price NUMERIC(14,2) NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'available',sold_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(router_id,username));
@@ -79,6 +106,17 @@ ALTER TABLE cards ADD COLUMN IF NOT EXISTS batch_id UUID;
  ALTER TABLE cards ADD COLUMN IF NOT EXISTS qr_content TEXT;
  ALTER TABLE cards ADD COLUMN IF NOT EXISTS portal_url TEXT;
  ALTER TABLE cards ADD COLUMN IF NOT EXISTS ssid TEXT;
+ ALTER TABLE cards ADD COLUMN IF NOT EXISTS provision_state TEXT NOT NULL DEFAULT 'ready';
+ ALTER TABLE routers ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'direct';
+ ALTER TABLE routers ADD COLUMN IF NOT EXISTS tls_fingerprint TEXT;
+ ALTER TABLE routers ADD COLUMN IF NOT EXISTS agent_token_hash TEXT;
+ ALTER TABLE routers ADD COLUMN IF NOT EXISTS agent_last_seen TIMESTAMPTZ;
+ ALTER TABLE routers ADD COLUMN IF NOT EXISTS agent_info JSONB;
+ ALTER TABLE routers ADD COLUMN IF NOT EXISTS agent_offline_notified BOOLEAN NOT NULL DEFAULT false;
+ ALTER TABLE hotspot_profiles ADD COLUMN IF NOT EXISTS provision_state TEXT NOT NULL DEFAULT 'ready';
+ CREATE UNIQUE INDEX IF NOT EXISTS routers_agent_token_idx ON routers(agent_token_hash) WHERE agent_token_hash IS NOT NULL;
+ CREATE TABLE IF NOT EXISTS agent_jobs(id UUID PRIMARY KEY,router_id UUID NOT NULL REFERENCES routers(id) ON DELETE CASCADE,type TEXT NOT NULL,payload JSONB NOT NULL,card_id UUID,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,error TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),sent_at TIMESTAMPTZ,done_at TIMESTAMPTZ);
+ CREATE INDEX IF NOT EXISTS agent_jobs_router_status_idx ON agent_jobs(router_id,status,created_at);
  CREATE TABLE IF NOT EXISTS app_settings(user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,theme TEXT NOT NULL DEFAULT 'light',currency TEXT NOT NULL DEFAULT 'XOF');
  CREATE TABLE IF NOT EXISTS store_items(id UUID PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',category TEXT NOT NULL DEFAULT 'template',price NUMERIC(14,2) NOT NULL DEFAULT 0,active BOOLEAN NOT NULL DEFAULT true,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
  INSERT INTO store_items(id,name,description,category,price,active)
@@ -94,66 +132,8 @@ ALTER TABLE cards ADD COLUMN IF NOT EXISTS batch_id UUID;
 }
 
 app.get("/health",(_,res)=>res.json({ok:true,service:"MICRO-MAX API",version:"2.0.0"}));
-
-// Protected administrator account recovery. Requires ADMIN_EMAIL and ADMIN_RECOVERY_SECRET.
-app.post("/api/auth/admin-recover", loginLimiter, async (req, res) => {
-  const expected = String(process.env.ADMIN_RECOVERY_SECRET || "");
-  const supplied = String(req.get("x-admin-recovery-secret") || "");
-  const a = Buffer.from(expected);
-  const b = Buffer.from(supplied);
-
-  if (a.length < 32 || a.length !== b.length ||
-      !crypto.timingSafeEqual(a, b)) {
-    return res.status(403).json({ error: "RECOVERY_NOT_AUTHORIZED" });
-  }
-
-  const email = String(req.body.email || "").trim().toLowerCase();
-  const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-  const password = String(req.body.password || "");
-
-  if (!adminEmail || email !== adminEmail)
-    return res.status(403).json({ error: "ADMIN_EMAIL_MISMATCH" });
-  if (password.length < 12)
-    return res.status(400).json({ error: "PASSWORD_TOO_SHORT" });
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const found = await client.query(
-      "SELECT id FROM users WHERE email=$1 FOR UPDATE", [email]
-    );
-    const hash = await bcrypt.hash(password, 12);
-
-    if (found.rowCount) {
-      await client.query(
-        "UPDATE users SET password_hash=$1, role='admin' WHERE id=$2",
-        [hash, found.rows[0].id]
-      );
-    } else {
-      const id = crypto.randomUUID();
-      await client.query(
-        "INSERT INTO users(id,email,password_hash,role) VALUES($1,$2,$3,'admin')",
-        [id, email, hash]
-      );
-      await client.query(
-        "INSERT INTO app_settings(user_id) VALUES($1) ON CONFLICT DO NOTHING",
-        [id]
-      );
-    }
-
-    await client.query("COMMIT");
-    return res.json({ ok: true });
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("Admin recovery failed:", e.message);
-    return res.status(500).json({ error: "ADMIN_RECOVERY_FAILED" });
-  } finally {
-    client.release();
-  }
-});
-
-app.post("/api/auth/register",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");if(!email||password.length<8)return res.status(400).json({error:"INVALID_INPUT"});try{const count=Number((await pool.query("SELECT count(*)::int n FROM users")).rows[0].n);let user;if(count===0){user=await bootstrapAdmin({email,hash:await bcrypt.hash(password,12)});}else if(process.env.ALLOW_REGISTRATION==="true"){user=await registerUser({email,hash:await bcrypt.hash(password,12)});}else{user=null;}if(!user)return res.status(403).json({error:count===0?"REGISTRATION_FAILED":"REGISTRATION_CLOSED"});await audit(user.id,"REGISTER","user",user.id,{role:user.role});res.status(201).json({token:sign(user),user});}catch(e){if(String(e?.code)==="23505")return res.status(409).json({error:"EMAIL_EXISTS"});res.status(500).json({error:"REGISTRATION_FAILED"});}});
-app.post("/api/auth/login",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");const r=await pool.query("SELECT * FROM users WHERE email=$1",[email]);if(!r.rowCount||!r.rows[0].password_hash||!(await bcrypt.compare(password,r.rows[0].password_hash)))return res.status(401).json({error:"INVALID_CREDENTIALS"});await audit(r.rows[0].id,"LOGIN","user",r.rows[0].id);res.json({token:sign(r.rows[0]),user:{id:r.rows[0].id,email:r.rows[0].email,role:r.rows[0].role}});});
+app.post("/api/auth/register",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||""),name=String(req.body.name||"").trim().slice(0,60);if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:"INVALID_EMAIL"});if(password.length<8)return res.status(400).json({error:"WEAK_PASSWORD"});try{const user=await bootstrapAdmin({email,hash:await bcrypt.hash(password,12),name});if(!user)return res.status(403).json({error:"REGISTRATION_CLOSED"});res.status(201).json({token:sign(user),user:{id:user.id,email:user.email,role:user.role,name:user.display_name||""}});}catch{res.status(409).json({error:"EMAIL_EXISTS"});}});
+app.post("/api/auth/login",loginLimiter,async(req,res)=>{const email=String(req.body.email||"").trim().toLowerCase(),password=String(req.body.password||"");const r=await pool.query("SELECT * FROM users WHERE email=$1",[email]);if(!r.rowCount||!r.rows[0].password_hash||!(await bcrypt.compare(password,r.rows[0].password_hash)))return res.status(401).json({error:"INVALID_CREDENTIALS"});await audit(r.rows[0].id,"LOGIN","user",r.rows[0].id);res.json({token:sign(r.rows[0]),user:{id:r.rows[0].id,email:r.rows[0].email,role:r.rows[0].role,name:r.rows[0].display_name||""}});});
 app.post("/api/auth/google",loginLimiter,async(req,res)=>{
   const idToken=String(req.body.idToken||"").trim();
   if(!idToken)return res.status(400).json({error:"GOOGLE_ID_TOKEN_REQUIRED"});
@@ -185,13 +165,13 @@ app.post("/api/store/:id/activate",auth,async(req,res)=>{const r=await pool.quer
 app.get("/api/store/my",auth,async(req,res)=>{const r=await pool.query("SELECT e.created_at,i.id,i.name,i.description,i.category,i.price FROM store_entitlements e JOIN store_items i ON i.id=e.item_id WHERE e.user_id=$1 ORDER BY e.created_at DESC",[req.user.sub]);res.json({items:r.rows});});
 app.get("/api/payment-methods",auth,async(req,res)=>{const online=process.env.ENABLE_ONLINE_PAYMENTS==="true";res.json({methods:[{id:"cash",name:"نقداً / يدوي",available:true},...(online?[{id:"binance_pay",name:"Binance Pay",available:binancePayConfigured()}]:[])]});});
 
-app.get("/api/routers",auth,async(req,res)=>{const r=await pool.query("SELECT id,name,host,port,username,tls,created_at FROM routers WHERE user_id=$1 ORDER BY created_at DESC",[req.user.sub]);res.json({routers:r.rows});});
+app.get("/api/routers",auth,async(req,res)=>{const r=await pool.query("SELECT id,name,host,port,username,tls,mode,(tls_fingerprint IS NOT NULL) pinned,agent_last_seen,(mode='agent' AND agent_last_seen > now() - interval '120 seconds') online,created_at FROM routers WHERE user_id=$1 ORDER BY created_at DESC",[req.user.sub]);res.json({routers:r.rows});});
 
 function tcpProbe(host, port, useTls=false, timeout=5000) {
   return new Promise(resolve => {
     const started=Date.now(); let settled=false;
     const finish=(result)=>{if(settled)return;settled=true;try{socket?.destroy();}catch{};resolve({...result,latencyMs:Date.now()-started});};
-    const socket=useTls ? tls.connect({host,port,servername:host,rejectUnauthorized:false}) : net.createConnection({host,port});
+    const socket=useTls ? tls.connect({host,port,servername:net.isIP(host)?undefined:host,rejectUnauthorized:false,lookup:NET_LOOKUP}) : net.createConnection({host,port,lookup:NET_LOOKUP});
     const timer=setTimeout(()=>finish({ok:false,code:"TIMEOUT",message:"لم يصل رد من المنفذ خلال المهلة"}),timeout);
     socket.once("connect",()=>{clearTimeout(timer);finish({ok:true,code:"OPEN",message:"المنفذ مفتوح ويمكن الوصول إليه"});});
     socket.once("secureConnect",()=>{clearTimeout(timer);finish({ok:true,code:"OPEN_TLS",message:"منفذ TLS مفتوح ويمكن الوصول إليه"});});
@@ -204,6 +184,7 @@ function privateIpv4(host) {
   return p.length===4 && p.every(x=>Number.isInteger(x)&&x>=0&&x<=255) && (p[0]===10 || p[0]===192&&p[1]===168 || p[0]===172&&p[1]>=16&&p[1]<=31);
 }
 app.post("/api/routers/discover",auth,async(req,res)=>{
+  if(!NET_CFG.allowPrivate) return res.status(400).json({ok:false,error:"DISCOVERY_REQUIRES_LOCAL_DEPLOYMENT",detail:"البحث التلقائي يعمل فقط إذا شُغّل Backend داخل نفس الشبكة المحلية (ALLOW_PRIVATE_ROUTER_HOSTS=true). للراوتر البعيد استخدم وضع Agent أو API-SSL."});
   const network=String(req.body?.network||"192.168.88.0/24").trim(); const m=network.match(/^(\d+\.\d+\.\d+)\.0\/24$/);
   if(!m || !privateIpv4(`${m[1]}.1`)) return res.status(400).json({ok:false,error:"PRIVATE_24_NETWORK_REQUIRED",detail:"اكتشاف الراوتر يعمل فقط على شبكة خاصة بصيغة 192.168.88.0/24"});
   const hosts=Array.from({length:254},(_,i)=>`${m[1]}.${i+1}`); const found=[]; let cursor=0;
@@ -215,29 +196,31 @@ app.post("/api/routers/discover",auth,async(req,res)=>{
 app.post("/api/routers/diagnose",auth,async(req,res)=>{
   const host=String(req.body?.host||"").trim(); const port=Number(req.body?.port)||8728; const tlsMode=!!req.body?.tls;
   if(!host)return res.status(400).json({ok:false,error:"ROUTER_INPUT_REQUIRED",steps:[]});
+  try{ guardRouterInput(host,port); }catch(e){ return res.status(400).json({ok:false,error:e.message,steps:[{name:"VALIDATION",ok:false,code:e.message,message:e.message==="PORT_NOT_ALLOWED"?"المنفذ غير مسموح (المسموح: 8728, 8729 أو حسب ROUTER_ALLOWED_PORTS)":"عنوان الراوتر غير مسموح (loopback/metadata/شبكة خاصة على سيرفر سحابي)"}]}); }
   const steps=[]; let addresses=[];
   try { addresses=await dns.promises.lookup(host,{all:true}); steps.push({name:"DNS",ok:true,message:`تم حل ${host}`,addresses:addresses.map(x=>x.address)}); }
   catch(e){ steps.push({name:"DNS",ok:false,code:String(e.code||"DNS_ERROR"),message:"تعذر حل اسم المضيف من Backend"}); }
+  if(addresses.length&&!addresses.some(a=>isAddressAllowed(a.address,NET_CFG)))return res.status(400).json({ok:false,error:"HOST_NOT_ALLOWED",steps:[...steps,{name:"VALIDATION",ok:false,code:"HOST_NOT_ALLOWED",message:"العنوان يشير إلى شبكة غير مسموحة من هذا السيرفر. الراوترات المحلية تحتاج وضع Agent."}]});
   const tcp=await tcpProbe(host,port,tlsMode); steps.push({name:tlsMode?"TCP/TLS":"TCP",...tcp});
   let login=null;
   if(req.body?.username && typeof req.body?.password === "string" && tcp.ok){
     let ros;
-    try { ros=new RouterOS({host,port,username:String(req.body.username),password:req.body.password,tls:tlsMode,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",timeout:8000}); const r=await ros.command("/system/resource/print",[]); login={ok:true,code:"AUTH_OK",message:"تم تسجيل الدخول إلى RouterOS",resource:r[0]||{}}; }
-    catch(e){ login={ok:false,code:String(e.code||e.message||"ROUTER_LOGIN_FAILED"),message:String(e.message||e.code||"فشل تسجيل الدخول").slice(0,240)}; }
+    try { ros=new RouterOS({host,port,username:String(req.body.username),password:req.body.password,tls:tlsMode,pinSha256:fpNormalize(req.body.fingerprint)||undefined,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",lookup:NET_LOOKUP,timeout:8000}); const r=await ros.command("/system/resource/print",[]); login={ok:true,code:"AUTH_OK",message:"تم تسجيل الدخول إلى RouterOS",resource:r[0]||{}}; }
+    catch(e){ login={ok:false,code:String(e.code||e.message||"ROUTER_LOGIN_FAILED"),message:String(e.routerMessage?`${e.message}: ${e.routerMessage}`:(e.message||e.code||"فشل تسجيل الدخول")).slice(0,240)}; }
     finally { try{await ros?.close();}catch{} }
     steps.push({name:"RouterOS",...login});
   } else steps.push({name:"RouterOS",ok:false,code:tcp.ok?"CREDENTIALS_NOT_TESTED":"TCP_UNREACHABLE",message:tcp.ok?"تم فتح المنفذ لكن لم تُرسل بيانات الدخول":"لا يمكن اختبار بيانات الدخول قبل فتح المنفذ"});
   const ok=steps.every(x=>x.ok);
   res.json({ok,source:"backend",host,port,tls:tlsMode,steps,advice:ok?"الاتصال جاهز من مكان تشغيل Backend":"إذا فشل TCP فالمشكلة شبكة/VPN/Firewall، وليست كلمة مرور التطبيق"});
 });
-app.post("/api/routers/test",auth,async(req,res)=>{const {host,port=8728,username,password,tls=false}=req.body;let ros;try{if(!String(host||"").trim()||!String(username||"").trim()||!String(password||""))return res.status(400).json({ok:false,error:"ROUTER_INPUT_REQUIRED",detail:"host, username and password are required"});ros=new RouterOS({host:String(host).trim(),port:Number(port)||8728,username:String(username).trim(),password,tls:!!tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});const resource=await ros.command("/system/resource/print",[]);res.json({ok:true,resource:resource[0]||{}});}catch(e){const detail=String(e?.code||e?.message||"UNKNOWN").replace(/\s+/g," ").slice(0,240);res.status(502).json({ok:false,error:"ROUTER_CONNECTION_FAILED",detail,help:tls?"تحقق من API-SSL والمنفذ 8729 والشهادة وALLOW_INSECURE_ROUTER_TLS":"تحقق من API والمنفذ 8728 وIP الراوتر والجدار الناري"});}finally{try{await ros?.close();}catch{}}});
-app.post("/api/routers",auth,async(req,res)=>{const {name,host,port=8728,username,password,tls=false}=req.body;if(!name||!host||!username||!password)return res.status(400).json({error:"INVALID_INPUT"});const id=crypto.randomUUID();await pool.query("INSERT INTO routers(id,user_id,name,host,port,username,password_enc,tls) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",[id,req.user.sub,name,host,Number(port),username,encrypt(password),!!tls]);await audit(req.user.sub,"CREATE","router",id,{name,host});res.status(201).json({id,name,host,port:Number(port),username,tls:!!tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});});
-app.delete("/api/routers/:id",auth,role("admin"),async(req,res)=>{await pool.query("DELETE FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);await audit(req.user.sub,"DELETE","router",req.params.id);res.status(204).end();});
+app.post("/api/routers/test",auth,async(req,res)=>{const {host,port=8728,username,password,tls=false,fingerprint}=req.body;let ros;try{if(!String(host||"").trim()||!String(username||"").trim()||!String(password||""))return res.status(400).json({ok:false,error:"ROUTER_INPUT_REQUIRED",detail:"host, username and password are required"});const target=guardRouterInput(host,Number(port)||8728);ros=new RouterOS({host:target.host,port:target.port,username:String(username).trim(),password,tls:!!tls,pinSha256:fpNormalize(fingerprint)||undefined,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true",lookup:NET_LOOKUP});const resource=await ros.command("/system/resource/print",[]);res.json({ok:true,resource:resource[0]||{}});}catch(e){const detail=String(e?.code||e?.message||"UNKNOWN").replace(/\s+/g," ").slice(0,240);res.status(e.status||502).json({ok:false,error:e.status?e.message:"ROUTER_CONNECTION_FAILED",detail,routerMessage:e?.routerMessage||undefined,help:tls?"تحقق من API-SSL والمنفذ 8729 والشهادة وALLOW_INSECURE_ROUTER_TLS":"تحقق من API والمنفذ 8728 وIP الراوتر والجدار الناري"});}finally{try{await ros?.close();}catch{}}});
+app.post("/api/routers",auth,async(req,res)=>{const {name,host,port=8728,username,password,tls=false,fingerprint}=req.body;if(!name||!host||!username||!password)return res.status(400).json({error:"INVALID_INPUT"});let target,fp;try{target=guardRouterInput(host,Number(port)||8728);fp=fpNormalize(fingerprint);}catch(e){return res.status(e.status||400).json({error:e.message});}const id=crypto.randomUUID();await pool.query("INSERT INTO routers(id,user_id,name,host,port,username,password_enc,tls,tls_fingerprint,mode) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'direct')",[id,req.user.sub,String(name).trim().slice(0,80),target.host,target.port,String(username).trim(),encrypt(password),!!tls,fp||null]);await audit(req.user.sub,"CREATE","router",id,{name,host:target.host,mode:"direct",pinned:!!fp});res.status(201).json({id,name,host:target.host,port:target.port,username,tls:!!tls,mode:"direct",pinned:!!fp,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});});
+app.delete("/api/routers/:id",auth,role("admin","owner"),async(req,res)=>{await pool.query("DELETE FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);await audit(req.user.sub,"DELETE","router",req.params.id);res.status(204).end();});
 async function getRouter(req,id){const r=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[id,req.user.sub]);if(!r.rowCount)throw Error("ROUTER_NOT_FOUND");return r.rows[0];}
-async function withRos(req,id,fn){const router=await getRouter(req,id);const ros=new RouterOS({host:router.host,port:router.port,username:router.username,password:decrypt(router.password_enc),tls:router.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});try{return await fn(ros,router);}finally{await ros.close().catch(()=>{});}}
+async function withRos(req,id,fn){const router=await getRouter(req,id);const ros=rosFor(router);try{return await fn(ros,router);}finally{await ros.close().catch(()=>{});}}
 app.get("/api/routers/:id/hotspot/users",auth,async(req,res)=>{try{const items=await withRos(req,req.params.id,async ros=>await ros.command("/ip/hotspot/user/print",[]));res.json(items);}catch(e){res.status(502).json({error:"HOTSPOT_USERS_QUERY_FAILED",detail:e.message});}});
 app.get("/api/routers/:id/network/:kind",auth,async(req,res)=>{const commands={interfaces:"/interface/print","dhcp-leases":"/ip/dhcp-server/lease/print",arp:"/ip/arp/print","dns-static":"/ip/dns/static/print","ip-addresses":"/ip/address/print",routes:"/ip/route/print",firewall:"/ip/firewall/filter/print",queues:"/queue/simple/print",logs:"/log/print"};const cmd=commands[req.params.kind];if(!cmd)return res.status(404).json({error:"NETWORK_KIND_NOT_FOUND"});try{const items=await withRos(req,req.params.id,async ros=>await ros.command(cmd,[]));res.json({kind:req.params.kind,items});}catch(e){res.status(502).json({error:"NETWORK_QUERY_FAILED",detail:e.message});}});
-app.post("/api/routers/:id/terminal",auth,role("admin"),async(req,res)=>{
+app.post("/api/routers/:id/terminal",auth,role("admin","owner"),async(req,res)=>{
   const command=String(req.body.command||"").trim();
   if(!command||command.length>1000)return res.status(400).json({error:"INVALID_COMMAND"});
   try{
@@ -273,6 +256,11 @@ function profilePayload(body){
 
 app.get("/api/routers/:id/hotspot-profiles",auth,async(req,res)=>{
   try{
+    const rr=await getRouter(req,req.params.id);
+    if(rr.mode==="agent"){
+      const l=await pool.query("SELECT name,price,duration_minutes,rate_limit,session_timeout,idle_timeout,shared_users,enabled,provision_state FROM hotspot_profiles WHERE router_id=$1 ORDER BY name",[rr.id]);
+      return res.json({mode:"agent",profiles:l.rows.map(x=>({name:x.name,rateLimit:x.rate_limit||"",sessionTimeout:x.session_timeout||"",idleTimeout:x.idle_timeout||"",sharedUsers:Number(x.shared_users||1),price:Number(x.price||0),durationMinutes:Number(x.duration_minutes||0),enabled:x.enabled!==false,provisionState:x.provision_state}))});
+    }
     const items=await withRos(req,req.params.id,async ros=>{
       const [routerProfiles,local]=await Promise.all([
         ros.command("/ip/hotspot/user/profile/print",[]),
@@ -287,6 +275,20 @@ app.get("/api/routers/:id/hotspot-profiles",auth,async(req,res)=>{
 app.post("/api/routers/:id/hotspot-profiles",auth,async(req,res)=>{
   try{
     const p=profilePayload(req.body);
+    const rr=await getRouter(req,req.params.id);
+    if(rr.mode==="agent"){
+      const payload={name:p.name,sharedUsers:p.sharedUsers,rateLimit:p.rateLimit,sessionTimeout:p.sessionTimeout,idleTimeout:p.idleTimeout};
+      const jobId=crypto.randomUUID();
+      // validate now (fails fast with a clear error instead of at the router)
+      renderJobScript([{id:jobId,type:"hotspot-profile-set",payload}],{baseUrl:"https://validate.invalid",token:"mmag_"+"a".repeat(30)});
+      const q=await pool.query(`INSERT INTO hotspot_profiles(id,router_id,name,price,duration_minutes,rate_limit,session_timeout,idle_timeout,shared_users,enabled,provision_state)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,true,'pending')
+        ON CONFLICT(router_id,name) DO UPDATE SET price=0,duration_minutes=EXCLUDED.duration_minutes,rate_limit=EXCLUDED.rate_limit,session_timeout=EXCLUDED.session_timeout,idle_timeout=EXCLUDED.idle_timeout,shared_users=EXCLUDED.shared_users,enabled=true,provision_state='pending',updated_at=now()
+        RETURNING *`,[crypto.randomUUID(),rr.id,p.name,p.price,p.durationMinutes,p.rateLimit,p.sessionTimeout,p.idleTimeout,p.sharedUsers]);
+      await pool.query("INSERT INTO agent_jobs(id,router_id,type,payload) VALUES($1,$2,'hotspot-profile-set',$3)",[jobId,rr.id,JSON.stringify(payload)]);
+      await audit(req.user.sub,"UPSERT","hotspot_profile",rr.id,{name:p.name,mode:"agent"});
+      return res.status(202).json({profile:q.rows[0],provisioning:"pending",note:"سيُنشأ البروفايل على الراوتر خلال دقيقة تقريباً عند اتصال الـ Agent."});
+    }
     const result=await withRos(req,req.params.id,async ros=>{
       const existing=await ros.command("/ip/hotspot/user/profile/print",[]);
       const found=existing.find(x=>x.name===p.name);
@@ -351,7 +353,7 @@ app.get("/api/routers/:id/hotspot-login",auth,async(req,res)=>{
   let ros;
   try{
     const r=await getRouterForUser(req,req.params.id);
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+    ros=rosFor(r);
     await ros.connect();
     const files=await ros.command("/file/print",["?name=hotspot/login.html"]);
     const f=files[0]||{};
@@ -370,7 +372,7 @@ app.post("/api/routers/:id/hotspot-login/validate",auth,async(req,res)=>{
   }catch(e){res.status(400).json({valid:false,error:"HOTSPOT_LOGIN_VALIDATE_FAILED",detail:e.message});}
 });
 
-app.post("/api/routers/:id/hotspot-login/publish",auth,role("admin"),async(req,res)=>{
+app.post("/api/routers/:id/hotspot-login/publish",auth,role("admin","owner"),async(req,res)=>{
   let ros;
   try{
     const r=await getRouterForUser(req,req.params.id);
@@ -378,7 +380,7 @@ app.post("/api/routers/:id/hotspot-login/publish",auth,role("admin"),async(req,r
     if(content.length<100 || content.length>500000) return res.status(400).json({error:"INVALID_LOGIN_HTML_SIZE"});
     const validation=validateLoginHtml(content);
     if(!validation.valid) return res.status(400).json({error:"LOGIN_HTML_INCOMPATIBLE",validation});
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+    ros=rosFor(r);
     await ros.connect();
     const current=await ros.command("/file/print",["?name=hotspot/login.html"]);
     const old=String(current[0]?.contents||"");
@@ -399,7 +401,7 @@ app.get("/api/routers/:id/hotspot-login/backups",auth,async(req,res)=>{
   let ros;
   try{
     const r=await getRouterForUser(req,req.params.id);
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+    ros=rosFor(r);
     await ros.connect();
     const files=await ros.command("/file/print",[]);
     const backups=files.filter(f=>/^hotspot\/login\.html\.micromax-[A-Za-z0-9_.-]+\.bak$/.test(String(f.name||""))).map(f=>({name:f.name,size:Number(f.size||0),creationTime:f.creation_time||f["creation-time"]||null})).sort((a,b)=>String(b.creationTime).localeCompare(String(a.creationTime)));
@@ -408,13 +410,13 @@ app.get("/api/routers/:id/hotspot-login/backups",auth,async(req,res)=>{
   finally{try{await ros?.close();}catch{}}
 });
 
-app.post("/api/routers/:id/hotspot-login/restore",auth,role("admin"),async(req,res)=>{
+app.post("/api/routers/:id/hotspot-login/restore",auth,role("admin","owner"),async(req,res)=>{
   let ros;
   try{
     const r=await getRouterForUser(req,req.params.id);
     const backup=String(req.body.backupName||"").trim();
     if(!/^hotspot\/login\.html\.micromax-[A-Za-z0-9_.-]+\.bak$/.test(backup)) return res.status(400).json({error:"INVALID_BACKUP_NAME"});
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+    ros=rosFor(r);
     await ros.connect();
     const b=await ros.command("/file/print",[`?name=${backup}`]);
     const content=String(b[0]?.contents||"");
@@ -446,7 +448,7 @@ app.get("/api/routers/:id/hotspot-pages",auth,async(req,res)=>{
   let ros;
   try{
     const r=await getRouterForUser(req,req.params.id);
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+    ros=rosFor(r);
     await ros.connect();
     const result={routerId:r.id,pages:{}};
     for(const page of ["login","status"]){const name=`hotspot/${page}.html`;const f=(await ros.command("/file/print",[`?name=${name}`]))[0]||{};const content=String(f.contents||"");result.pages[page]={file:name,content,validation:validateHotspotPage(page,content),updatedAt:f.creation_time||f["creation-time"]||null};}
@@ -460,7 +462,7 @@ app.post("/api/routers/:id/hotspot-pages/validate",auth,async(req,res)=>{
   catch(e){res.status(400).json({valid:false,error:"HOTSPOT_PAGE_VALIDATE_FAILED",detail:e.message});}
 });
 
-app.post("/api/routers/:id/hotspot-pages/publish",auth,role("admin"),async(req,res)=>{
+app.post("/api/routers/:id/hotspot-pages/publish",auth,role("admin","owner"),async(req,res)=>{
   let ros;
   try{
     const page=String(req.body.page||"").toLowerCase(); const content=String(req.body.content||"");
@@ -468,7 +470,7 @@ app.post("/api/routers/:id/hotspot-pages/publish",auth,role("admin"),async(req,r
     if(content.length<100 || content.length>500000)return res.status(400).json({error:"INVALID_HOTSPOT_HTML_SIZE"});
     const validation=validateHotspotPage(page,content); if(!validation.valid)return res.status(400).json({error:"HOTSPOT_HTML_INCOMPATIBLE",validation});
     const r=await getRouterForUser(req,req.params.id);
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"}); await ros.connect();
+    ros=rosFor(r); await ros.connect();
     const file=`hotspot/${page}.html`; const current=await ros.command("/file/print",[`?name=${file}`]); const old=String(current[0]?.contents||"");
     const backup=`${file}.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`; if(old)try{await ros.command("/file/add",[`=name=${backup}`,`=contents=${old}`]);}catch{}
     const target=current[0]?.[".id"]||current[0]?.id; if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]); else await ros.command("/file/add",[`=name=${file}`,`=contents=${content}`]);
@@ -498,7 +500,7 @@ app.post("/api/routers/:id/cards/preflight",auth,async(req,res)=>{
     const routerQ=await pool.query("SELECT id,host,port,username,tls FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);
     if(!routerQ.rowCount)throw Error("ROUTER_NOT_FOUND");
     const r=routerQ.rows[0];
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt((await pool.query("SELECT password_enc FROM routers WHERE id=$1",[req.params.id])).rows[0].password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+    ros=rosFor((await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub])).rows[0]||(()=>{throw Error("ROUTER_NOT_FOUND")})());
     await ros.connect();
     const profiles=await ros.command("/ip/hotspot/user/profile/print",[]);
     const profileVerified=profiles.some(x=>String(x.name||"")===String(plan.profile_name));
@@ -537,7 +539,7 @@ app.post("/api/routers/:id/qr-preflight",auth,async(req,res)=>{
     const routerQ=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);
     if(!routerQ.rowCount)throw Error("ROUTER_NOT_FOUND");
     const r=routerQ.rows[0];
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+    ros=rosFor(r);
     await ros.connect();
     const hotspotProfiles=await ros.command("/ip/hotspot/profile/print",[]);
     const hotspotServers=await ros.command("/ip/hotspot/print",[]);
@@ -546,25 +548,31 @@ app.post("/api/routers/:id/qr-preflight",auth,async(req,res)=>{
     const controllerHost=String(url.host);
     let portalStatus=null,portalReachable=false,html="",fetchError=null;
     try{
-      const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),5000);
-      const response=await fetch(url,{redirect:"follow",signal:controller.signal,headers:{"User-Agent":"MICRO-MAX-HotSpot-QR-Check/1.0"}});
-      clearTimeout(timer); portalStatus=response.status; html=(await response.text()).slice(0,500000); portalReachable=response.ok;
+      const response=await safeGet(url.toString(),{cfg:NET_CFG});
+      portalStatus=response.status; html=response.body; portalReachable=response.ok;
     }catch(e){fetchError=e.message||"PORTAL_UNREACHABLE";}
+    // The portal is usually on a private IP the API cannot reach: fall back to the real login.html stored on the router.
+    let source="portal-http",fileRead=false;
+    if(!portalReachable){
+      try{const f=(await ros.command("/file/print",["?name=hotspot/login.html"]))[0];if(f&&f.contents){html=String(f.contents);fileRead=true;source="router-file";}}catch{}
+    }
+    const analysis=analyzeLoginHtml(html);
     const hasLoginForm=/<form[^>]+action=["'][^"']*\/login/i.test(html)||/<form[^>]*>/i.test(html)&&/name=["']username["']/i.test(html)&&/name=["']password["']/i.test(html);
-    const hasAutoSubmit=/\.submit\s*\(|requestSubmit\s*\(/i.test(html);
+    const hasAutoSubmit=analysis.autoLogin;
     const papAllowed=loginBy.some(v=>v.toLowerCase().includes("http-pap"));
     const httpsAllowed=loginBy.some(v=>v.toLowerCase().includes("https"));
     const chapOnly=loginBy.length>0 && loginBy.every(v=>v.toLowerCase().includes("http-chap")||v.toLowerCase().includes("cookie"));
     let mode="portal-prefill";
-    let ready=portalReachable && hasLoginForm && (papAllowed || httpsAllowed || !chapOnly);
+    let ready=(portalReachable||fileRead) && hasLoginForm && (papAllowed || httpsAllowed || !chapOnly);
     if(ready && hasAutoSubmit && (papAllowed||httpsAllowed)) mode="auto-submit";
     const warnings=[];
-    if(!portalReachable)warnings.push("HOTSPOT_PORTAL_NOT_REACHABLE_FROM_API");
+    if(!portalReachable&&!fileRead)warnings.push("HOTSPOT_PORTAL_NOT_REACHABLE_FROM_API");
+    for(const w of analysis.warnings)if(!warnings.includes(w))warnings.push(w);
     if(portalReachable&&!hasLoginForm)warnings.push("LOGIN_FORM_NOT_DETECTED");
     if(chapOnly)warnings.push("CHAP_REQUIRES_LOGIN_PAGE_CHALLENGE_HANDLING");
     if(mode==="portal-prefill")warnings.push("QR_OPENS_REAL_HOTSPOT_LOGIN_PAGE;_AUTO_LOGIN_REQUIRES_COMPATIBLE_LOGIN_HTML");
     res.json({
-      ready,mode,portal:{url:portalUrl,host:controllerHost,status:portalStatus,reachable:portalReachable,loginFormDetected:hasLoginForm,autoSubmitDetected:hasAutoSubmit,fetchError},
+      ready,mode,source,analysis,portal:{url:portalUrl,host:controllerHost,status:portalStatus,reachable:portalReachable,loginFormDetected:hasLoginForm,autoSubmitDetected:hasAutoSubmit,fetchError},
       router:{verified:true,hotspotServers:hotspotServers.length,loginBy,papAllowed,httpsAllowed,chapOnly},
       recommendedQr:`${portalUrl.replace(/\/$/,"")}?username={USERNAME}&password={PASSWORD}&dst=${encodeURIComponent(url.origin+"/")}`,
       planId:planId||null,
@@ -608,10 +616,14 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
     const routerQ=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.sub]);
     if(!routerQ.rowCount)throw Error("ROUTER_NOT_FOUND");
     const r=routerQ.rows[0];
-    ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
-    await ros.connect();
-    const profiles=await ros.command("/ip/hotspot/user/profile/print",[]);
-    if(!profiles.some(x=>x.name===plan.profile_name))throw Error("HOTSPOT_PROFILE_NOT_FOUND");
+    const agentMode=r.mode==="agent";
+    if(agentMode){ rosSafe(plan.profile_name); }
+    else{
+      ros=rosFor(r);
+      await ros.connect();
+      const profiles=await ros.command("/ip/hotspot/user/profile/print",[]);
+      if(!profiles.some(x=>x.name===plan.profile_name))throw Error("HOTSPOT_PROFILE_NOT_FOUND");
+    }
 
     // MikroTik generates the usernames/passwords itself (RouterOS :rndstr). Duplicates against the
     // database are detected after read-back, removed from the router and regenerated.
@@ -619,8 +631,11 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
     const pin=String(req.body.passwordMode||"userpass")==="pin";
     if(pin)assertPinStrength(usernameLetters,usernameDigits);
     const dbHas=async names=>{const q=await pool.query("SELECT username FROM cards WHERE router_id=$1 AND username=ANY($2::text[])",[req.params.id,names]);return new Set(q.rows.map(x=>x.username));};
-    routerTouched=true;
-    const made=await generateBatch({ros,count,prefix,digits:usernameDigits,letters:usernameLetters,passLen,pin,profile:plan.profile_name,batchId,dbHas});
+    routerTouched=!agentMode;
+    const limitUptime=req.body.enforceDuration===true?hotspotDuration(plan.duration_minutes):"";
+    const made=agentMode
+      ? generateCredentials({count,prefix,digits:usernameDigits,letters:usernameLetters,passLen,pin,taken:new Set((await pool.query("SELECT username FROM cards WHERE router_id=$1 AND username LIKE $2",[req.params.id,prefix+"%"])).rows.map(x=>x.username))})
+      : await generateBatch({ros,count,prefix,digits:usernameDigits,letters:usernameLetters,passLen,pin,profile:plan.profile_name,batchId,dbHas,limitUptime});
     for(const m of made)created.push({...m,id:crypto.randomUUID()});
 
     // Persist in chunks. Passwords are stored encrypted; the QR is rebuilt on read (never stored in clear).
@@ -631,11 +646,16 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
         const chunk=created.slice(i,i+250);
         const values=[]; const params=[];
         chunk.forEach((c,j)=>{
-          const o=j*11;
-          values.push(`($${o+1},$${o+2},$${o+3},$${o+4},$${o+5},$${o+6},$${o+7},$${o+8},$${o+9},$${o+10},$${o+11})`);
-          params.push(c.id,req.params.id,c.username,encPass(c.password),plan.profile_name,plan.price,plan.id,plan.currency,batchId,qrBase,ssid||null);
+          const o=j*12;
+          values.push(`($${o+1},$${o+2},$${o+3},$${o+4},$${o+5},$${o+6},$${o+7},$${o+8},$${o+9},$${o+10},$${o+11},$${o+12})`);
+          params.push(c.id,req.params.id,c.username,encPass(c.password),plan.profile_name,plan.price,plan.id,plan.currency,batchId,qrBase,ssid||null,agentMode?"pending":"ready");
         });
-        await client.query(`INSERT INTO cards(id,router_id,username,password,profile,price,plan_id,price_currency,batch_id,portal_url,ssid) VALUES ${values.join(",")}`,params);
+        await client.query(`INSERT INTO cards(id,router_id,username,password,profile,price,plan_id,price_currency,batch_id,portal_url,ssid,provision_state) VALUES ${values.join(",")}`,params);
+      }
+      if(agentMode){
+        for(const c of created){
+          await client.query("INSERT INTO agent_jobs(id,router_id,type,payload,card_id) VALUES($1,$2,'hotspot-user-add',$3,$4)",[crypto.randomUUID(),req.params.id,JSON.stringify({username:c.username,password:c.password,profile:plan.profile_name,comment:`MICRO-MAX:${batchId}`,limitUptime}),c.id]);
+        }
       }
       await client.query("COMMIT"); committed=true;
     }catch(e){ try{await client.query("ROLLBACK");}catch{} throw e; }
@@ -643,7 +663,7 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
 
     await audit(req.user.sub,"CREATE","cards",req.params.id,{count,planId,price:Number(plan.price),currency:plan.currency,batchId,generatedBy:"mikrotik",usernameDigits,usernameLetters});
     res.status(201).json({
-      success:true,count,batchId,generatedBy:"mikrotik",pricingSource:"micromax_plan",planId,planName:plan.name,price:Number(plan.price),currency:plan.currency,
+      success:true,count,batchId,generatedBy:agentMode?"agent":"mikrotik",provisioning:agentMode?"pending":"done",pricingSource:"micromax_plan",planId,planName:plan.name,price:Number(plan.price),currency:plan.currency,
       usernameFormat:{prefix,letters:usernameLetters,digits:usernameDigits,totalLength:prefix.length+usernameLetters+usernameDigits,passwordMode:pin?"pin":"userpass",passwordLength:passLen},
       validation:{profileVerified:true,duplicateCheck:true,usernameCollisionCheck:true,routerVerified:true,qrSigned:true},
       cards:created.map(c=>({id:c.id,username:c.username,password:c.password,passwordMode:pin?"pin":"userpass",profile:plan.profile_name,planId:plan.id,planName:plan.name,price:Number(plan.price),currency:plan.currency,durationMinutes:Number(plan.duration_minutes||0),rateLimit:plan.rate_limit||"",sessionTimeout:plan.session_timeout||"",idleTimeout:plan.idle_timeout||"",sharedUsers:Number(plan.shared_users||1),qrContent:buildQrUrl({portalUrl:qrBase,username:c.username,password:pin?"":c.password,cardId:c.id,secret:QR_SECRET}),wifiQr:buildWifiQr(ssid)}))
@@ -656,7 +676,7 @@ app.post("/api/routers/:id/cards/generate",auth,async(req,res)=>{
 });
 
 // ---- Smart detection: DB <-> MikroTik reconciliation (read-only unless apply=true) ----
-async function rosForRouter(req,id){const q=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[id,req.user.sub]);if(!q.rowCount)throw Error("ROUTER_NOT_FOUND");const r=q.rows[0];return new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS==="true"});}
+async function rosForRouter(req,id){const q=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[id,req.user.sub]);if(!q.rowCount)throw Error("ROUTER_NOT_FOUND");const r=q.rows[0];return rosFor(r);}
 app.post("/api/routers/:id/cards/audit",auth,async(req,res)=>{
   let ros=null;
   try{
@@ -704,10 +724,22 @@ app.post("/api/cards/scan",auth,async(req,res)=>{
 app.get("/api/cards",auth,async(req,res)=>{const r=await pool.query("SELECT c.*,r.name router_name,p.name plan_name,p.currency plan_currency,hp.duration_minutes profile_duration_minutes,hp.rate_limit profile_rate_limit,hp.session_timeout profile_session_timeout,hp.idle_timeout profile_idle_timeout,hp.shared_users profile_shared_users FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE r.user_id=$1 ORDER BY c.created_at DESC LIMIT 1000",[req.user.sub]);res.json({cards:r.rows.map(cardOut)});});
 
 // Smart Batch Center: reporting and safe lifecycle operations. Does not change card pricing/profile/username.
+// Cards of one batch in the shape the app prints (only unsold cards by default, so sold cards are never reprinted by mistake).
+app.get("/api/card-batches/:id/print-cards",auth,async(req,res)=>{
+  try{
+    if(!/^[0-9a-f-]{36}$/.test(req.params.id))return res.status(400).json({error:"INVALID_BATCH"});
+    const all=req.query.status==="all";
+    const q=await pool.query(`SELECT c.*,p.name plan_name,hp.duration_minutes FROM cards c JOIN routers r ON r.id=c.router_id
+      LEFT JOIN hotspot_plans p ON p.id=c.plan_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile
+      WHERE c.batch_id=$1 AND r.user_id=$2 ${all?"":"AND c.status='available'"} ORDER BY c.created_at,c.username LIMIT 5000`,[req.params.id,req.user.sub]);
+    const cards=q.rows.map(r=>{const o=cardOut(r);return{id:o.id,username:o.username,password:o.password,passwordMode:o.passwordMode,planName:r.plan_name||r.profile,profile:r.profile,price:Number(r.price||0),currency:r.price_currency||"XOF",durationMinutes:Number(r.duration_minutes||0),qrContent:o.qrContent,wifiQr:o.wifiQr,status:r.status};});
+    res.json({count:cards.length,cards});
+  }catch(e){ console.error("print-cards",e); res.status(500).json({error:"PRINT_CARDS_FAILED"}); }
+});
 app.get("/api/card-batches",auth,async(req,res)=>{try{const r=await pool.query(`SELECT c.batch_id,MIN(c.created_at) created_at,COUNT(*)::int total,COUNT(*) FILTER(WHERE c.status='available')::int available,COUNT(*) FILTER(WHERE c.status='sold')::int sold,COUNT(*) FILTER(WHERE c.status='used')::int used,COUNT(*) FILTER(WHERE c.status='expired')::int expired,COUNT(*) FILTER(WHERE c.status='disabled')::int disabled,MIN(c.plan_id) plan_id,MIN(p.name) plan_name,MIN(r.name) router_name,MIN(c.price_currency) currency,MIN(c.price) price FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE r.user_id=$1 AND c.batch_id IS NOT NULL GROUP BY c.batch_id ORDER BY MIN(c.created_at) DESC LIMIT 500`,[req.user.sub]);res.json({batches:r.rows});}catch(e){res.status(500).json({error:"BATCH_QUERY_FAILED",detail:e.message});}});
 app.get("/api/card-batches/:id",auth,async(req,res)=>{try{const r=await pool.query(`SELECT c.*,r.name router_name,p.name plan_name,p.currency plan_currency FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE c.batch_id=$1 AND r.user_id=$2 ORDER BY c.created_at DESC`,[req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:"BATCH_NOT_FOUND"});res.json({batchId:req.params.id,cards:r.rows.map(cardOut)});}catch(e){res.status(500).json({error:"BATCH_DETAIL_FAILED",detail:e.message});}});
 app.post("/api/card-batches/:id/disable",auth,async(req,res)=>{const client=await pool.connect();let routerId=null;try{await client.query("BEGIN");const q=await client.query(`SELECT c.id,c.router_id,c.username,c.status FROM cards c JOIN routers r ON r.id=c.router_id WHERE c.batch_id=$1 AND r.user_id=$2 FOR UPDATE`,[req.params.id,req.user.sub]);if(!q.rowCount)throw Error("BATCH_NOT_FOUND");routerId=q.rows[0].router_id;const candidates=q.rows.filter(x=>["available","expired"].includes(x.status));for(const c of candidates)await client.query("UPDATE cards SET status='disabled' WHERE id=$1",[c.id]);await client.query("COMMIT");await audit(req.user.sub,"DISABLE","card_batch",req.params.id,{changed:candidates.length,protected:q.rows.length-candidates.length});res.json({success:true,batchId:req.params.id,disabled:candidates.length,protected:q.rows.length-candidates.length});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();}});
-app.delete("/api/card-batches/:id",auth,async(req,res)=>{const client=await pool.connect();let ros=null;try{await client.query("BEGIN");const q=await client.query(`SELECT c.*,r.host,r.port,r.username router_username,r.password_enc,r.tls FROM cards c JOIN routers r ON r.id=c.router_id WHERE c.batch_id=$1 AND r.user_id=$2 FOR UPDATE`,[req.params.id,req.user.sub]);if(!q.rowCount)throw Error("BATCH_NOT_FOUND");const protectedCards=q.rows.filter(x=>!["available","expired","disabled"].includes(x.status));if(protectedCards.length)throw Error("BATCH_CONTAINS_SOLD_OR_USED_CARDS");const deletable=q.rows.filter(x=>["available","expired","disabled"].includes(x.status));for(const c of deletable)await client.query("DELETE FROM cards WHERE id=$1",[c.id]);await client.query("COMMIT");try{const r=q.rows[0];ros=new RouterOS({host:r.host,port:r.port,username:r.router_username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});await ros.connect();const users=await ros.command("/ip/hotspot/user/print",[`?comment=MICRO-MAX:${req.params.id}`]);for(const u of users){if(u[".id"])await ros.command("/ip/hotspot/user/remove",[`=.id=${u[".id"]}`]);}}catch{}await audit(req.user.sub,"DELETE","card_batch",req.params.id,{deleted:deletable.length});res.json({success:true,batchId:req.params.id,deleted:deletable.length});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();try{await ros?.close();}catch{}}});
+app.delete("/api/card-batches/:id",auth,async(req,res)=>{const client=await pool.connect();let ros=null;try{await client.query("BEGIN");const q=await client.query(`SELECT c.*,r.host,r.port,r.username router_username,r.password_enc,r.tls,r.tls_fingerprint,r.mode router_mode FROM cards c JOIN routers r ON r.id=c.router_id WHERE c.batch_id=$1 AND r.user_id=$2 FOR UPDATE`,[req.params.id,req.user.sub]);if(!q.rowCount)throw Error("BATCH_NOT_FOUND");const protectedCards=q.rows.filter(x=>!["available","expired","disabled"].includes(x.status));if(protectedCards.length)throw Error("BATCH_CONTAINS_SOLD_OR_USED_CARDS");const deletable=q.rows.filter(x=>["available","expired","disabled"].includes(x.status));for(const c of deletable)await client.query("DELETE FROM cards WHERE id=$1",[c.id]);await client.query("COMMIT");try{const r=q.rows[0];if(r.router_mode!=="agent"){ros=rosFor({...r,username:r.router_username,mode:r.router_mode});await ros.connect();}if(r.router_mode==="agent"){for(const c of deletable)await pool.query("INSERT INTO agent_jobs(id,router_id,type,payload) VALUES($1,$2,'hotspot-user-remove',$3)",[crypto.randomUUID(),c.router_id,JSON.stringify({username:c.username})]);}else{const users=await ros.command("/ip/hotspot/user/print",[`?comment=MICRO-MAX:${req.params.id}`]);for(const u of users){if(u[".id"])await ros.command("/ip/hotspot/user/remove",[`=.id=${u[".id"]}`]);}}}catch{}await audit(req.user.sub,"DELETE","card_batch",req.params.id,{deleted:deletable.length});res.json({success:true,batchId:req.params.id,deleted:deletable.length});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();try{await ros?.close();}catch{}}});
 app.get("/api/card-batches/:id/csv",auth,async(req,res)=>{try{const r=await pool.query(`SELECT c.username,c.password,c.profile,c.status,c.price,c.price_currency,c.plan_id,c.batch_id,c.created_at,c.sold_at,r.name router_name,p.name plan_name FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_plans p ON p.id=c.plan_id WHERE c.batch_id=$1 AND r.user_id=$2 ORDER BY c.created_at`,[req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:"BATCH_NOT_FOUND"});const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;const lines=["username,password,profile,status,price,currency,plan_id,batch_id,created_at,sold_at,router,plan"];for(const x of r.rows)lines.push([x.username,decPass(x.password),x.profile,x.status,x.price,x.price_currency,x.plan_id,x.batch_id,x.created_at?.toISOString?.()||x.created_at,x.sold_at?.toISOString?.()||x.sold_at,x.router_name,x.plan_name].map(esc).join(","));res.setHeader("Content-Type","text/csv; charset=utf-8");res.setHeader("Content-Disposition",`attachment; filename="micromax-batch-${req.params.id}.csv"`);res.send("\uFEFF"+lines.join("\n"));}catch(e){res.status(500).json({error:"BATCH_CSV_FAILED",detail:e.message});}});
 
 const CARD_REPORT_COLUMNS = [
@@ -773,7 +805,7 @@ app.get("/api/reports/cards.pdf", auth, async (req, res) => {
     doc.end();
   } catch (e) { res.status(500).json({ error: "CARD_REPORT_PDF_FAILED", detail: e.message }); }
 });
-app.post("/api/sales",auth,async(req,res)=>{const {cardId,paymentMethod="cash",reference=null}=req.body;const requestedAmount=req.body.amount; if(!cardId)return res.status(400).json({error:"CARD_REQUIRED"});if(paymentMethod!=="cash" && process.env.ENABLE_ONLINE_PAYMENTS!=="true")return res.status(403).json({error:"ONLINE_PAYMENTS_DISABLED"});const client=await pool.connect();try{await client.query("BEGIN");const c=await client.query("SELECT c.*,hp.duration_minutes profile_duration_minutes FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile WHERE c.id=$1 AND r.user_id=$2 FOR UPDATE",[cardId,req.user.sub]);if(!c.rowCount||c.rows[0].status!=="available")throw Error("CARD_NOT_AVAILABLE");const card=c.rows[0];const planPrice=Number(card.price||0);const numericAmount=planPrice;if(!Number.isFinite(numericAmount)||numericAmount<=0)return res.status(400).json({error:"PLAN_PRICE_NOT_SET",plan:card.plan_name||card.profile});const saleId=crypto.randomUUID();const finalCash=paymentMethod==="cash";await client.query("UPDATE cards SET status='sold',sold_at=now() WHERE id=$1",[cardId]);await client.query("INSERT INTO sales(id,card_id,seller_id,amount,payment_method,payment_status,reference) VALUES($1,$2,$3,$4,$5,$6,$7)",[saleId,cardId,req.user.sub,numericAmount,paymentMethod,finalCash?"success":"pending",reference]);await client.query("COMMIT");await audit(req.user.sub,"CREATE","sale",saleId,{cardId,amount:numericAmount,paymentMethod,paymentStatus:finalCash?"success":"pending",profile:card.profile,plan:card.plan_name||null,profileDurationMinutes:Number(card.profile_duration_minutes||0)});res.status(201).json({saleId,status:finalCash?"success":"pending",amount:numericAmount,profile:card.profile,durationMinutes:Number(card.profile_duration_minutes||0),card:finalCash?{username:card.username,password:decPass(card.password),profile:card.profile,price:numericAmount}:undefined});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();}});
+app.post("/api/sales",auth,async(req,res)=>{const {cardId,paymentMethod="cash",reference=null}=req.body;const requestedAmount=req.body.amount; if(!cardId)return res.status(400).json({error:"CARD_REQUIRED"});if(paymentMethod!=="cash" && process.env.ENABLE_ONLINE_PAYMENTS!=="true")return res.status(403).json({error:"ONLINE_PAYMENTS_DISABLED"});const client=await pool.connect();try{await client.query("BEGIN");const c=await client.query("SELECT c.*,hp.duration_minutes profile_duration_minutes FROM cards c JOIN routers r ON r.id=c.router_id LEFT JOIN hotspot_profiles hp ON hp.router_id=c.router_id AND hp.name=c.profile WHERE c.id=$1 AND r.user_id=$2 FOR UPDATE",[cardId,req.user.sub]);if(!c.rowCount||c.rows[0].status!=="available")throw Error("CARD_NOT_AVAILABLE");const card=c.rows[0];const planPrice=Number(card.price||0);const numericAmount=planPrice;if(!Number.isFinite(numericAmount)||numericAmount<=0)throw Error("PLAN_PRICE_NOT_SET");if(card.provision_state&&card.provision_state!=="ready")throw Error(card.provision_state==="pending"?"CARD_PROVISIONING_PENDING":"CARD_PROVISIONING_FAILED");const saleId=crypto.randomUUID();const finalCash=paymentMethod==="cash";await client.query("UPDATE cards SET status='sold',sold_at=now() WHERE id=$1",[cardId]);await client.query("INSERT INTO sales(id,card_id,seller_id,amount,payment_method,payment_status,reference) VALUES($1,$2,$3,$4,$5,$6,$7)",[saleId,cardId,req.user.sub,numericAmount,paymentMethod,finalCash?"success":"pending",reference]);await client.query("COMMIT");await audit(req.user.sub,"CREATE","sale",saleId,{cardId,amount:numericAmount,paymentMethod,paymentStatus:finalCash?"success":"pending",profile:card.profile,plan:card.plan_name||null,profileDurationMinutes:Number(card.profile_duration_minutes||0)});res.status(201).json({saleId,status:finalCash?"success":"pending",amount:numericAmount,profile:card.profile,durationMinutes:Number(card.profile_duration_minutes||0),card:finalCash?{username:card.username,password:decPass(card.password),profile:card.profile,price:numericAmount}:undefined});}catch(e){await client.query("ROLLBACK");res.status(400).json({error:e.message});}finally{client.release();}});
 app.get("/api/sales",auth,async(req,res)=>{const r=await pool.query("SELECT s.*,c.username card_username FROM sales s LEFT JOIN cards c ON c.id=s.card_id WHERE s.seller_id=$1 ORDER BY s.created_at DESC LIMIT 1000",[req.user.sub]);res.json({sales:r.rows});});
 app.post("/api/payments/intents",auth,async(req,res)=>{
   const { saleId, provider="cash" } = req.body;
@@ -893,28 +925,28 @@ function hotspotBackupPattern(kind){ return kind === "status" ? /^hotspot\/statu
 function validateHotspot(kind, content){ return kind === "status" ? validateStatusHtml(content) : validateLoginHtml(content); }
 
 async function readHotspotFile(req,id,kind){
-  const r=await getRouterForUser(req,id); const ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});
+  const r=await getRouterForUser(req,id); const ros=rosFor(r);
   try{ await ros.connect(); const file=hotspotFileName(kind); const files=await ros.command("/file/print",[`?name=${file}`]); const f=files[0]||{}; const content=String(f.contents||""); return {router:r,file,content,validation:validateHotspot(kind,content),updatedAt:f.creation_time||f["creation-time"]||null}; } finally { try{await ros.close();}catch{} }
 }
 
 app.get("/api/routers/:id/hotspot-status",auth,async(req,res)=>{try{res.json(await readHotspotFile(req,req.params.id,"status"));}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_READ_FAILED",detail:e.message});}});
 app.post("/api/routers/:id/hotspot-status/validate",auth,async(req,res)=>{try{await getRouterForUser(req,req.params.id);res.json(validateStatusHtml(String(req.body.content||"")));}catch(e){res.status(400).json({valid:false,error:"HOTSPOT_STATUS_VALIDATE_FAILED",detail:e.message});}});
-app.post("/api/routers/:id/hotspot-status/publish",auth,role("admin"),async(req,res)=>{
-  let ros; try{const r=await getRouterForUser(req,req.params.id); const content=String(req.body.content||""); if(content.length<100||content.length>500000)return res.status(400).json({error:"INVALID_STATUS_HTML_SIZE"}); const validation=validateStatusHtml(content); if(!validation.valid)return res.status(400).json({error:"STATUS_HTML_INCOMPATIBLE",validation}); ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"}); await ros.connect(); const current=await ros.command("/file/print",["?name=hotspot/status.html"]); const old=String(current[0]?.contents||""); const backupName=`hotspot/status.html.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`; if(old){try{await ros.command("/file/add",[`=name=${backupName}`,`=contents=${old}`]);}catch{}} const target=current[0]?.[".id"]||current[0]?.id; if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]); else await ros.command("/file/add",["=name=hotspot/status.html",`=contents=${content}`]); await audit(req.user.sub,"PUBLISH","hotspot_status",req.params.id,{backup:backupName,bytes:Buffer.byteLength(content,"utf8")}); res.json({ok:true,file:"hotspot/status.html",backup:old?backupName:null,validation}); }catch(e){res.status(502).json({ok:false,error:"HOTSPOT_STATUS_PUBLISH_FAILED",detail:e.message});} finally{try{await ros?.close();}catch{}}
+app.post("/api/routers/:id/hotspot-status/publish",auth,role("admin","owner"),async(req,res)=>{
+  let ros; try{const r=await getRouterForUser(req,req.params.id); const content=String(req.body.content||""); if(content.length<100||content.length>500000)return res.status(400).json({error:"INVALID_STATUS_HTML_SIZE"}); const validation=validateStatusHtml(content); if(!validation.valid)return res.status(400).json({error:"STATUS_HTML_INCOMPATIBLE",validation}); ros=rosFor(r); await ros.connect(); const current=await ros.command("/file/print",["?name=hotspot/status.html"]); const old=String(current[0]?.contents||""); const backupName=`hotspot/status.html.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`; if(old){try{await ros.command("/file/add",[`=name=${backupName}`,`=contents=${old}`]);}catch{}} const target=current[0]?.[".id"]||current[0]?.id; if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]); else await ros.command("/file/add",["=name=hotspot/status.html",`=contents=${content}`]); await audit(req.user.sub,"PUBLISH","hotspot_status",req.params.id,{backup:backupName,bytes:Buffer.byteLength(content,"utf8")}); res.json({ok:true,file:"hotspot/status.html",backup:old?backupName:null,validation}); }catch(e){res.status(502).json({ok:false,error:"HOTSPOT_STATUS_PUBLISH_FAILED",detail:e.message});} finally{try{await ros?.close();}catch{}}
 });
-app.get("/api/routers/:id/hotspot-status/backups",auth,async(req,res)=>{let ros;try{const r=await getRouterForUser(req,req.params.id);ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});await ros.connect();const files=await ros.command("/file/print",[]);const backups=files.filter(f=>hotspotBackupPattern("status").test(String(f.name||""))).map(f=>({name:f.name,size:Number(f.size||0),creationTime:f.creation_time||f["creation-time"]||null})).sort((a,b)=>String(b.creationTime).localeCompare(String(a.creationTime)));res.json({backups});}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_BACKUPS_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
-app.post("/api/routers/:id/hotspot-status/restore",auth,role("admin"),async(req,res)=>{let ros;try{const r=await getRouterForUser(req,req.params.id);const backup=String(req.body.backupName||"").trim();if(!hotspotBackupPattern("status").test(backup))return res.status(400).json({error:"INVALID_BACKUP_NAME"});ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});await ros.connect();const b=await ros.command("/file/print",[`?name=${backup}`]);const content=String(b[0]?.contents||"");const validation=validateStatusHtml(content);if(!validation.valid)return res.status(400).json({error:"BACKUP_INCOMPATIBLE",validation});const current=await ros.command("/file/print",["?name=hotspot/status.html"]);const target=current[0]?.[".id"]||current[0]?.id;if(!target)throw Error("STATUS_HTML_NOT_FOUND");await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]);await audit(req.user.sub,"RESTORE","hotspot_status",req.params.id,{backup});res.json({ok:true,backup});}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_RESTORE_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
+app.get("/api/routers/:id/hotspot-status/backups",auth,async(req,res)=>{let ros;try{const r=await getRouterForUser(req,req.params.id);ros=rosFor(r);await ros.connect();const files=await ros.command("/file/print",[]);const backups=files.filter(f=>hotspotBackupPattern("status").test(String(f.name||""))).map(f=>({name:f.name,size:Number(f.size||0),creationTime:f.creation_time||f["creation-time"]||null})).sort((a,b)=>String(b.creationTime).localeCompare(String(a.creationTime)));res.json({backups});}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_BACKUPS_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
+app.post("/api/routers/:id/hotspot-status/restore",auth,role("admin","owner"),async(req,res)=>{let ros;try{const r=await getRouterForUser(req,req.params.id);const backup=String(req.body.backupName||"").trim();if(!hotspotBackupPattern("status").test(backup))return res.status(400).json({error:"INVALID_BACKUP_NAME"});ros=rosFor(r);await ros.connect();const b=await ros.command("/file/print",[`?name=${backup}`]);const content=String(b[0]?.contents||"");const validation=validateStatusHtml(content);if(!validation.valid)return res.status(400).json({error:"BACKUP_INCOMPATIBLE",validation});const current=await ros.command("/file/print",["?name=hotspot/status.html"]);const target=current[0]?.[".id"]||current[0]?.id;if(!target)throw Error("STATUS_HTML_NOT_FOUND");await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]);await audit(req.user.sub,"RESTORE","hotspot_status",req.params.id,{backup});res.json({ok:true,backup});}catch(e){res.status(502).json({error:"HOTSPOT_STATUS_RESTORE_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
 
-app.post("/api/routers/:id/hotspot-design/publish",auth,role("admin"),async(req,res)=>{
+app.post("/api/routers/:id/hotspot-design/publish",auth,role("admin","owner"),async(req,res)=>{
   const {loginHtml,statusHtml}=req.body||{}; if(typeof loginHtml!=="string"||typeof statusHtml!=="string")return res.status(400).json({error:"LOGIN_AND_STATUS_REQUIRED"});
   const lv=validateLoginHtml(loginHtml), sv=validateStatusHtml(statusHtml); if(!lv.valid||!sv.valid)return res.status(400).json({error:"HOTSPOT_DESIGN_INVALID",login:lv,status:sv});
-  try{await getRouterForUser(req,req.params.id); const results={}; for(const [kind,content] of [["login",loginHtml],["status",statusHtml]]){const r=await getRouterForUser(req,req.params.id);const ros=new RouterOS({host:r.host,port:r.port,username:r.username,password:decrypt(r.password_enc),tls:r.tls,allowInsecureTls:process.env.ALLOW_INSECURE_ROUTER_TLS === "true"});try{await ros.connect();const file=hotspotFileName(kind);const current=await ros.command("/file/print",[`?name=${file}`]);const old=String(current[0]?.contents||"");const backupName=`${file}.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`;if(old){try{await ros.command("/file/add",[`=name=${backupName}`,`=contents=${old}`]);}catch{}}const target=current[0]?.[".id"]||current[0]?.id;if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]);else await ros.command("/file/add",[`=name=${file}`,`=contents=${content}`]);results[kind]={file,backup:old?backupName:null};}finally{try{await ros.close();}catch{}}}await audit(req.user.sub,"PUBLISH","hotspot_design",req.params.id,{loginBytes:Buffer.byteLength(loginHtml),statusBytes:Buffer.byteLength(statusHtml)});res.json({ok:true,results});}catch(e){res.status(502).json({error:"HOTSPOT_DESIGN_PUBLISH_FAILED",detail:e.message});}
+  try{await getRouterForUser(req,req.params.id); const results={}; for(const [kind,content] of [["login",loginHtml],["status",statusHtml]]){const r=await getRouterForUser(req,req.params.id);const ros=rosFor(r);try{await ros.connect();const file=hotspotFileName(kind);const current=await ros.command("/file/print",[`?name=${file}`]);const old=String(current[0]?.contents||"");const backupName=`${file}.micromax-${new Date().toISOString().replace(/[:.]/g,"-")}.bak`;if(old){try{await ros.command("/file/add",[`=name=${backupName}`,`=contents=${old}`]);}catch{}}const target=current[0]?.[".id"]||current[0]?.id;if(target)await ros.command("/file/set",[`=.id=${target}`,`=contents=${content}`]);else await ros.command("/file/add",[`=name=${file}`,`=contents=${content}`]);results[kind]={file,backup:old?backupName:null};}finally{try{await ros.close();}catch{}}}await audit(req.user.sub,"PUBLISH","hotspot_design",req.params.id,{loginBytes:Buffer.byteLength(loginHtml),statusBytes:Buffer.byteLength(statusHtml)});res.json({ok:true,results});}catch(e){res.status(502).json({error:"HOTSPOT_DESIGN_PUBLISH_FAILED",detail:e.message});}
 });
 
 app.get("/api/themes/:routerId",auth,async(req,res)=>{const r=await pool.query("SELECT * FROM hotspot_themes t JOIN routers r ON r.id=t.router_id WHERE t.router_id=$1 AND r.user_id=$2",[req.params.routerId,req.user.sub]);res.json(r.rows[0]||null);});
 app.post("/api/themes/:routerId",auth,async(req,res)=>{try{const owner=await pool.query("SELECT 1 FROM routers WHERE id=$1 AND user_id=$2",[req.params.routerId,req.user.sub]);if(!owner.rowCount)return res.status(404).json({error:"ROUTER_NOT_FOUND"});const {name="Hotspot",logoUrl=null,primaryColor="#0B5FA5",background="#F4F7FB"}=req.body;const id=crypto.randomUUID();const r=await pool.query("INSERT INTO hotspot_themes(id,router_id,name,logo_url,primary_color,background) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(router_id) DO UPDATE SET name=EXCLUDED.name,logo_url=EXCLUDED.logo_url,primary_color=EXCLUDED.primary_color,background=EXCLUDED.background,updated_at=now() RETURNING *",[id,req.params.routerId,String(name).slice(0,100),logoUrl,primaryColor,background]);res.json(r.rows[0]);}catch(e){res.status(400).json({error:"THEME_SAVE_FAILED"});}});
 
-app.get("/api/backup/export",auth,role("admin"),async(req,res)=>{
+app.get("/api/backup/export",auth,role("admin","owner"),async(req,res)=>{
   try{
     const uid=req.user.sub;
     const data={version:3,createdAt:new Date().toISOString(),tables:{}};
@@ -935,7 +967,7 @@ app.get("/api/backup/export",auth,role("admin"),async(req,res)=>{
     res.json(data);
   }catch(e){res.status(500).json({error:"BACKUP_EXPORT_FAILED"});}
 });
-app.post("/api/backup/restore",auth,role("admin"),async(req,res)=>{
+app.post("/api/backup/restore",auth,role("admin","owner"),async(req,res)=>{
   const tables=req.body?.tables; if(!tables||typeof tables!=="object")return res.status(400).json({error:"INVALID_BACKUP"});
   const client=await pool.connect(); const uid=req.user.sub; const restored={app_settings:0,hotspot_themes:0,store_entitlements:0,cards:0,sales:0}; const skipped=[];
   try{
@@ -950,4 +982,196 @@ app.post("/api/backup/restore",auth,role("admin"),async(req,res)=>{
   }catch(e){await client.query("ROLLBACK");res.status(400).json({error:"BACKUP_RESTORE_FAILED",detail:e.message});}finally{client.release();}
 });
 
-const port=Number(process.env.PORT||8080);init().then(()=>app.listen(port,()=>console.log(`MICRO-MAX API on :${port}`))).catch(e=>{console.error(e);process.exit(1)});
+
+// ================= Router onboarding: Agent (remote, no open ports) and API-SSL (public IP) =================
+const agentLimiter=rateLimit({windowMs:60*1000,max:30,standardHeaders:true,legacyHeaders:false,keyGenerator:req=>hashToken(String(req.headers["x-agent-token"]||req.ip)).slice(0,24)});
+app.use("/api/agent",express.text({type:"*/*",limit:"16kb"}));
+async function agentAuth(req,res,next){
+  const token=String(req.headers["x-agent-token"]||"");
+  if(!/^mmag_[A-Za-z0-9_-]{20,}$/.test(token))return res.status(401).type("text/plain").send("# unauthorized\n");
+  try{
+    const q=await pool.query("SELECT id,user_id,name FROM routers WHERE agent_token_hash=$1 AND mode='agent'",[hashToken(token)]);
+    if(!q.rowCount)return res.status(401).type("text/plain").send("# unauthorized\n");
+    req.agent={router:q.rows[0],token}; next();
+  }catch{ res.status(500).type("text/plain").send("# error\n"); }
+}
+app.post("/api/agent/sync",agentLimiter,agentAuth,async(req,res)=>{
+  try{
+    const rid=req.agent.router.id; const info=parseReport(typeof req.body==="string"?req.body:"");
+    const up=await pool.query("WITH old AS (SELECT agent_offline_notified f FROM routers WHERE id=$1) UPDATE routers SET agent_last_seen=now(),agent_info=$2,agent_offline_notified=false WHERE id=$1 RETURNING (SELECT f FROM old) was_offline",[rid,JSON.stringify(info)]);
+    if(up.rows[0]?.was_offline)await pool.query("INSERT INTO notifications(id,user_id,title,body,level) VALUES($1,$2,$3,$4,'info')",[crypto.randomUUID(),req.agent.router.user_id,`الراوتر ${req.agent.router.name} عاد للاتصال`,"استؤنف وصول الاتصال من الراوتر وسيتم تنفيذ المهام المعلقة."]);
+    // jobs delivered but never acknowledged are retried (max 5 attempts)
+    await pool.query("UPDATE agent_jobs SET status=CASE WHEN attempts>=5 THEN 'failed' ELSE 'pending' END,error=CASE WHEN attempts>=5 THEN 'NO_ACK' ELSE error END WHERE router_id=$1 AND status='sent' AND sent_at < now() - interval '2 minutes'",[rid]);
+    await pool.query("UPDATE cards SET provision_state='failed' WHERE provision_state='pending' AND id IN (SELECT card_id FROM agent_jobs WHERE router_id=$1 AND status='failed' AND card_id IS NOT NULL)",[rid]);
+    const j=await pool.query("UPDATE agent_jobs SET status='sent',sent_at=now(),attempts=attempts+1 WHERE id IN (SELECT id FROM agent_jobs WHERE router_id=$1 AND status='pending' ORDER BY created_at LIMIT 300 FOR UPDATE SKIP LOCKED) RETURNING id,type,payload",[rid]);
+    const ok=[];
+    for(const job of j.rows){
+      try{ renderJobScript([job],{baseUrl:agentBase(req),token:req.agent.token}); ok.push(job); }
+      catch(e){ await pool.query("UPDATE agent_jobs SET status='failed',error=$2,done_at=now() WHERE id=$1",[job.id,String(e.message).slice(0,120)]); if(job.payload) await pool.query("UPDATE cards SET provision_state='failed' WHERE id=(SELECT card_id FROM agent_jobs WHERE id=$1)",[job.id]); }
+    }
+    res.type("text/plain").send(renderJobScript(ok,{baseUrl:agentBase(req),token:req.agent.token}));
+  }catch(e){ console.error("agent sync",e); res.status(500).type("text/plain").send("# error\n"); }
+});
+app.get("/api/agent/ack",agentLimiter,agentAuth,async(req,res)=>{
+  try{
+    const ids=String(req.query.j||"").split(",").filter(Boolean),okFlag=req.query.s==="ok";
+    if(!ids.length||ids.length>100||!ids.every(i=>/^[0-9a-f-]{36}$/.test(i)))return res.status(400).type("text/plain").send("bad");
+    const u=await pool.query("UPDATE agent_jobs SET status=$3,done_at=now(),error=$4 WHERE id=ANY($1::uuid[]) AND router_id=$2 AND status IN ('sent','pending') RETURNING card_id,type,payload",[ids,req.agent.router.id,okFlag?"done":"failed",okFlag?null:"ROUTER_REJECTED"]);
+    const cardIds=u.rows.map(r=>r.card_id).filter(Boolean);
+    if(cardIds.length)await pool.query("UPDATE cards SET provision_state=$2 WHERE id=ANY($1::uuid[])",[cardIds,okFlag?"ready":"failed"]);
+    for(const r of u.rows)if(r.type==="hotspot-profile-set")await pool.query("UPDATE hotspot_profiles SET provision_state=$3 WHERE router_id=$1 AND name=$2",[req.agent.router.id,r.payload?.name,okFlag?"ready":"failed"]);
+    res.type("text/plain").send("ok");
+  }catch{ res.status(500).type("text/plain").send("error"); }
+});
+
+// Import the profiles that really exist on the MikroTik so cards can be generated from them (button "عرض بروفايلات الراوتر").
+app.post("/api/routers/:id/hotspot-profiles/import",auth,async(req,res)=>{
+  let ros;
+  try{
+    const r=await getRouter(req,req.params.id);
+    let rows;
+    if(r.mode==="agent"){
+      const names=Array.isArray(r.agent_info?.profiles)?r.agent_info.profiles:[];
+      if(!r.agent_last_seen)return res.status(409).json({error:"AGENT_NOT_CONNECTED"});
+      if(!names.length)return res.status(409).json({error:"AGENT_PROFILES_NOT_REPORTED",detail:"شغّل سكربت الـ Agent المحدّث (rotate) ليرسل قائمة البروفايلات."});
+      rows=names.map(name=>({name,rate_limit:"",session_timeout:"",idle_timeout:"",shared_users:1,duration_minutes:0}));
+    }else{
+      ros=rosFor(r); await ros.connect();
+      rows=(await ros.command("/ip/hotspot/user/profile/print",[])).map(mapRouterProfile).filter(x=>x.name);
+    }
+    let added=0,updated=0;
+    for(const p of rows){
+      // price and manual duration are owned by MICRO-MAX: never overwritten by the import
+      const q=await pool.query(`INSERT INTO hotspot_profiles(id,router_id,name,price,duration_minutes,rate_limit,session_timeout,idle_timeout,shared_users,enabled,provision_state)
+        VALUES($1,$2,$3,0,$4,$5,$6,$7,$8,true,'ready')
+        ON CONFLICT(router_id,name) DO UPDATE SET
+          rate_limit=CASE WHEN $9 THEN hotspot_profiles.rate_limit ELSE EXCLUDED.rate_limit END,
+          session_timeout=CASE WHEN $9 THEN hotspot_profiles.session_timeout ELSE EXCLUDED.session_timeout END,
+          idle_timeout=CASE WHEN $9 THEN hotspot_profiles.idle_timeout ELSE EXCLUDED.idle_timeout END,
+          shared_users=CASE WHEN $9 THEN hotspot_profiles.shared_users ELSE EXCLUDED.shared_users END,
+          duration_minutes=CASE WHEN $9 OR EXCLUDED.duration_minutes=0 THEN hotspot_profiles.duration_minutes ELSE EXCLUDED.duration_minutes END,
+          provision_state='ready',updated_at=now() RETURNING (xmax=0) inserted`,
+        [crypto.randomUUID(),r.id,p.name,p.duration_minutes,p.rate_limit,p.session_timeout,p.idle_timeout,p.shared_users,r.mode==="agent"]);
+      q.rows[0].inserted?added++:updated++;
+    }
+    await audit(req.user.sub,"IMPORT","hotspot_profiles",r.id,{added,updated});
+    const l=await pool.query(`SELECT hp.name,hp.rate_limit,hp.session_timeout,hp.idle_timeout,hp.shared_users,hp.duration_minutes,
+      (SELECT p.id FROM hotspot_plans p WHERE p.router_id=hp.router_id AND p.profile_name=hp.name AND p.active=true ORDER BY p.created_at LIMIT 1) plan_id,
+      (SELECT p.price FROM hotspot_plans p WHERE p.router_id=hp.router_id AND p.profile_name=hp.name AND p.active=true ORDER BY p.created_at LIMIT 1) plan_price
+      FROM hotspot_profiles hp WHERE hp.router_id=$1 ORDER BY hp.name`,[r.id]);
+    res.json({added,updated,profiles:l.rows.map(x=>({name:x.name,rateLimit:x.rate_limit,sessionTimeout:x.session_timeout,idleTimeout:x.idle_timeout,sharedUsers:x.shared_users,durationMinutes:x.duration_minutes,planId:x.plan_id,planPrice:x.plan_price===null?null:Number(x.plan_price),readyForCards:!!x.plan_id&&Number(x.plan_price)>0}))});
+  }catch(e){
+    const code=e.message==="ROUTER_NOT_FOUND"?404:502;
+    res.status(code).json({error:code===502?"PROFILE_IMPORT_FAILED":e.message,detail:String(e?.code||e?.message||"").slice(0,200)});
+  }finally{ if(ros)await ros.close().catch(()=>{}); }
+});
+
+app.post("/api/routers/agent/enroll",auth,async(req,res)=>{
+  try{
+    const name=String(req.body?.name||"").trim().slice(0,80); if(!name)return res.status(400).json({error:"INVALID_INPUT"});
+    const base=agentBase(req); const token=newAgentToken(); const id=crypto.randomUUID();
+    await pool.query("INSERT INTO routers(id,user_id,name,host,port,username,password_enc,tls,mode,agent_token_hash) VALUES($1,$2,$3,'agent',0,'agent',$4,true,'agent',$5)",[id,req.user.sub,name,encrypt(crypto.randomBytes(16).toString("hex")),hashToken(token)]);
+    await audit(req.user.sub,"CREATE","router",id,{name,mode:"agent"});
+    res.status(201).json({id,name,mode:"agent",intervalSec:AGENT_INTERVAL_SEC,agent:{source:agentSource({baseUrl:base,token}),policy:AGENT_POLICY,interval:AGENT_INTERVAL_SEC+"s",caUrl:"https://curl.se/ca/cacert.pem"},script:buildEnrollScript({baseUrl:base,token,intervalSec:AGENT_INTERVAL_SEC}),note:"الصق السكربت في Winbox > New Terminal. يظهر الراوتر متصلاً خلال حوالي دقيقة. الرمز لا يُعرض مرة أخرى؛ استخدم rotate لإصدار سكربت جديد."});
+  }catch(e){ res.status(e.message==="PUBLIC_BASE_URL_REQUIRED"?500:400).json({error:e.message}); }
+});
+app.post("/api/routers/:id/agent/rotate",auth,async(req,res)=>{
+  try{
+    const r=await getRouter(req,req.params.id); if(r.mode!=="agent")return res.status(400).json({error:"NOT_AGENT_ROUTER"});
+    const token=newAgentToken();
+    await pool.query("UPDATE routers SET agent_token_hash=$2 WHERE id=$1",[r.id,hashToken(token)]);
+    await audit(req.user.sub,"ROTATE","router_agent",r.id);
+    res.json({id:r.id,agent:{source:agentSource({baseUrl:agentBase(req),token}),policy:AGENT_POLICY,interval:AGENT_INTERVAL_SEC+"s",caUrl:"https://curl.se/ca/cacert.pem"},script:buildEnrollScript({baseUrl:agentBase(req),token,intervalSec:AGENT_INTERVAL_SEC,includeCa:false})});
+  }catch(e){ res.status(e.message==="ROUTER_NOT_FOUND"?404:400).json({error:e.message}); }
+});
+app.get("/api/routers/:id/agent/status",auth,async(req,res)=>{
+  try{
+    const r=await getRouter(req,req.params.id); if(r.mode!=="agent")return res.status(400).json({error:"NOT_AGENT_ROUTER"});
+    const c=await pool.query("SELECT status,count(*)::int n FROM agent_jobs WHERE router_id=$1 AND created_at > now() - interval '7 days' GROUP BY status",[r.id]);
+    const jobs=Object.fromEntries(c.rows.map(x=>[x.status,x.n]));
+    const online=!!r.agent_last_seen&&Date.now()-new Date(r.agent_last_seen).getTime()<120000;
+    res.json({id:r.id,online,lastSeen:r.agent_last_seen,intervalSec:AGENT_INTERVAL_SEC,info:r.agent_info||{},jobs});
+  }catch(e){ res.status(e.message==="ROUTER_NOT_FOUND"?404:400).json({error:e.message}); }
+});
+app.post("/api/routers/direct-setup",auth,role("admin","owner"),async(req,res)=>{
+  try{
+    const allowFrom=Array.isArray(req.body?.allowFrom)?req.body.allowFrom.slice(0,20):[];
+    const port=Number(req.body?.port)||8729;
+    if(!NET_CFG.routerPorts.includes(port))return res.status(400).json({error:"PORT_NOT_ALLOWED"});
+    const apiPass=crypto.randomBytes(18).toString("base64url").replace(/[^A-Za-z0-9]/g,"A").slice(0,24);
+    const script=buildDirectSetupScript({allowFrom,apiUser:"micromax",apiPass,port});
+    res.json({apiUser:"micromax",apiPassword:apiPass,port,tls:true,script,warning:allowFrom.length?null:"لم تحدد allowFrom: منفذ API-SSL سيكون مفتوحاً لكل الإنترنت. ضع عناوين Outbound IPs الخاصة بسيرفرك.",next:"شغّل السكربت على الراوتر، انسخ البصمة (fingerprint) التي يطبعها، ثم أضف الراوتر بنفس البيانات مع fingerprint."});
+  }catch(e){ res.status(400).json({error:e.message}); }
+});
+
+app.get("/api/insights",auth,async(req,res)=>{
+  try{
+    const plans=await pool.query(`SELECT p.id plan_id,p.name,p.price,p.currency,
+      count(c.id) FILTER (WHERE c.status='available' AND c.provision_state='ready')::int available,
+      count(c.id) FILTER (WHERE c.sold_at > now() - interval '7 days')::int sold_7d,
+      count(c.id) FILTER (WHERE c.sold_at > now() - interval '30 days')::int sold_30d,
+      COALESCE(sum(c.price) FILTER (WHERE c.sold_at > now() - interval '30 days'),0) revenue_30d
+      FROM hotspot_plans p JOIN routers r ON r.id=p.router_id LEFT JOIN cards c ON c.plan_id=p.id
+      WHERE r.user_id=$1 AND p.active=true GROUP BY p.id ORDER BY p.name`,[req.user.sub]);
+    let tz=String(process.env.APP_TIMEZONE||"UTC"); if(!/^[A-Za-z_\/+-]{1,40}$/.test(tz))tz="UTC";
+    let hours;
+    try{hours=await pool.query(`SELECT extract(hour from c.sold_at AT TIME ZONE $2)::int h,count(*)::int n FROM cards c JOIN routers r ON r.id=c.router_id WHERE r.user_id=$1 AND c.sold_at > now() - interval '30 days' GROUP BY 1`,[req.user.sub,tz]);}
+    catch{hours=await pool.query(`SELECT extract(hour from c.sold_at AT TIME ZONE 'UTC')::int h,count(*)::int n FROM cards c JOIN routers r ON r.id=c.router_id WHERE r.user_id=$1 AND c.sold_at > now() - interval '30 days' GROUP BY 1`,[req.user.sub]);tz="UTC";}
+    res.json({timezone:tz,...buildInsights({plans:plans.rows,hours:hours.rows})});
+  }catch(e){ console.error("insights",e); res.status(500).json({error:"INSIGHTS_FAILED"}); }
+});
+
+
+// ================= Professional tooling: security audit, fleet overview, config doctor =================
+app.get("/api/routers/:id/security-audit",auth,async(req,res)=>{
+  let ros;
+  try{
+    const r=await getRouter(req,req.params.id);
+    ros=rosFor(r); await ros.connect();
+    const safe=async path=>{try{return await ros.command(path,[]);}catch{return null;}};
+    const resource=(await safe("/system/resource/print"))?.[0]||null;
+    const data={
+      resource,services:await safe("/ip/service/print"),users:await safe("/user/print"),firewall:await safe("/ip/firewall/filter/print"),
+      dns:(await safe("/ip/dns/print"))?.[0]||null,discovery:(await safe("/ip/neighbor/discovery-settings/print"))?.[0]||null,
+      macServer:(await safe("/tool/mac-server/print"))?.[0]||null,ssh:(await safe("/ip/ssh/print"))?.[0]||null,hotspotProfiles:await safe("/ip/hotspot/profile/print")
+    };
+    const unreadable=Object.entries(data).filter(([,v])=>v===null).map(([k])=>k);
+    await audit(req.user.sub,"SECURITY_AUDIT","router",r.id,{});
+    res.json({routerId:r.id,name:r.name,readOnly:true,unreadable,...auditSecurity(data,{apiTls:!!r.tls})});
+  }catch(e){
+    const code=e.message==="ROUTER_NOT_FOUND"?404:e.message==="ROUTER_IS_AGENT_MODE"?400:502;
+    res.status(code).json({error:code===502?"SECURITY_AUDIT_FAILED":e.message,detail:String(e?.code||e?.message||"").slice(0,200)});
+  }finally{ if(ros)await ros.close().catch(()=>{}); }
+});
+
+app.get("/api/fleet",auth,async(req,res)=>{
+  try{
+    const q=await pool.query("SELECT id,name,host,port,tls,mode,agent_last_seen,agent_info FROM routers WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200",[req.user.sub]);
+    const rows=q.rows;
+    if(req.query.probe==="1"){
+      const direct=rows.filter(r=>r.mode!=="agent").slice(0,30);
+      await Promise.all(direct.map(async r=>{
+        if(net.isIP(r.host)&&!isAddressAllowed(r.host,NET_CFG)){r.probe=null;return;}
+        try{const p=await tcpProbe(r.host,r.port,!!r.tls,2500);r.probe={ok:!!p.ok,latencyMs:p.latencyMs};}catch{r.probe={ok:false};}
+      }));
+    }
+    res.json(fleetSummary(rows.map(({host,port,tls,...rest})=>rest)));
+  }catch(e){ console.error("fleet",e); res.status(500).json({error:"FLEET_FAILED"}); }
+});
+
+app.get("/api/system/doctor",auth,role("admin"),async(req,res)=>{
+  let dbOk=true; try{await pool.query("SELECT 1");}catch{dbOk=false;}
+  res.json(configDoctor({...process.env},{dbOk}));
+});
+
+function startMonitor(){
+  const tick=async()=>{
+    try{
+      const q=await pool.query("UPDATE routers SET agent_offline_notified=true WHERE mode='agent' AND agent_last_seen IS NOT NULL AND agent_last_seen < now() - interval '5 minutes' AND agent_offline_notified=false RETURNING id,user_id,name");
+      for(const r of q.rows)await pool.query("INSERT INTO notifications(id,user_id,title,body,level) VALUES($1,$2,$3,$4,'warning')",[crypto.randomUUID(),r.user_id,`الراوتر ${r.name} غير متصل`,"لم يصل أي اتصال من الراوتر منذ أكثر من 5 دقائق. تحقق من الكهرباء والإنترنت."]);
+    }catch(e){ console.error("monitor",e.message); }
+  };
+  setInterval(tick,60000).unref();
+}
+
+const port=Number(process.env.PORT||8080);init().then(()=>{app.listen(port,()=>console.log(`MICRO-MAX API on :${port}`));startMonitor();}).catch(e=>{console.error(e);process.exit(1)});
