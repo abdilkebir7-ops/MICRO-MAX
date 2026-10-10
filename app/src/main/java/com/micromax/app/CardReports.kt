@@ -120,11 +120,11 @@ fun CardReportsPage(api: Api, routers: JSONArray, selectedRouter: JSONObject?) {
     Column(Modifier.fillMaxSize().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("تقارير الكروت", fontSize = 28.sp, fontWeight = FontWeight.Black)
+                Text("تقارير الكروت",style=MaterialTheme.typography.headlineMedium)
                 Text("مراقبة الكروت المستخدمة وغير المستخدمة والمخزون والدفعات", color = TextMuted, fontSize = 12.sp)
             }
             Button(onClick = { load() }, enabled = !loading && exporting == null) {
-                Icon(Icons.Outlined.Refresh, null); Spacer(Modifier.width(5.dp)); Text(if (loading) "جاري…" else "تحديث")
+                Icon(MmIcons.Sync, null); Spacer(Modifier.width(5.dp)); Text(if (loading) "جاري…" else "تحديث")
             }
         }
         error?.let { ErrorCard(it) }
@@ -145,8 +145,8 @@ fun CardReportsPage(api: Api, routers: JSONArray, selectedRouter: JSONObject?) {
         }
         when (tab) {
             "summary" -> LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
-                item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { ReportMetric("كل الكروت", cards.size.toString(), Color(0xFF2563EB), Modifier.weight(1f)); ReportMetric("غير مستخدم", count("available").toString(), Color(0xFF16A34A), Modifier.weight(1f)) } }
-                item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { ReportMetric("مستخدم / مباع", (count("used") + count("sold")).toString(), Color(0xFFF59E0B), Modifier.weight(1f)); ReportMetric("منتهي / معطل", (count("expired") + count("disabled")).toString(), Color(0xFFDC2626), Modifier.weight(1f)) } }
+                item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { ReportMetric("كل الكروت", cards.size.toString(), DataBlue, Modifier.weight(1f)); ReportMetric("غير مستخدم", count("available").toString(), Link, Modifier.weight(1f)) } }
+                item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { ReportMetric("مستخدم / مباع", (count("used") + count("sold")).toString(), Activity, Modifier.weight(1f)); ReportMetric("منتهي / معطل", (count("expired") + count("disabled")).toString(), Color(0xFFDC2626), Modifier.weight(1f)) } }
                 item { StatusFilters(statusFilter) { statusFilter = it } }
                 item { GlassCard { Text("قراءة سريعة", fontWeight = FontWeight.Bold); Text("المتاح للبيع: ${count("available")} • المستخدم: ${count("used")} • المباع: ${count("sold")}\nالدفعات المسجلة: ${batches.size}", color = TextMuted, fontSize = 13.sp) } }
                 item { Text("آخر الكروت", fontSize = 19.sp, fontWeight = FontWeight.Bold) }
@@ -158,8 +158,8 @@ fun CardReportsPage(api: Api, routers: JSONArray, selectedRouter: JSONObject?) {
                 if (visible.isEmpty()) item { EmptyCard("لا توجد كروت مطابقة للفلاتر الحالية") }
             }
             else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
-                item { Text("دفعات التوليد", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
-                items(batches, key = { it.optString("batch_id") }) { batch -> BatchReportItem(batch) }
+                item { Text("دفعات التوليد",style=MaterialTheme.typography.titleLarge) }
+                items(batches, key = { it.optString("batch_id") }) { batch -> BatchReportItem(batch, api) }
                 if (batches.isEmpty()) item { EmptyCard("لا توجد دفعات مسجلة بعد") }
             }
         }
@@ -211,10 +211,38 @@ private fun StatusFilters(current: String, onChange: (String) -> Unit) { Row(Mod
 private fun CardReportItem(row: CardReportRow) { GlassCard { Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(row.username, fontWeight = FontWeight.Bold); Text("${row.plan} • ${row.router}", color = TextMuted, fontSize = 12.sp); Text("${row.price} • ${row.created}", color = TextMuted, fontSize = 11.sp) }; StatusBadge(row.status) } } }
 
 @Composable
-private fun BatchReportItem(batch: JSONObject) { GlassCard { Text(batch.optString("plan_name", "دفعة كروت"), fontWeight = FontWeight.Bold); Text("${batch.optInt("total")} كرت • ${batch.optString("router_name", "-")}", color = TextMuted, fontSize = 12.sp); Text("متاح ${batch.optInt("available")} • مباع ${batch.optInt("sold")} • مستخدم ${batch.optInt("used")} • منتهي ${batch.optInt("expired")} • معطل ${batch.optInt("disabled")}", color = Accent, fontSize = 12.sp); Text("Batch: ${batch.optString("batch_id", "-")}", color = TextMuted, fontSize = 10.sp) } }
+private fun BatchReportItem(batch: JSONObject, api: Api) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    var sheet by remember { mutableStateOf(SheetLayout.NORMAL) }
+    var busy by remember { mutableStateOf(false) }
+    var msg by remember { mutableStateOf<String?>(null) }
+    val available = batch.optInt("available")
+    GlassCard {
+        Text(batch.optString("plan_name", "دفعة كروت"), fontWeight = FontWeight.Bold)
+        Text("${batch.optInt("total")} كرت • ${batch.optString("router_name", "-")}", color = TextMuted, fontSize = 12.sp)
+        Text("متاح ${batch.optInt("available")} • مباع ${batch.optInt("sold")} • مستخدم ${batch.optInt("used")} • منتهي ${batch.optInt("expired")} • معطل ${batch.optInt("disabled")}", color = Accent, fontSize = 12.sp)
+        Text("Batch: ${batch.optString("batch_id", "-")}", color = TextMuted, fontSize = 10.sp)
+        if (available > 0) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton({ val v = SheetLayout.values(); sheet = v[(sheet.ordinal + 1) % v.size] }) { Text(sheet.label, fontSize = 11.sp) }
+            Button({
+                scope.launch {
+                    busy = true; msg = null
+                    try {
+                        val r = JSONObject(api.get("/api/card-batches/${batch.optString("batch_id")}/print-cards"))
+                        val cards = r.optJSONArray("cards")
+                        if (cards == null || cards.length() == 0) msg = "لا توجد كروت متاحة للطباعة" else printCardSheet(ctx, cards, sheet, "MICRO-MAX ${batch.optString("plan_name")}")
+                    } catch (e: Exception) { msg = e.message ?: "تعذر التحضير للطباعة" }
+                    busy = false
+                }
+            }, enabled = !busy) { Text("طباعة المتاح ($available)", fontSize = 12.sp) }
+        }
+        msg?.let { Text(it, color = TextMuted, fontSize = 11.sp) }
+    }
+}
 
 @Composable
-private fun StatusBadge(status: String) { val normalized = normalizedCardStatus(status); val (label, color) = when (normalized) { "available" -> "غير مستخدم" to Color(0xFF16A34A); "used" -> "مستخدم" to Color(0xFFF59E0B); "sold" -> "مباع" to Color(0xFF7C3AED); "expired" -> "منتهي" to Color(0xFFDC2626); "disabled" -> "معطل" to Color(0xFF64748B); else -> normalized to TextMuted }; Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+private fun StatusBadge(status: String) { val normalized = normalizedCardStatus(status); val (label, color) = when (normalized) { "available" -> "غير مستخدم" to Link; "used" -> "مستخدم" to Activity; "sold" -> "مباع" to Color(0xFF7C3AED); "expired" -> "منتهي" to Color(0xFFDC2626); "disabled" -> "معطل" to Color(0xFF64748B); else -> normalized to TextMuted }; Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
 
 private fun normalizedCardStatus(value: String): String = when (value.lowercase()) { "available", "unused" -> "available"; "active", "used" -> "used"; "sold" -> "sold"; "expired" -> "expired"; "disabled" -> "disabled"; else -> value.lowercase() }
 

@@ -1,2 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources><color name="brand_blue">#3B82F6</color><color name="brand_blue_dark">#60A5FA</color><color name="brand_cyan">#22D3EE</color><color name="brand_purple">#8B5CF6</color><color name="brand_green">#22C55E</color><color name="brand_red">#F43F5E</color><color name="brand_amber">#F59E0B</color><color name="brand_bg_light">#F4F7FB</color><color name="brand_bg_dark">#050A14</color><color name="brand_ink_light">#14283B</color><color name="brand_ink_dark">#F8FAFC</color><color name="status_bar">#050A14</color><color name="ic_launcher_background">#08111F</color></resources>
+<resources>
+    <color name="chassis">#0F1E25</color>
+    <color name="frost">#EDF1F2</color>
+    <color name="signal">#0A7E8C</color>
+    <color name="signal_soft">#4CD0DF</color>
+    <color name="link">#2FA66A</color>
+    <color name="status_bar">#EDF1F2</color>
+    <color name="ic_launcher_background">#0F1E25</color>
+</resources>
