@@ -176,13 +176,14 @@ fun AutoLinkRouterDialog(api: Api, onSaved: () -> Unit, onCancel: () -> Unit) {
         busy = true; err = null
         try {
             step = "1/4 تجهيز الربط على الخادم…"
-            val enroll = JSONObject(api.post("/api/routers/agent/enroll", JSONObject().put("name", name.trim()).toString()))
-            val agent = enroll.getJSONObject("agent")
-            val newId = enroll.optString("id")
+            var newId = ""
             RouterOsApi(host.trim()).use { r ->
                 step = "2/4 الاتصال بالراوتر…"
                 r.connect(user.trim(), pass)
-                step = "3/4 تثبيت الشهادات…"
+
+                val enroll = JSONObject(api.post("/api/routers/agent/enroll", JSONObject().put("name", name.trim()).toString()))
+                val agent = enroll.getJSONObject("agent")
+                newId = enroll.optString("id")                step = "3/4 تثبيت الشهادات…"
                 try { r.command("/tool/fetch", mapOf("url" to agent.optString("caUrl"), "mode" to "https", "check-certificate" to "no", "dst-path" to "mm-ca.pem"), longWaitMs = 90000) } catch (_: Exception) { }
                 try { r.command("/certificate/import", mapOf("file-name" to "mm-ca.pem", "passphrase" to ""), longWaitMs = 120000) } catch (_: Exception) { }
                 step = "4/4 تثبيت وكيل MICRO-MAX…"
