@@ -167,6 +167,8 @@ fun AutoLinkRouterDialog(api: Api, onSaved: () -> Unit, onCancel: () -> Unit) {
 
     fun friendly(e: Exception): String = when {
         e is RouterOsApi.Trap && e.message == "AUTH_FAILED" -> "اسم المستخدم أو كلمة المرور غير صحيحة."
+        e is RouterOsApi.Trap && e.message == "INSUFFICIENT_POLICY" -> "صلاحيات هذا الحساب غير كافية. يلزم حساب مسؤول مخوّل لإعداد الوكيل؛ لم يتم تسجيل الراوتر في الخادم."
+        e is RouterOsApi.Trap && e.message == "AGENT_EXISTS" -> "يوجد سكربت أو مجدول باسم micromax-agent. أوقفنا التعديل لحماية الإعداد الموجود."
         e is java.net.SocketTimeoutException || e is java.net.ConnectException || e is java.net.NoRouteToHostException ->
             "تعذر الاتصال بالراوتر على $host:8728. تأكد أن الهاتف على واي فاي الراوتر، وأن خدمة API مفعلة (IP ← Services)."
         else -> e.message ?: "فشل الربط"
@@ -181,17 +183,28 @@ fun AutoLinkRouterDialog(api: Api, onSaved: () -> Unit, onCancel: () -> Unit) {
                 step = "2/4 الاتصال بالراوتر…"
                 r.connect(user.trim(), pass)
 
+                // Check permissions and existing agent objects before enrolling or changing anything.
+                val me = r.command("/user/print", queries = listOf("?name=${user.trim()}"))
+                    .firstOrNull { it["!type"] == "!re" }
+                if (me?.get("group") != "full") {
+                    throw RouterOsApi.Trap("INSUFFICIENT_POLICY")
+                }
+
+                val hasScript = r.command("/system/script/print", queries = listOf("?name=micromax-agent"))
+                    .any { it["!type"] == "!re" }
+                val hasScheduler = r.command("/system/scheduler/print", queries = listOf("?name=micromax-agent"))
+                    .any { it["!type"] == "!re" }
+                if (hasScript || hasScheduler) {
+                    throw RouterOsApi.Trap("AGENT_EXISTS")
+                }
+
                 val enroll = JSONObject(api.post("/api/routers/agent/enroll", JSONObject().put("name", name.trim()).toString()))
                 val agent = enroll.getJSONObject("agent")
-                newId = enroll.optString("id")                step = "3/4 تثبيت الشهادات…"
+                newId = enroll.optString("id")
+                step = "3/4 تثبيت الشهادات…"
                 try { r.command("/tool/fetch", mapOf("url" to agent.optString("caUrl"), "mode" to "https", "check-certificate" to "no", "dst-path" to "mm-ca.pem"), longWaitMs = 90000) } catch (_: Exception) { }
                 try { r.command("/certificate/import", mapOf("file-name" to "mm-ca.pem", "passphrase" to ""), longWaitMs = 120000) } catch (_: Exception) { }
                 step = "4/4 تثبيت وكيل MICRO-MAX…"
-                for (path in listOf("/system/scheduler", "/system/script")) {
-                    r.command("$path/print", queries = listOf("?name=micromax-agent")).filter { it["!type"] == "!re" }.forEach { x ->
-                        x[".id"]?.let { id -> try { r.command("$path/remove", mapOf(".id" to id)) } catch (_: Exception) { } }
-                    }
-                }
                 val policy = agent.optString("policy")
                 r.command("/system/script/add", mapOf("name" to "micromax-agent", "policy" to policy, "source" to agent.optString("source")))
                 r.command("/system/scheduler/add", mapOf("name" to "micromax-agent", "interval" to agent.optString("interval", "30s"), "start-time" to "startup", "policy" to policy, "on-event" to "/system script run micromax-agent"))
