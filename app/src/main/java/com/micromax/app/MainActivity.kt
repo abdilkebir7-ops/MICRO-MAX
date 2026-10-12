@@ -770,7 +770,6 @@ fun SecurityPage(api: Api) {
 }
 
 @Composable
-@Composable
 fun NetworkPage(api: Api, router: JSONObject?) {
     var tab by remember { mutableIntStateOf(0) }
     var data by remember { mutableStateOf(JSONArray()) }
