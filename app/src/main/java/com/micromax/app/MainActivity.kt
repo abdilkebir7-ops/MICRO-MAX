@@ -133,7 +133,12 @@ fun MicroMaxApp(activity: MainActivity) {
             c.isAppearanceLightNavigationBars = !themeDark
         }
         val prefs = remember { activity.getSharedPreferences("micromax_session", Context.MODE_PRIVATE) }
-        val api = remember { Api((prefs.getString("api_base_url", null)?.takeIf { it.startsWith("http") } ?: BuildConfig.MICROMAX_API_BASE_URL).ifBlank { "https://micro-max-api.onrender.com" }) }
+        val defaultApiBase = BuildConfig.MICROMAX_API_BASE_URL.ifBlank { "https://micro-max-api.onrender.com" }
+        val savedApiBase = prefs.getString("api_base_url", null)
+        val legacyApiBase = savedApiBase?.contains("karim-max-hotspot-manager.onrender.com", ignoreCase = true) == true
+        if (legacyApiBase) prefs.edit().putString("api_base_url", defaultApiBase).apply()
+        val selectedApiBase = if (savedApiBase.isNullOrBlank() || legacyApiBase || !savedApiBase.startsWith("http")) defaultApiBase else savedApiBase
+        val api = remember { Api(selectedApiBase) }
         var authenticated by remember { mutableStateOf(prefs.getString("jwt_token", null).isNullOrBlank().not()) }
         if (authenticated) {
             api.token = prefs.getString("jwt_token", null)
@@ -765,22 +770,112 @@ fun SecurityPage(api: Api) {
 }
 
 @Composable
+@Composable
 fun NetworkPage(api: Api, router: JSONObject?) {
     var tab by remember { mutableIntStateOf(0) }
     var data by remember { mutableStateOf(JSONArray()) }
+    var interfaces by remember { mutableStateOf(JSONArray()) }
+    var arpDevices by remember { mutableStateOf(JSONArray()) }
+    var dhcpLeases by remember { mutableStateOf(JSONArray()) }
     var err by remember { mutableStateOf<String?>(null) }
-    val scope=rememberCoroutineScope()
-    val names=listOf("Interfaces","DHCP","ARP","DNS","IP","Routes","Firewall","Queues","Logs","IP Bindings")
-    val paths=listOf("interfaces","dhcp-leases","arp","dns-static","ip-addresses","routes","firewall","queues","logs","ip-bindings")
-    LaunchedEffect(router?.optString("id"),tab){ if(router!=null) scope.launch{ try{val o=JSONObject(api.get("/api/routers/${router.optString("id")}/network/${paths[tab]}"));data=o.optJSONArray("items")?:JSONArray();err=null}catch(e:Exception){err=e.message}} }
-    Column(Modifier.fillMaxSize().padding(12.dp)){
-        Text("أدوات الشبكة",fontSize=27.sp,fontWeight=FontWeight.Black); Text(router?.optString("name")?:"اختر راوتر",color=TextMuted)
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)){names.forEachIndexed{i,n->FilterChip(tab==i,{tab=i},{Text(n,fontSize=11.sp)})}}
-        err?.let{ErrorCard(it)}
-        LazyColumn(Modifier.fillMaxSize(),verticalArrangement=Arrangement.spacedBy(8.dp),contentPadding=PaddingValues(vertical=10.dp)){items((0 until data.length()).map{data.getJSONObject(it)}){o->GlassCard{val title=o.optString("name",o.optString("address",o.optString("dst-address",o.optString("message","-"))));Text(title,fontWeight=FontWeight.Bold);Text(o.toString().removePrefix("{").removeSuffix("}").take(260),fontSize=11.sp,color=TextMuted)}}}
+    var loading by remember { mutableStateOf(false) }
+    val names = listOf("خريطة الشبكة", "Interfaces", "DHCP", "ARP", "DNS", "IP", "Routes", "Firewall", "Queues", "Logs", "IP Bindings")
+    val paths = listOf("", "interfaces", "dhcp-leases", "arp", "dns-static", "ip-addresses", "routes", "firewall", "queues", "logs", "ip-bindings")
+
+    suspend fun fetch(path: String): JSONArray {
+        val response = JSONObject(api.get("/api/routers/${router?.optString("id")}/network/$path"))
+        return response.optJSONArray("items") ?: JSONArray()
+    }
+
+    LaunchedEffect(router?.optString("id"), tab) {
+        if (router == null) {
+            data = JSONArray(); interfaces = JSONArray(); arpDevices = JSONArray(); dhcpLeases = JSONArray()
+            err = null
+        } else {
+            loading = true
+            try {
+                if (tab == 0) {
+                    interfaces = fetch("interfaces")
+                    arpDevices = fetch("arp")
+                    dhcpLeases = fetch("dhcp-leases")
+                } else data = fetch(paths[tab])
+                err = null
+            } catch (e: Exception) {
+                err = e.message ?: "تعذر تحميل بيانات الشبكة"
+            } finally { loading = false }
+        }
+    }
+
+    Column(Modifier.fillMaxSize().padding(12.dp)) {
+        Text("خريطة الشبكة", fontSize = 27.sp, fontWeight = FontWeight.Black)
+        Text(router?.optString("name") ?: "اختر راوتر", color = TextMuted)
+        Spacer(Modifier.height(8.dp))
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            names.forEachIndexed { i, name -> FilterChip(selected = tab == i, onClick = { tab = i }, label = { Text(name, fontSize = 11.sp) }) }
+        }
+        err?.let { ErrorCard(it) }
+        if (tab == 0) {
+            if (router == null) EmptyCard("اختر راوتر لعرض خريطة الشبكة")
+            else if (loading) GlassCard { Text("جارٍ تحميل بيانات الشبكة…", color = TextMuted) }
+            else {
+                GlassCard {
+                    Text("مخطط الاتصال", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(12.dp))
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Column(Modifier.weight(1f).background(TextMuted.copy(alpha = 0.10f), RoundedCornerShape(12.dp)).padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("🌐", fontSize = 24.sp); Text("الإنترنت", fontWeight = FontWeight.Bold)
+                        }
+                        Text("⇄", fontSize = 24.sp, fontWeight = FontWeight.Black)
+                        Column(Modifier.weight(1f).background(TextMuted.copy(alpha = 0.10f), RoundedCornerShape(12.dp)).padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("📡", fontSize = 24.sp); Text(router.optString("name", "MikroTik"), fontWeight = FontWeight.Bold, maxLines = 1)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("عرض مبسط مبني على البيانات التي يرجعها الراوتر عبر API.", fontSize = 12.sp, color = TextMuted)
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(Modifier.weight(1f)) { GlassCard { Text("الواجهات", color = TextMuted, fontSize = 12.sp); Text(interfaces.length().toString(), fontSize = 24.sp, fontWeight = FontWeight.Black) } }
+                    Column(Modifier.weight(1f)) { GlassCard { Text("أجهزة ARP", color = TextMuted, fontSize = 12.sp); Text(arpDevices.length().toString(), fontSize = 24.sp, fontWeight = FontWeight.Black) } }
+                    Column(Modifier.weight(1f)) { GlassCard { Text("DHCP", color = TextMuted, fontSize = 12.sp); Text(dhcpLeases.length().toString(), fontSize = 24.sp, fontWeight = FontWeight.Black) } }
+                }
+                GlassCard {
+                    Text("واجهات الراوتر", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    if (interfaces.length() == 0) Text("لا توجد بيانات واجهات.", color = TextMuted)
+                    else Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                        (0 until interfaces.length()).forEach { i ->
+                            val item = interfaces.optJSONObject(i) ?: JSONObject()
+                            Text(item.optString("name", item.optString("interface", "واجهة ${i + 1}")), fontWeight = FontWeight.Bold)
+                            Text(listOf(item.optString("type"), item.optString("mac-address"), item.optString("running")).filter { it.isNotBlank() }.joinToString(" • ").ifBlank { "واجهة شبكة" }, color = TextMuted, fontSize = 11.sp)
+                            if (i < interfaces.length() - 1) Divider(color = TextMuted.copy(alpha = 0.15f))
+                        }
+                    }
+                }
+                GlassCard {
+                    Text("الأجهزة المكتشفة (ARP)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    if (arpDevices.length() == 0) Text("لا توجد أجهزة ARP ظاهرة حالياً.", color = TextMuted)
+                    else Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                        (0 until minOf(arpDevices.length(), 30)).forEach { i ->
+                            val item = arpDevices.optJSONObject(i) ?: JSONObject()
+                            Text(item.optString("address", item.optString("ip-address", "IP غير معروف")), fontWeight = FontWeight.Bold)
+                            Text(listOf(item.optString("mac-address"), item.optString("interface"), item.optString("status")).filter { it.isNotBlank() }.joinToString(" • ").ifBlank { "جهاز مكتشف" }, color = TextMuted, fontSize = 11.sp)
+                            if (i < minOf(arpDevices.length(), 30) - 1) Divider(color = TextMuted.copy(alpha = 0.15f))
+                        }
+                        if (arpDevices.length() > 30) Text("يتم عرض أول 30 جهازاً.", color = TextMuted, fontSize = 11.sp)
+                    }
+                }
+            }
+        } else {
+            LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(vertical = 10.dp)) {
+                items((0 until data.length()).mapNotNull { data.optJSONObject(it) }) { item ->
+                    GlassCard {
+                        Text(item.optString("name", item.optString("address", item.optString("dst-address", item.optString("message", "-")))), fontWeight = FontWeight.Bold)
+                        Text(item.toString().removePrefix("{").removeSuffix("}").take(260), fontSize = 11.sp, color = TextMuted)
+                    }
+                }
+            }
+        }
     }
 }
-
 
 @Composable
 fun TerminalPage(api: Api, router: JSONObject?) {
