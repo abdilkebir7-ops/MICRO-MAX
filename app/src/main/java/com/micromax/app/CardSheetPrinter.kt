@@ -132,7 +132,11 @@ data class AdvancedCardPrintSettings(
     val gapYmm: Int = 4,
     val fontSize: Float = 11f,
     val lineSpacing: Float = 4f,
-    val cutMarks: Boolean = true
+    val cutMarks: Boolean = true,
+    val fontStyle: String = "عريض",
+    val borderStyle: String = "متصل",
+    val cornerRadiusMm: Float = 3f,
+    val borderWidthMm: Float = .5f
 )
 
 /** طباعة الدفعة الفعلية بالحجم التجاري، مع QR وBarcode الحقيقيين لكل كرت. */
@@ -196,14 +200,26 @@ private class AdvancedCardSheetAdapter(private val ctx: Context, private val car
     private fun drawAdvancedCard(canvas: Canvas, card: JSONObject, x: Float, y: Float, w: Float, h: Float, mm: Float) {
         val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK }
         p.style = Paint.Style.FILL; canvas.drawRoundRect(x, y, x + w, y + h, 3f * mm, 3f * mm, p.apply { color = Color.WHITE })
-        p.style = Paint.Style.STROKE; p.strokeWidth = .45f * mm; p.color = Color.BLACK; canvas.drawRoundRect(x, y, x + w, y + h, 3f * mm, 3f * mm, p)
+        p.style = Paint.Style.STROKE; p.strokeWidth = settings.borderWidthMm.coerceIn(.1f, 3f) * mm; p.color = Color.BLACK
+        if (settings.borderStyle == "متقطع") p.pathEffect = android.graphics.DashPathEffect(floatArrayOf(3f * mm, 2f * mm), 0f)
+        val radius = settings.cornerRadiusMm.coerceIn(0f, 15f) * mm
+        if (settings.borderStyle != "بدون") canvas.drawRoundRect(x, y, x + w, y + h, radius, radius, p)
+        p.pathEffect = null
         if (settings.cutMarks) { p.strokeWidth = .25f * mm; val mark = 3f * mm; canvas.drawLine(x - mark, y, x + 1.2f * mm, y, p); canvas.drawLine(x, y - mark, x, y + 1.2f * mm, p); canvas.drawLine(x + w - 1.2f * mm, y + h, x + w + mark, y + h, p); canvas.drawLine(x + w, y + h - 1.2f * mm, x + w, y + h + mark, p) }
         val pad = 4f * mm
-        p.style = Paint.Style.FILL; p.typeface = Typeface.DEFAULT_BOLD; p.textSize = settings.fontSize * mm; p.color = Color.BLACK
+        p.style = Paint.Style.FILL
+        p.typeface = when (settings.fontStyle) {
+            "رقيق" -> Typeface.create("sans-serif-light", Typeface.NORMAL)
+            "عادي" -> Typeface.create("sans-serif", Typeface.NORMAL)
+            "مزخرف" -> Typeface.create("cursive", Typeface.NORMAL)
+            "ثابت" -> Typeface.MONOSPACE
+            else -> Typeface.create("sans-serif", Typeface.BOLD)
+        }
+        p.textSize = settings.fontSize * mm; p.color = Color.BLACK
         canvas.drawText(card.optString("planName", card.optString("profile", "WiFi Access")).take(22), x + pad, y + 7f * mm, p)
         p.strokeWidth = .35f * mm; canvas.drawRect(x + pad, y + 9f * mm, x + w - pad, y + 9.4f * mm, p)
         val pin = card.optString("passwordMode") == "pin" || card.optString("password").isBlank() || card.optString("password") == card.optString("username")
-        p.typeface = Typeface.MONOSPACE; p.textSize = (settings.fontSize - settings.lineSpacing / 2f).coerceAtLeast(6f) * mm
+        p.typeface = when (settings.fontStyle) { "رقيق" -> Typeface.create("sans-serif-light", Typeface.NORMAL); "مزخرف" -> Typeface.create("cursive", Typeface.NORMAL); "عريض" -> Typeface.create("monospace", Typeface.BOLD); "ثابت" -> Typeface.MONOSPACE; else -> Typeface.create("sans-serif", Typeface.NORMAL) }; p.textSize = (settings.fontSize - settings.lineSpacing / 2f).coerceAtLeast(6f) * mm
         canvas.drawText((if (pin) "PIN: " else "USER: ") + card.optString("username"), x + pad, y + h - 12f * mm, p)
         if (!pin) canvas.drawText("PASS: " + card.optString("password"), x + pad, y + h - 6f * mm, p)
         val qr = generateCode(card.optString("qrContent"), BarcodeFormat.QR_CODE, 360, 360)
