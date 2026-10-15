@@ -74,19 +74,28 @@ class RouterOsApi(private val host: String, private val port: Int = 8728, privat
         socket = s; input = s.getInputStream(); output = s.getOutputStream()
         // RouterOS 6.43+ commonly returns a challenge on the first /login.
         // WinBox/API clients answer it with MD5(0x00 + password + challenge).
+        fun trapText(r: List<Map<String, String>>): String? = r.firstOrNull { it["!type"] == "!trap" }?.let { it["message"] ?: "trap" }
         val first = send("/login", emptyMap())
-        if (first.any { it["!type"] == "!trap" }) throw Trap("AUTH_FAILED")
+        trapText(first)?.let { throw Trap("AUTH_FAILED: first=$it") }
         val challenge = first.firstOrNull { !it["ret"].isNullOrBlank() }?.get("ret")
-        val result = if (!challenge.isNullOrBlank()) {
-            val challengeBytes = challenge.hexBytesOrNull() ?: throw Trap("INVALID_LOGIN_CHALLENGE")
-            val digest = MessageDigest.getInstance("MD5").digest(byteArrayOf(0) + password.toByteArray(Charsets.UTF_8) + challengeBytes)
-            val response = "00" + digest.joinToString("") { "%02x".format(it) }
-            send("/login", mapOf("name" to user, "response" to response))
-        } else {
-            // Compatibility path for older RouterOS versions that accept plain credentials.
-            send("/login", mapOf("name" to user, "password" to password))
+        var challengeError: String? = null
+        var ok = false
+        if (!challenge.isNullOrBlank()) {
+            val challengeBytes = challenge.hexBytesOrNull()
+            if (challengeBytes != null) {
+                val digest = MessageDigest.getInstance("MD5").digest(byteArrayOf(0) + password.toByteArray(Charsets.UTF_8) + challengeBytes)
+                val response = "00" + digest.joinToString("") { "%02x".format(it) }
+                val r = send("/login", mapOf("name" to user, "response" to response))
+                challengeError = trapText(r)
+                ok = challengeError == null
+            }
         }
-        if (result.any { it["!type"] == "!trap" }) throw Trap("AUTH_FAILED")
+        if (!ok) {
+            // RouterOS 6.43+ plain login (also the fallback if the legacy challenge login was refused).
+            val r = send("/login", mapOf("name" to user, "password" to password))
+            val plainError = trapText(r)
+            if (plainError != null) throw Trap("AUTH_FAILED: router=" + plainError + (if (challengeError != null) " | challenge=" + challengeError else "") + " | method=" + (if (challenge.isNullOrBlank()) "plain-only" else "challenge+plain") + " | userLen=" + user.length + " passLen=" + password.length)
+        }
     }
 
     /** Sends one command and returns every reply sentence as attribute maps ("!type" holds !re/!done/!trap). */
