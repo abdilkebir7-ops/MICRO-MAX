@@ -8,7 +8,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.unit.dp
 
-/** MICRO-MAX line icon set: 24x24 grid, 1.8 stroke, round caps and joins. Generated from icons.py. */
+/** MICROMAX line icon set: 24x24 grid, 1.8 stroke, round caps and joins. Generated from icons.py. */
 object MmIcons {
     private fun line(name: String, vararg paths: String): ImageVector {
         val b = ImageVector.Builder(name = name, defaultWidth = 24.dp, defaultHeight = 24.dp, viewportWidth = 24f, viewportHeight = 24f)

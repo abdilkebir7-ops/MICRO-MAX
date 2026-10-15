@@ -1,0 +1,32 @@
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تسجيل الدخول — MICRO-MAX</title><link rel="icon" href="/assets/favicon.svg"><link rel="stylesheet" href="/assets/mm.css"></head>
+<body class="glow"><div id="hdr"></div>
+<main class="wrap" style="max-width:440px;padding:48px 0">
+<div class="card">
+<div style="display:flex;gap:6px;background:var(--bg2);padding:5px;border-radius:13px;margin-bottom:18px"><button class="btn" id="tl" style="flex:1;border:0">تسجيل الدخول</button><button class="btn" id="tr" style="flex:1;border:0">حساب جديد</button></div>
+<form id="f" novalidate>
+<div id="nameRow" hidden><label class="f">الاسم</label><input id="name" autocomplete="name" maxlength="60"></div>
+<label class="f">البريد الإلكتروني</label><input id="email" type="email" autocomplete="email" required dir="ltr">
+<label class="f">كلمة المرور</label><input id="pw" type="password" autocomplete="current-password" required minlength="8" dir="ltr">
+<div id="keyRow" hidden><label class="f">مفتاح إعداد المدير (ADMIN_SETUP_KEY)</label><input id="key" type="password" dir="ltr" autocomplete="off"><div class="small muted">هذا البريد محجوز للمدير. أدخل المفتاح المضبوط في إعدادات الخادم، أو سجّل بحساب Google.</div></div>
+<p id="err" class="small" style="color:var(--danger);min-height:20px;margin:10px 0 0"></p>
+<button class="btn primary" id="go" style="width:100%;margin-top:6px">دخول</button>
+</form>
+<div id="g" style="margin-top:14px;display:flex;justify-content:center"></div>
+</div></main>
+<script src="/assets/mm.js"></script>
+<script>
+MM.header("");
+let mode="login";const $=id=>document.getElementById(id);
+const next=new URLSearchParams(location.search).get("next");
+function setMode(m){mode=m;$("nameRow").hidden=m!=="register";$("go").textContent=m==="login"?"دخول":"إنشاء الحساب";$("pw").autocomplete=m==="login"?"current-password":"new-password";$("tl").style.background=m==="login"?"var(--panel)":"transparent";$("tr").style.background=m==="register"?"var(--panel)":"transparent";$("err").textContent="";}
+$("tl").onclick=()=>setMode("login");$("tr").onclick=()=>setMode("register");setMode(new URLSearchParams(location.search).get("mode")==="register"?"register":"login");
+function done(d){MM.setAuth(d.token,d.user);location.href=next&&next.startsWith("/")&&!next.startsWith("//")?next:"/console.html";}
+$("f").onsubmit=async e=>{e.preventDefault();$("err").textContent="";const email=$("email").value.trim(),password=$("pw").value;
+ if(!email||!password){$("err").textContent="أدخل البريد وكلمة المرور";return;} if(mode==="register"&&password.length<8){$("err").textContent=MM.msg({error:"WEAK_PASSWORD"});return;}
+ $("go").disabled=true;
+ try{const body={email,password};if(mode==="register"){body.name=$("name").value;if(!$("keyRow").hidden)body.setupKey=$("key").value;}
+  done(await MM.api(mode==="login"?"/api/auth/login":"/api/auth/register",{method:"POST",body}));}
+ catch(x){if(x.error==="ADMIN_EMAIL_REQUIRES_GOOGLE_OR_SETUP_KEY")$("keyRow").hidden=false;$("err").textContent=MM.msg(x);}
+ finally{$("go").disabled=false;}};
+MM.api("/api/site/config").then(c=>{ if(!c.google||!c.googleClientId) return; const s=document.createElement("script");s.src="https://accounts.google.com/gsi/client";s.async=true;s.onload=()=>{google.accounts.id.initialize({client_id:c.googleClientId,callback:async r=>{try{done(await MM.api("/api/auth/google",{method:"POST",body:{idToken:r.credential}}))}catch(x){$("err").textContent=MM.msg(x)}}});google.accounts.id.renderButton($("g"),{theme:"outline",size:"large",text:"continue_with",locale:"ar"});};document.head.appendChild(s);}).catch(()=>{});
+</script></body></html>

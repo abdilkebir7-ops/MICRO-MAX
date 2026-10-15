@@ -47,22 +47,9 @@ private fun RouterChoice(icon: androidx.compose.ui.graphics.vector.ImageVector, 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddRouterChooser(api: Api, onSaved: () -> Unit, onCancel: () -> Unit) {
-    var choice by remember { mutableStateOf<String?>(null) }
-    when (choice) {
-        "auto" -> AutoLinkRouterDialog(api, onSaved, onCancel)
-        "agent" -> AgentRouterDialog(api, onSaved, onCancel)
-        "direct" -> AddRouterDialog(api, onSaved, onCancel, initialMode = "public")
-        else -> ModalBottomSheet(onDismissRequest = onCancel, containerColor = MaterialTheme.colorScheme.surface) {
-            Column(Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                PageHeading("راوتر جديد", "كيف تريد الربط؟", "اختر ما يناسب مكانك الآن. يمكنك إضافة راوترات أخرى بطرق مختلفة لاحقًا.")
-                Spacer(Modifier.height(4.dp))
-                RouterChoice(MmIcons.Sparkle, Signal, "ربط تلقائي", "أنت متصل بواي فاي الراوتر الآن؟ اضغط ربط وسنجهّز كل شيء بدون نسخ أي شيء.", "الأسهل") { choice = "auto" }
-                RouterChoice(MmIcons.Cloud, Violet, "راوتر بعيد", "الراوتر في مكان آخر أو بدون IP ثابت. تلصق سكربتًا واحدًا في Terminal.") { choice = "agent" }
-                RouterChoice(MmIcons.Network, DataBlue, "اتصال مباشر (IP عام)", "للراوتر الذي له عنوان عام ومنفذ API-SSL (8729) مفتوح.") { choice = "direct" }
-                Text("الخادم على الإنترنت ولا يصل إلى عناوين مثل 192.168.88.1، لذلك الراوتر داخل شبكتك يُربط بالطريقة الأولى أو الثانية.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-    }
+    // Hamo/WinBox behaviour: start with a real local RouterOS connection.
+    // Cloud Agent remains available from the dedicated remote-router flow.
+    ReferenceRouterScreen(api, onSaved, onCancel)
 }
 
 @Composable
@@ -101,7 +88,7 @@ fun AgentRouterDialog(api: Api, onSaved: () -> Unit, onCancel: () -> Unit) {
                 Text("1) انسخ السكربت   2) افتح WinBox ← New Terminal   3) الصق ثم Enter", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 Button({
                     val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("MICRO-MAX Agent", script))
+                    cm.setPrimaryClip(ClipData.newPlainText("MICROMAX Agent", script))
                     Toast.makeText(ctx, "تم نسخ السكربت", Toast.LENGTH_SHORT).show()
                 }, Modifier.fillMaxWidth()) { Icon(MmIcons.Copy, null); Spacer(Modifier.width(8.dp)); Text("نسخ السكربت") }
                 SelectionContainer { Text(script.take(900) + if (script.length > 900) "\n…" else "", fontFamily = FontFamily.Monospace, fontSize = 9.sp, color = TextMuted) }
@@ -167,8 +154,6 @@ fun AutoLinkRouterDialog(api: Api, onSaved: () -> Unit, onCancel: () -> Unit) {
 
     fun friendly(e: Exception): String = when {
         e is RouterOsApi.Trap && e.message == "AUTH_FAILED" -> "اسم المستخدم أو كلمة المرور غير صحيحة."
-        e is RouterOsApi.Trap && e.message == "INSUFFICIENT_POLICY" -> "صلاحيات هذا الحساب غير كافية. يلزم حساب مسؤول مخوّل لإعداد الوكيل؛ لم يتم تسجيل الراوتر في الخادم."
-        e is RouterOsApi.Trap && e.message == "AGENT_EXISTS" -> "يوجد سكربت أو مجدول باسم micromax-agent. أوقفنا التعديل لحماية الإعداد الموجود."
         e is java.net.SocketTimeoutException || e is java.net.ConnectException || e is java.net.NoRouteToHostException ->
             "تعذر الاتصال بالراوتر على $host:8728. تأكد أن الهاتف على واي فاي الراوتر، وأن خدمة API مفعلة (IP ← Services)."
         else -> e.message ?: "فشل الربط"
@@ -178,33 +163,21 @@ fun AutoLinkRouterDialog(api: Api, onSaved: () -> Unit, onCancel: () -> Unit) {
         busy = true; err = null
         try {
             step = "1/4 تجهيز الربط على الخادم…"
-            var newId = ""
+            val enroll = JSONObject(api.post("/api/routers/agent/enroll", JSONObject().put("name", name.trim()).toString()))
+            val agent = enroll.getJSONObject("agent")
+            val newId = enroll.optString("id")
             RouterOsApi(host.trim()).use { r ->
                 step = "2/4 الاتصال بالراوتر…"
                 r.connect(user.trim(), pass)
-
-                // Check permissions and existing agent objects before enrolling or changing anything.
-                val me = r.command("/user/print", queries = listOf("?name=${user.trim()}"))
-                    .firstOrNull { it["!type"] == "!re" }
-                if (me?.get("group") != "full") {
-                    throw RouterOsApi.Trap("INSUFFICIENT_POLICY")
-                }
-
-                val hasScript = r.command("/system/script/print", queries = listOf("?name=micromax-agent"))
-                    .any { it["!type"] == "!re" }
-                val hasScheduler = r.command("/system/scheduler/print", queries = listOf("?name=micromax-agent"))
-                    .any { it["!type"] == "!re" }
-                if (hasScript || hasScheduler) {
-                    throw RouterOsApi.Trap("AGENT_EXISTS")
-                }
-
-                val enroll = JSONObject(api.post("/api/routers/agent/enroll", JSONObject().put("name", name.trim()).toString()))
-                val agent = enroll.getJSONObject("agent")
-                newId = enroll.optString("id")
                 step = "3/4 تثبيت الشهادات…"
                 try { r.command("/tool/fetch", mapOf("url" to agent.optString("caUrl"), "mode" to "https", "check-certificate" to "no", "dst-path" to "mm-ca.pem"), longWaitMs = 90000) } catch (_: Exception) { }
                 try { r.command("/certificate/import", mapOf("file-name" to "mm-ca.pem", "passphrase" to ""), longWaitMs = 120000) } catch (_: Exception) { }
-                step = "4/4 تثبيت وكيل MICRO-MAX…"
+                step = "4/4 تثبيت وكيل MICROMAX…"
+                for (path in listOf("/system/scheduler", "/system/script")) {
+                    r.command("$path/print", queries = listOf("?name=micromax-agent")).filter { it["!type"] == "!re" }.forEach { x ->
+                        x[".id"]?.let { id -> try { r.command("$path/remove", mapOf(".id" to id)) } catch (_: Exception) { } }
+                    }
+                }
                 val policy = agent.optString("policy")
                 r.command("/system/script/add", mapOf("name" to "micromax-agent", "policy" to policy, "source" to agent.optString("source")))
                 r.command("/system/scheduler/add", mapOf("name" to "micromax-agent", "interval" to agent.optString("interval", "30s"), "start-time" to "startup", "policy" to policy, "on-event" to "/system script run micromax-agent"))

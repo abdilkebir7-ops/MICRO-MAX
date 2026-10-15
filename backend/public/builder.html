@@ -1,0 +1,43 @@
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>منشئ القوالب — MICRO-MAX</title><link rel="icon" href="/assets/favicon.svg"><link rel="stylesheet" href="/assets/mm.css">
+<style>.bw{display:grid;grid-template-columns:380px 1fr;gap:18px;align-items:start}.pvbox{position:sticky;top:78px;display:grid;justify-items:center;gap:10px}#pv{border:1px solid var(--line);border-radius:18px;background:#fff;height:min(78vh,760px);width:100%;transition:width .2s}#pv.m{width:390px}.sw{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}.sw button{aspect-ratio:1;border-radius:11px;border:2px solid transparent;cursor:pointer;padding:0}.sw button.on{border-color:var(--ink)}.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}.seg{display:flex;gap:6px}.seg button{flex:1}.seg .on{border-color:var(--accent);color:var(--accent)}.plr{display:grid;grid-template-columns:1fr 1fr auto;gap:6px;margin-bottom:6px}@media(max-width:900px){.bw{grid-template-columns:1fr}.pvbox{position:static}}</style></head>
+<body class="glow"><div id="hdr"></div>
+<main class="wrap" style="padding:30px 0"><span class="eyebrow">منشئ القوالب</span><h1 style="font-size:clamp(26px,4vw,38px)">صمّم صفحة الدخول بنفسك</h1>
+<div class="bw"><div class="card" id="ctl">
+<label class="f">اسم الشبكة / العلامة</label><input id="brand" maxlength="40" value="MICRO-MAX WiFi">
+<label class="f">العنوان الفرعي</label><input id="subtitle" maxlength="90" value="اتصال سريع وآمن — أدخل بيانات الكرت للمتابعة">
+<label class="f">النمط الجاهز</label><div class="sw" id="sw"></div>
+<div class="row2"><div><label class="f">لون رئيسي</label><input type="color" id="accent"></div><div><label class="f">لون ثانوي</label><input type="color" id="accent2"></div></div>
+<label class="f">التخطيط</label><div class="seg" id="layout"><button class="btn sm" data-v="card">بطاقة</button><button class="btn sm" data-v="split">منقسم</button><button class="btn sm" data-v="minimal">بسيط</button></div>
+<div class="row2"><div><label class="f">اللغة</label><select id="lang"><option value="ar">العربية</option><option value="en">English</option></select></div><div><label class="f">واتساب (مع المفتاح)</label><input id="whatsapp" dir="ltr" placeholder="218930090401"></div></div>
+<label class="f">رابط الشعار (https)</label><input id="logoUrl" dir="ltr" placeholder="https://…/logo.png">
+<label class="f">نص التذييل</label><input id="footer" maxlength="100">
+<label class="f"><input type="checkbox" id="pinMode"> وضع PIN (حقل واحد فقط: رقم الكرت)</label>
+<label class="f"><input type="checkbox" id="showQrHint" checked> إظهار تلميح مسح QR</label>
+<label class="f">الباقات (حتى 4)</label><div id="plans"></div><button class="btn sm" id="addp">+ باقة</button>
+<div id="val" class="small" style="margin-top:14px"></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button class="btn primary" id="dl">⬇ تحميل login.html</button><button class="btn" id="pub">نشر على راوتري</button><button class="btn" id="cp">نسخ الكود</button><button class="btn" id="sv" hidden>حفظ في المتجر (مدير)</button></div>
+</div>
+<div class="pvbox"><div class="seg" style="width:200px"><button class="btn sm on" id="dv">حاسوب</button><button class="btn sm" id="mv">هاتف</button></div><iframe id="pv" sandbox="allow-scripts" title="معاينة"></iframe></div></div></main>
+<div id="ftr"></div>
+<script src="/assets/mm.js"></script><script src="/assets/publish.js"></script><script>
+MM.header("builder");MM.footer();const $=id=>document.getElementById(id);
+let presets=[],st={preset:"aurora",layout:"card",plans:[{name:"يومية",note:"1 GB"},{name:"أسبوعية",note:"10 GB"},{name:"شهرية",note:"مفتوحة"}]},html="",timer;
+const q=new URLSearchParams(location.search);
+function opts(){return {...st,brand:$("brand").value,subtitle:$("subtitle").value,accent:$("accent").value,accent2:$("accent2").value,lang:$("lang").value,whatsapp:$("whatsapp").value,logoUrl:$("logoUrl").value,footer:$("footer").value,pinMode:$("pinMode").checked,showQrHint:$("showQrHint").checked};}
+function drawPlans(){$("plans").innerHTML=st.plans.map((p,i)=>`<div class="plr"><input data-i="${i}" data-k="name" value="${MM.esc(p.name)}" placeholder="الاسم" maxlength="24"><input data-i="${i}" data-k="note" value="${MM.esc(p.note)}" placeholder="ملاحظة" maxlength="24"><button class="btn sm danger" data-d="${i}">×</button></div>`).join("");$("addp").hidden=st.plans.length>=4;}
+function drawSw(){$("sw").innerHTML=presets.map(p=>`<button title="${MM.esc(p.name)}" data-p="${p.preset}" class="${p.preset===st.preset?"on":""}" style="background:linear-gradient(135deg,${p.accent},${p.accent2})"></button>`).join("");document.querySelectorAll("#layout button").forEach(b=>b.classList.toggle("on",b.dataset.v===st.layout));}
+async function refresh(){try{const d=await MM.api("/api/site/templates/render",{method:"POST",body:{options:opts()}});html=d.html;$("pv").srcdoc=html;const v=d.validation;$("val").innerHTML=v.valid?`<span class="badge ok">✔ متوافق مع MikroTik</span>${v.warnings.length?` <span class="badge warn">${v.warnings.join(", ")}</span>`:""}`:`<span class="badge bad">${v.errors.join(", ")}</span>`;}catch(e){MM.fail(e);}}
+const later=()=>{clearTimeout(timer);timer=setTimeout(refresh,250);};
+$("ctl").addEventListener("input",e=>{const t=e.target;if(t.dataset.i!==undefined){st.plans[t.dataset.i][t.dataset.k]=t.value;}later();});
+$("ctl").addEventListener("click",e=>{const t=e.target.closest("button");if(!t)return;
+ if(t.dataset.p){st.preset=t.dataset.p;const p=presets.find(x=>x.preset===st.preset);$("accent").value=p.accent;$("accent2").value=p.accent2;drawSw();later();}
+ else if(t.dataset.v){st.layout=t.dataset.v;drawSw();later();}
+ else if(t.dataset.d!==undefined){st.plans.splice(Number(t.dataset.d),1);drawPlans();later();}
+ else if(t.id==="addp"&&st.plans.length<4){st.plans.push({name:"",note:""});drawPlans();}});
+$("dv").onclick=()=>{$("pv").className="";$("dv").classList.add("on");$("mv").classList.remove("on");};$("mv").onclick=()=>{$("pv").className="m";$("mv").classList.add("on");$("dv").classList.remove("on");};
+$("dl").onclick=()=>{const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([html],{type:"text/html"}));a.download="login.html";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);};
+$("cp").onclick=async()=>{try{await navigator.clipboard.writeText(html);MM.toast("تم النسخ");}catch{MM.toast("تعذر النسخ، استخدم التحميل",true);}};
+$("pub").onclick=()=>MMPublish.open(async()=>html);
+if(MM.user?.role==="admin"){$("sv").hidden=false;$("sv").onclick=async()=>{const name=prompt("اسم القالب في المتجر");if(!name)return;try{await MM.api("/api/admin/templates",{method:"POST",body:{name,html,category:"مخصص",description:opts().subtitle}});MM.toast("تم الحفظ في المتجر");}catch(e){MM.fail(e);}};}
+MM.api("/api/site/templates").then(d=>{presets=d.presets;const p=presets.find(x=>x.preset===q.get("preset"))||presets[0];st.preset=p.preset;$("accent").value=p.accent;$("accent2").value=p.accent2;drawSw();drawPlans();refresh();}).catch(MM.fail);
+</script></body></html>

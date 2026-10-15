@@ -1,0 +1,12 @@
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>التحميل والتحديثات — MICRO-MAX</title><link rel="icon" href="/assets/favicon.svg"><link rel="stylesheet" href="/assets/mm.css"></head>
+<body class="glow"><div id="hdr"></div>
+<main class="wrap" style="padding:36px 0;max-width:860px"><span class="eyebrow">تطبيق أندرويد</span><h1 style="font-size:clamp(28px,4vw,42px)">حمّل MICRO-MAX وحدّثه</h1>
+<div class="card" id="latest" style="margin:18px 0"><p class="muted">جارٍ التحميل…</p></div>
+<div class="card"><h3>كيف أثبّت التطبيق؟</h3><ol class="muted small" style="padding-inline-start:20px;margin:0"><li>حمّل ملف APK من الزر أعلاه.</li><li>افتح الملف، وإن طُلب فعّل «التثبيت من مصادر غير معروفة» لمتصفحك.</li><li>سجّل الدخول بنفس حساب الموقع — الراوترات تتزامن تلقائياً.</li><li>للتحقق من سلامة الملف قارن بصمة SHA-256 المعروضة.</li></ol></div>
+<h2 style="margin-top:34px">سجل الإصدارات</h2><div id="list" class="grid"></div></main>
+<div id="ftr"></div>
+<script src="/assets/mm.js"></script><script>
+MM.header("download");MM.footer();const E=MM.esc;
+const rel=r=>`<div class="card"><div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap"><h3 style="margin:0">v${E(r.version)} ${r.channel==="beta"?'<span class="badge warn">تجريبي</span>':""}${r.mandatory?' <span class="badge bad">إلزامي</span>':""}</h3><span class="small muted">${new Date(r.createdAt).toLocaleDateString("ar")} · ⬇ ${r.downloads}</span></div><p class="muted" style="white-space:pre-line">${E(r.notes||"—")}</p>${r.sha256?`<div class="small muted" dir="ltr" style="word-break:break-all">SHA-256: ${E(r.sha256)}</div>`:""}<a class="btn sm" style="margin-top:10px" href="/download/${encodeURIComponent(r.version)}">⬇ تحميل ${r.sizeMb?E(r.sizeMb)+" MB":""}</a></div>`;
+MM.api("/api/site/releases").then(d=>{const it=d.items;document.getElementById("latest").innerHTML=it.length?`<span class="eyebrow">الأحدث</span><h2 style="margin:4px 0">v${E(it[0].version)}</h2><p class="muted" style="white-space:pre-line">${E(it[0].notes||"")}</p><a class="btn primary" href="/download/latest">⬇ تحميل APK ${it[0].sizeMb?"("+E(it[0].sizeMb)+" MB)":""}</a>`:`<p class="muted">لم يُنشر إصدار بعد. سيظهر رابط التحميل هنا بمجرد رفعه من لوحة الإدارة.</p>`;document.getElementById("list").innerHTML=it.map(rel).join("");}).catch(MM.fail);
+</script></body></html>

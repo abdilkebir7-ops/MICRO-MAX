@@ -18,6 +18,7 @@ import android.print.PrintManager
 import android.print.pdf.PrintedPdfDocument
 import com.google.zxing.BarcodeFormat
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.FileOutputStream
 import java.io.IOException
 
@@ -30,7 +31,7 @@ enum class SheetLayout(val cols: Int, val rows: Int, val label: String) {
 }
 
 /** Opens Android's print dialog (printer or "Save as PDF") with a cut-ready sheet of cards. Works offline. */
-fun printCardSheet(context: Context, cards: JSONArray, layout: SheetLayout, title: String = "MICRO-MAX Cards") {
+fun printCardSheet(context: Context, cards: JSONArray, layout: SheetLayout, title: String = "MICROMAX Cards") {
     val pm = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
     val attrs = PrintAttributes.Builder().setMediaSize(PrintAttributes.MediaSize.ISO_A4).setMinMargins(PrintAttributes.Margins.NO_MARGINS).build()
     pm.print(title, CardSheetAdapter(context, cards, layout), attrs)
@@ -114,5 +115,100 @@ private class CardSheetAdapter(val ctx: Context, val cards: JSONArray, val layou
             c.drawBitmap(it, null, RectF(108f, 8f, 180f, 80f), crisp)
             c.drawText(if (wifi != null) "2) امسح للدخول" else "امسح للدخول", 112f, 92f, small)
         }
+    }
+}
+
+/** إعدادات طباعة تجارية للدفعة الفعلية. جميع المقاسات بالملليمتر. */
+data class AdvancedCardPrintSettings(
+    val paperWidthMm: Int = 210,
+    val paperHeightMm: Int = 297,
+    val cardWidthMm: Int = 90,
+    val cardHeightMm: Int = 55,
+    val columns: Int = 2,
+    val rows: Int = 4,
+    val marginXmm: Int = 10,
+    val marginYmm: Int = 10,
+    val gapXmm: Int = 4,
+    val gapYmm: Int = 4,
+    val fontSize: Float = 11f,
+    val lineSpacing: Float = 4f,
+    val cutMarks: Boolean = true
+)
+
+/** طباعة الدفعة الفعلية بالحجم التجاري، مع QR وBarcode الحقيقيين لكل كرت. */
+fun printCardSheetAdvanced(context: Context, cards: JSONArray, settings: AdvancedCardPrintSettings, title: String = "MICROMAX Cards") {
+    val pm = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
+    val attrs = PrintAttributes.Builder().setMediaSize(PrintAttributes.MediaSize.ISO_A4).setMinMargins(PrintAttributes.Margins.NO_MARGINS).build()
+    pm.print(title, AdvancedCardSheetAdapter(context, cards, settings), attrs)
+}
+
+private class AdvancedCardSheetAdapter(private val ctx: Context, private val cards: JSONArray, private val settings: AdvancedCardPrintSettings) : PrintDocumentAdapter() {
+    private var pdf: PrintedPdfDocument? = null
+    private val cols get() = settings.columns.coerceIn(1, 12)
+    private val rows get() = settings.rows.coerceIn(1, 20)
+    private val perPage get() = cols * rows
+    private val pages get() = maxOf(1, (cards.length() + perPage - 1) / perPage)
+    private val crisp = Paint().apply { isFilterBitmap = false }
+
+    override fun onLayout(old: PrintAttributes?, new: PrintAttributes, cancel: CancellationSignal?, cb: LayoutResultCallback, extras: Bundle?) {
+        pdf?.close(); pdf = PrintedPdfDocument(ctx, new)
+        if (cancel?.isCanceled == true) { cb.onLayoutCancelled(); return }
+        cb.onLayoutFinished(PrintDocumentInfo.Builder("micromax-cards-advanced.pdf").setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT).setPageCount(pages).build(), true)
+    }
+
+    override fun onWrite(ranges: Array<out PageRange>, dest: ParcelFileDescriptor, cancel: CancellationSignal?, cb: WriteResultCallback) {
+        val doc = pdf ?: run { cb.onWriteFailed("no document"); return }
+        Thread {
+            try {
+                for (i in 0 until pages) {
+                    if (cancel?.isCanceled == true) { cb.onWriteCancelled(); return@Thread }
+                    val page = doc.startPage(i)
+                    drawPage(page.canvas, i, doc.pageWidth.toFloat(), doc.pageHeight.toFloat())
+                    doc.finishPage(page)
+                }
+                FileOutputStream(dest.fileDescriptor).use { doc.writeTo(it) }
+                cb.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+            } catch (e: Exception) { cb.onWriteFailed(e.message) }
+        }.start()
+    }
+
+    override fun onFinish() { pdf?.close(); pdf = null }
+
+    private fun drawPage(canvas: Canvas, pageIndex: Int, pageW: Float, pageH: Float) {
+        canvas.drawColor(Color.WHITE)
+        val mm = minOf(pageW / settings.paperWidthMm.coerceAtLeast(1), pageH / settings.paperHeightMm.coerceAtLeast(1))
+        val cardW = settings.cardWidthMm * mm
+        val cardH = settings.cardHeightMm * mm
+        val mx = settings.marginXmm * mm
+        val my = settings.marginYmm * mm
+        val gx = settings.gapXmm * mm
+        val gy = settings.gapYmm * mm
+        val first = pageIndex * perPage
+        for (slot in 0 until perPage) {
+            val index = first + slot
+            if (index >= cards.length()) break
+            val x = mx + (slot % cols) * (cardW + gx)
+            val y = my + (slot / cols) * (cardH + gy)
+            drawAdvancedCard(canvas, cards.getJSONObject(index), x, y, cardW, cardH, mm)
+        }
+    }
+
+    private fun drawAdvancedCard(canvas: Canvas, card: JSONObject, x: Float, y: Float, w: Float, h: Float, mm: Float) {
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK }
+        p.style = Paint.Style.FILL; canvas.drawRoundRect(x, y, x + w, y + h, 3f * mm, 3f * mm, p.apply { color = Color.WHITE })
+        p.style = Paint.Style.STROKE; p.strokeWidth = .45f * mm; p.color = Color.BLACK; canvas.drawRoundRect(x, y, x + w, y + h, 3f * mm, 3f * mm, p)
+        if (settings.cutMarks) { p.strokeWidth = .25f * mm; val mark = 3f * mm; canvas.drawLine(x - mark, y, x + 1.2f * mm, y, p); canvas.drawLine(x, y - mark, x, y + 1.2f * mm, p); canvas.drawLine(x + w - 1.2f * mm, y + h, x + w + mark, y + h, p); canvas.drawLine(x + w, y + h - 1.2f * mm, x + w, y + h + mark, p) }
+        val pad = 4f * mm
+        p.style = Paint.Style.FILL; p.typeface = Typeface.DEFAULT_BOLD; p.textSize = settings.fontSize * mm; p.color = Color.BLACK
+        canvas.drawText(card.optString("planName", card.optString("profile", "WiFi Access")).take(22), x + pad, y + 7f * mm, p)
+        p.strokeWidth = .35f * mm; canvas.drawRect(x + pad, y + 9f * mm, x + w - pad, y + 9.4f * mm, p)
+        val pin = card.optString("passwordMode") == "pin" || card.optString("password").isBlank() || card.optString("password") == card.optString("username")
+        p.typeface = Typeface.MONOSPACE; p.textSize = (settings.fontSize - settings.lineSpacing / 2f).coerceAtLeast(6f) * mm
+        canvas.drawText((if (pin) "PIN: " else "USER: ") + card.optString("username"), x + pad, y + h - 12f * mm, p)
+        if (!pin) canvas.drawText("PASS: " + card.optString("password"), x + pad, y + h - 6f * mm, p)
+        val qr = generateCode(card.optString("qrContent"), BarcodeFormat.QR_CODE, 360, 360)
+        qr?.let { val size = minOf(24f * mm, h - 18f * mm); canvas.drawBitmap(it, null, android.graphics.RectF(x + w - size - pad, y + h - size - pad, x + w - pad, y + h - pad), crisp) }
+        val bar = generateCode(card.optString("username"), BarcodeFormat.CODE_128, 600, 120)
+        bar?.let { canvas.drawBitmap(it, null, android.graphics.RectF(x + pad, y + 11f * mm, x + w * .52f, y + 18f * mm), crisp) }
     }
 }

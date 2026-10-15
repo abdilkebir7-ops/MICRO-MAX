@@ -53,7 +53,7 @@ fun StorePage(api: Api, routers: JSONArray, onAddToRouter: (String, JSONObject) 
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 17.dp), verticalArrangement = Arrangement.spacedBy(15.dp), contentPadding = PaddingValues(top = 18.dp, bottom = 32.dp)) {
         item {
-            PageHeading("مكتبة مستقلة عن الراوتر", "المتجر والتصاميم", "تصفح القوالب بحرية أولاً، ثم أضف التصميم المختار إلى أي راوتر عند الحاجة")
+            PageHeading("مكتبة مستقلة عن الراوتر", "Store Max", "تصفح القوالب بحرية أولاً، ثم أضف التصميم المختار إلى أي راوتر عند الحاجة")
             Spacer(Modifier.height(12.dp))
             Surface(color = Royal.copy(alpha = .08f), shape = RoundedCornerShape(18.dp)) { Row(Modifier.padding(13.dp), verticalAlignment = Alignment.CenterVertically) { Icon(MmIcons.Store, null, tint = Royal); Spacer(Modifier.width(9.dp)); Column { Text("المتجر لا يحتاج راوترًا محددًا", fontWeight = FontWeight.Bold, color = Ink); Text("زر إضافة إلى راوتر يظهر بعد اختيار التصميم.", fontSize = 11.sp, color = MutedInk) } } }
         }

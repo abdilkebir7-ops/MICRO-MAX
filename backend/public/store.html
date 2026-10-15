@@ -1,0 +1,23 @@
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>متجر القوالب — MICRO-MAX</title><link rel="icon" href="/assets/favicon.svg"><link rel="stylesheet" href="/assets/mm.css">
+<style>.tpl{aspect-ratio:3/4;border:0;width:100%;border-radius:12px;background:#fff;pointer-events:none}.chips{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.chip{padding:6px 14px;border-radius:99px;border:1px solid var(--line);background:var(--panel);cursor:pointer;font-size:13px;color:var(--muted)}.chip.on{background:var(--accent);color:#04101c;border-color:transparent}.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.pv{width:100%;height:70vh;border:0;border-radius:12px;background:#fff}</style></head>
+<body class="glow"><div id="hdr"></div>
+<main class="wrap" style="padding:36px 0">
+<span class="eyebrow">متجر MICRO-MAX</span><h1 style="font-size:clamp(28px,4vw,42px)">قوالب صفحة Login للهوتسبوت</h1>
+<p class="muted">جميع القوالب متوافقة مع MikroTik (<code>$(link-login-only)</code>)، وتدعم QR والدخول التلقائي بلا إدخال يوزر. حمّلها أو انشرها على راوترك مباشرة.</p>
+<div style="display:flex;gap:10px;flex-wrap:wrap"><input id="q" placeholder="ابحث عن قالب…" style="max-width:300px"><a class="btn primary" href="/builder.html">✨ صمّم قالبك</a></div>
+<div class="chips" id="chips"></div><div class="grid g4" id="grid"></div></main>
+<div id="ftr"></div>
+<script src="/assets/mm.js"></script><script src="/assets/publish.js"></script><script>
+MM.header("store");MM.footer();
+let all=[],cat="الكل";const $=id=>document.getElementById(id);
+function card(t){const dl=t.price>0?`<span class="badge warn">${t.price} $</span>`:`<span class="badge ok">مجاني</span>`;
+ return `<div class="card" id="${t.slug}" style="padding:10px"><div class="tplw"><iframe sandbox="allow-scripts" src="/api/site/templates/${t.slug}/preview" title="${MM.esc(t.name)}"></iframe></div><div style="padding:8px 4px 0;display:flex;justify-content:space-between;align-items:center"><b>${MM.esc(t.name)}</b>${dl}</div><div class="small muted">${MM.esc(t.category)} · ⬇ ${t.downloads||0}</div><div class="acts"><button class="btn sm" data-a="pv" data-s="${t.slug}">معاينة</button><a class="btn sm" href="/api/site/templates/${t.slug}/download" download="login.html">تحميل</a>${t.kind==="preset"?`<a class="btn sm" href="/builder.html?preset=${t.preset}">تخصيص</a>`:""}<button class="btn sm primary" data-a="pub" data-s="${t.slug}">نشر</button></div></div>`;}
+function render(){const q=$("q").value.trim().toLowerCase();const list=all.filter(t=>(cat==="الكل"||t.category===cat)&&(!q||t.name.toLowerCase().includes(q)||(t.description||"").toLowerCase().includes(q)));$("grid").innerHTML=list.map(card).join("")||`<p class="muted">لا نتائج</p>`;MM.fitFrames();
+ const cats=["الكل",...new Set(all.map(t=>t.category))];$("chips").innerHTML=cats.map(c=>`<span class="chip ${c===cat?"on":""}" data-c="${MM.esc(c)}">${MM.esc(c)}</span>`).join("");}
+$("q").oninput=render;
+$("chips").onclick=e=>{const c=e.target.dataset.c;if(c){cat=c;render();}};
+$("grid").onclick=async e=>{const b=e.target.closest("button[data-a]");if(!b)return;const s=b.dataset.s;
+ if(b.dataset.a==="pv"){const m=MMPublish.modal(`<h3>معاينة</h3><iframe class="pv" sandbox="allow-scripts" src="/api/site/templates/${s}/preview"></iframe><div style="margin-top:12px"><button class="btn" id="x">إغلاق</button></div>`);m.querySelector("#x").onclick=()=>m.remove();m.firstChild.style.width="min(520px,100%)";}
+ else MMPublish.open(async()=>{const r=await fetch(`/api/site/templates/${s}/download`);if(!r.ok)throw {error:r.status===402?"PAID_TEMPLATE":"HTTP"};return r.text();});};
+MM.api("/api/site/templates").then(d=>{all=[...d.presets,...d.custom];render();if(location.hash){const el=document.getElementById(location.hash.slice(1));el&&el.scrollIntoView({block:"center"});}}).catch(MM.fail);
+</script></body></html>

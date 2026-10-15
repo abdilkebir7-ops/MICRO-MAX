@@ -1,0 +1,17 @@
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>مصمم الكروت — MICRO-MAX</title><link rel="icon" href="/assets/favicon.svg"><link rel="stylesheet" href="/assets/mm.css"><style>#cdh{padding:6px 0 30px}.cd-ctl{background:var(--panel2)}</style></head>
+<body class="glow"><div id="hdr"></div>
+<main class="wrap" style="padding:26px 0"><span class="eyebrow">طباعة الكروت</span><h1 style="font-size:clamp(24px,4vw,34px)">مصمم الكروت</h1>
+<p class="muted small" id="src">جارٍ التحميل…</p><div id="cdh"></div></main>
+<div id="ftr"></div>
+<script src="/assets/mm.js"></script><script src="/assets/qr.js"></script><script src="/assets/carddesigner.js"></script><script>
+MM.header("console");MM.footer();
+const st=document.createElement("style");st.textContent=MMCards.CSS;document.head.appendChild(st);
+function directPrint(html){const f=document.createElement("iframe");f.style.cssText="position:fixed;right:0;bottom:0;width:0;height:0;border:0";document.body.appendChild(f);f.onload=()=>{setTimeout(()=>{try{f.contentWindow.focus();f.contentWindow.print();}catch(e){MM.toast("تعذرت الطباعة المباشرة",true);}setTimeout(()=>f.remove(),60000);},600);};f.srcdoc=html;}
+const batch=new URLSearchParams(location.search).get("batch");
+const fmtDur=m=>!m?"":m>=1440?Math.round(m/1440)+" يوم":m>=60?Math.round(m/60)+" ساعة":m+" دقيقة";
+(async()=>{let cards=null;
+ if(batch&&MM.token){try{const d=await MM.api(`/api/card-batches/${encodeURIComponent(batch)}/print-cards?status=all`);cards=d.cards.map(c=>({user:c.username,pass:c.password,pin:c.passwordMode==="pin",plan:c.planName,price:c.price?c.price+" "+(c.currency||""):"",duration:fmtDur(c.durationMinutes),qr:c.qrContent||""}));document.getElementById("src").textContent=`دفعة من حسابك: ${cards.length} كرت. صمّم الشكل ثم اضغط «طباعة مباشرة».`;}catch(e){MM.fail(e);}}
+ else if(batch){location.href="/login.html?next="+encodeURIComponent(location.pathname+location.search);return;}
+ if(!cards){document.getElementById("src").textContent="عينة تجريبية: افتح هذه الصفحة من «الكروت ← طباعة» داخل لوحة التحكم لتحميل كروت دفعتك.";}
+ MMCards.mount(document.getElementById("cdh"),{cards,print:directPrint});})();
+</script></body></html>

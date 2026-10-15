@@ -114,7 +114,15 @@ export class RouterOS {
     }
     const out=this.buffer.subarray(0,n); this.buffer=this.buffer.subarray(n); return out;
   }
-  async command(path, args=[]) {
+  // Commands share one socket and replies carry no tag, so they must never interleave.
+  // Serialise callers such as Promise.all that use the same RouterOS connection.
+  command(path, args=[]) {
+    const run=()=>this._command(path,args);
+    const p=(this._queue||Promise.resolve()).then(run,run);
+    this._queue=p.catch(()=>{});
+    return p;
+  }
+  async _command(path, args=[]) {
     if(!this.socket) await this.connect();
     await this.write(sentence([path,...args]));
     const out=[];
