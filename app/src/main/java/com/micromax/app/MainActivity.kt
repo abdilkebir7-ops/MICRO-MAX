@@ -78,13 +78,14 @@ val TextMuted: Color @Composable get() = MaterialTheme.colorScheme.onSurfaceVari
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen() // applies postSplashScreenTheme: NoActionBar, avoiding duplicate title
+        RouterOsApi.appContext = applicationContext
         super.onCreate(savedInstanceState)
         setContent { MicroMaxApp(this) }
     }
 
     fun printBitmap(bitmap: Bitmap) {
         try {
-            androidx.print.PrintHelper(this).apply { scaleMode = androidx.print.PrintHelper.SCALE_MODE_FIT }.printBitmap("MICRO-MAX Card", bitmap)
+            androidx.print.PrintHelper(this).apply { scaleMode = androidx.print.PrintHelper.SCALE_MODE_FIT }.printBitmap("MICROMAX Card", bitmap)
         } catch (e: Exception) {
             Toast.makeText(this, e.message ?: "تعذر فتح الطباعة", Toast.LENGTH_LONG).show()
         }
@@ -97,12 +98,13 @@ class Api(var base: String) {
     // Render's free plan sleeps after inactivity and needs up to ~60s to wake: ping /health first so real calls don't time out.
     private val waker = http.newBuilder().connectTimeout(75, TimeUnit.SECONDS).readTimeout(75, TimeUnit.SECONDS).callTimeout(80, TimeUnit.SECONDS).build()
     @Volatile private var lastOk = 0L
+    private fun root(): String = base.trim().trim('"', '\'').trimEnd('/')
     private fun wake() {
         if (System.currentTimeMillis() - lastOk < 8 * 60_000L) return
-        try { waker.newCall(Request.Builder().url(base.trim().trimEnd('/') + "/health").get().build()).execute().use { if (it.isSuccessful) lastOk = System.currentTimeMillis() } } catch (_: Exception) { }
+        try { waker.newCall(Request.Builder().url(root() + "/health").get().build()).execute().use { if (it.isSuccessful) lastOk = System.currentTimeMillis() } } catch (_: Exception) { }
     }
     var token: String? = null
-    private fun req(path: String) = Request.Builder().url(base.trim().trimEnd('/') + path).apply { token?.let { addHeader("Authorization", "Bearer $it") } }
+    private fun req(path: String) = Request.Builder().url(root() + path).apply { token?.let { addHeader("Authorization", "Bearer $it") } }
     suspend fun get(path: String): String = call(req(path).get().build())
     suspend fun post(path: String, body: String = "{}"): String = call(req(path).post(body.toRequestBody("application/json".toMediaType())).build())
     suspend fun delete(path: String): String = call(req(path).delete().build())
@@ -115,13 +117,14 @@ class Api(var base: String) {
             response.body?.bytes() ?: ByteArray(0)
         }
     }
-    private suspend fun call(r: Request): String = withContext(Dispatchers.IO) { wake(); http.newCall(r).execute().use { x -> val b=x.body?.string().orEmpty(); if(x.code < 500) lastOk = System.currentTimeMillis(); if(!x.isSuccessful) throw Exception(try{JSONObject(b).optString("detail").ifBlank{JSONObject(b).optString("error")}}catch(_:Exception){"HTTP ${x.code}"}); b } }
+    private suspend fun call(r: Request): String = withContext(Dispatchers.IO) { wake(); http.newCall(r).execute().use { x -> val b=x.body?.string().orEmpty(); if(x.code < 500) lastOk = System.currentTimeMillis(); if(!x.isSuccessful) throw Exception(try{val j=JSONObject(b);val d=j.optString("detail").ifBlank{j.optString("error")};val h=j.optString("help");if(h.isBlank()) d else "$d\n$h"}catch(_:Exception){"HTTP ${x.code}"}); b } }
 }
 
 @Composable
 fun MicroMaxApp(activity: MainActivity) {
     val themePrefs = remember { activity.getSharedPreferences("micromax_session", Context.MODE_PRIVATE) }
-    var themeDark by remember { mutableStateOf(themePrefs.getBoolean("theme_dark", false)) }
+    // MICROMAX supports both polished operator themes; dark remains the default.
+    var themeDark by remember { mutableStateOf(themePrefs.getBoolean("theme_dark", true)) }
     MicroMaxTheme(themeDark) {
         val barColor = MaterialTheme.colorScheme.background
         SideEffect {
@@ -133,19 +136,40 @@ fun MicroMaxApp(activity: MainActivity) {
             c.isAppearanceLightNavigationBars = !themeDark
         }
         val prefs = remember { activity.getSharedPreferences("micromax_session", Context.MODE_PRIVATE) }
-        val api = remember { Api((prefs.getString("api_base_url", null)?.takeIf { it.startsWith("http") } ?: BuildConfig.MICROMAX_API_BASE_URL).ifBlank { "https://micro-max-api.onrender.com" }) }
+        val api = remember { Api(BuildConfig.MICROMAX_API_BASE_URL) }
         var authenticated by remember { mutableStateOf(prefs.getString("jwt_token", null).isNullOrBlank().not()) }
+        var checkingSession by remember { mutableStateOf(authenticated) }
+        fun clearSession() {
+            prefs.edit().remove("jwt_token").apply()
+            api.token = null
+            authenticated = false
+            checkingSession = false
+        }
         if (authenticated) {
             api.token = prefs.getString("jwt_token", null)
-            MainShell(api, activity, themeDark, { themeDark = !themeDark; themePrefs.edit().putBoolean("theme_dark", themeDark).apply() }) {
-                prefs.edit().remove("jwt_token").apply()
-                api.token = null
-                authenticated = false
+            LaunchedEffect(Unit) {
+                try {
+                    api.get("/api/me")
+                    checkingSession = false
+                } catch (e: Exception) {
+                    if (e.message.orEmpty().contains("UNAUTHORIZED", ignoreCase = true) || e.message.orEmpty().contains("401")) {
+                        clearSession()
+                    } else {
+                        // Keep the session during a temporary network outage; the dashboard will show the actual error.
+                        checkingSession = false
+                    }
+                }
+            }
+            if (!checkingSession) {
+                MainShell(api, activity, themeDark, { themeDark = !themeDark; themePrefs.edit().putBoolean("theme_dark", themeDark).apply() }) {
+                    clearSession()
+                }
             }
         } else {
             AuthScreen(api, prefs) { token ->
                 prefs.edit().putString("jwt_token", token).apply()
                 api.token = token
+                checkingSession = false
                 authenticated = true
             }
         }
@@ -161,15 +185,16 @@ private fun AuthPill(label: String, icon: ImageVector) {
 }
 
 private fun authError(raw: String): String = when {
+    raw.contains("UNAUTHORIZED", true) || raw.contains("401") -> "انتهت جلسة الدخول. سجّل الدخول من جديد للمتابعة."
     raw.contains("INVALID_CREDENTIALS") -> "البريد أو كلمة المرور غير صحيحة."
     raw.contains("EMAIL_EXISTS") -> "هذا البريد مسجّل مسبقًا. انتقل إلى «تسجيل الدخول»."
     raw.contains("REGISTRATION_CLOSED") -> "إنشاء الحسابات الجديدة مغلق على هذا الخادم. فعّل ALLOW_REGISTRATION=true في إعدادات Render ثم أعد النشر."
     raw.contains("WEAK_PASSWORD") -> "كلمة المرور قصيرة: 8 أحرف على الأقل."
     raw.contains("INVALID_EMAIL") -> "صيغة البريد الإلكتروني غير صحيحة."
     raw.contains("429") || raw.contains("many", true) -> "محاولات كثيرة. انتظر دقيقة ثم أعد المحاولة."
-    raw.contains("scheme", true) || raw.contains("Expected URL", true) -> "رابط الخادم غير صحيح. اضغط على اسم الخادم في الأسفل لتعديله."
+    raw.contains("scheme", true) || raw.contains("Expected URL", true) -> "تعذر الاتصال بالخدمة السحابية المُدارة. حاول لاحقًا أو تحقق من اتصال الإنترنت."
     raw.contains("timeout", true) || raw.contains("resolve", true) || raw.contains("failed to connect", true) || raw.contains("UnknownHost", true) ->
-        "تعذر الوصول إلى الخادم. تأكد من الإنترنت؛ الخادم المجاني قد يحتاج دقيقة ليستيقظ."
+        "تعذر الوصول إلى خادم MICROMAX. افتح صفحة health في متصفح الهاتف؛ إذا لم تفتح فالمشكلة DNS/إنترنت في الهاتف وليست كلمة مرور الراوتر."
     else -> raw
 }
 
@@ -218,8 +243,6 @@ private fun AuthScreen(api: Api, prefs: android.content.SharedPreferences, onAut
     var reveal by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
-    var serverDialog by remember { mutableStateOf(false) }
-    var serverUrl by remember { mutableStateOf(api.base) }
     val scope = rememberCoroutineScope()
     val cs = MaterialTheme.colorScheme
     val score = passwordScore(password)
@@ -256,7 +279,7 @@ private fun AuthScreen(api: Api, prefs: android.content.SharedPreferences, onAut
                     NetworkBadge(size = 50.dp)
                     Spacer(Modifier.width(13.dp))
                     Column {
-                        Text("MICRO-MAX", style = MaterialTheme.typography.titleLarge, color = Color.White, letterSpacing = 1.4.sp)
+                        Text("MICROMAX", style = MaterialTheme.typography.titleLarge, color = Color.White, letterSpacing = 1.4.sp)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             LedDot(Link, size = 5.dp, live = true)
                             Text("إدارة شبكات MikroTik", style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = .65f))
@@ -302,26 +325,16 @@ private fun AuthScreen(api: Api, prefs: android.content.SharedPreferences, onAut
                     }
                 }
             }
-            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).pressScale({ serverUrl = api.base; serverDialog = true }).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().background(cs.surfaceVariant, RoundedCornerShape(12.dp)).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(MmIcons.Cloud, null, tint = cs.onSurfaceVariant, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("الخادم: ${api.base.removePrefix("https://").removePrefix("http://").trimEnd('/')}", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("تغيير", style = MaterialTheme.typography.labelMedium, color = cs.primary)
+                Text("الخدمة السحابية محمية ومتصلة", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant, modifier = Modifier.weight(1f))
+                StatusPill("متصل")
             }
             Spacer(Modifier.height(16.dp))
         }
     }
-    if (serverDialog) AlertDialog(
-        onDismissRequest = { serverDialog = false }, shape = RoundedCornerShape(28.dp),
-        title = { Text("رابط الخادم") },
-        text = { OutlinedTextField(serverUrl, { serverUrl = it }, singleLine = true, label = { Text("https://...") }, shape = RoundedCornerShape(16.dp), colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
-            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrectEnabled = false, keyboardType = KeyboardType.Uri)) },
-        confirmButton = { TextButton({
-            val clean = serverUrl.trim().trimEnd('/')
-            if (clean.startsWith("https://") || clean.startsWith("http://")) { api.base = clean; prefs.edit().putString("api_base_url", clean).apply(); message = null; serverDialog = false }
-        }) { Text("حفظ") } },
-        dismissButton = { TextButton({ serverDialog = false }) { Text("إلغاء") } }
-    )
+
 }
 
 @Composable fun fieldColors() = OutlinedTextFieldDefaults.colors(
@@ -365,11 +378,11 @@ fun MainShell(api: Api, activity: MainActivity, themeDark: Boolean, toggleTheme:
     val nav = listOf(
         Nav("الرئيسية", MmIcons.Home, 0), Nav("الراوترات", MmIcons.Router, 1),
         Nav("الباقات", MmIcons.Gauge, 2), Nav("الكروت", MmIcons.Ticket, 3),
-        Nav("المتجر", MmIcons.Store, 4), Nav("المبيعات", MmIcons.Money, 5),
+        Nav("Store Max", MmIcons.Store, 4), Nav("المبيعات", MmIcons.Money, 5),
         Nav("التقارير", MmIcons.Chart, 6), Nav("الأمان", MmIcons.Shield, 7),
         Nav("الشبكة", MmIcons.Network, 8), Nav("الإعدادات", MmIcons.Sliders, 9),
         Nav("HTML HotSpot", MmIcons.Code, 10), Nav("طرفية RouterOS", MmIcons.Terminal, 11),
-        Nav("استوديو الكروت", MmIcons.Palette, 12), Nav("محرر الواجهات", MmIcons.Web, 13), Nav("التحكم الذكي", MmIcons.Sparkle, 14), Nav("تقارير الكروت", MmIcons.Layers, 15)
+        Nav("استوديو الكروت", MmIcons.Palette, 12), Nav("محرر الواجهات", MmIcons.Web, 13), Nav("التحكم الذكي", MmIcons.Sparkle, 14), Nav("تقارير الكروت", MmIcons.Layers, 15), Nav("قوالب Login", MmIcons.Web, 16), Nav("مستخدمو HotSpot", MmIcons.Users, 17), Nav("خريطة الشبكة", MmIcons.Network, 18)
     )
     var page by remember { mutableIntStateOf(0) }
     var moreOpen by remember { mutableStateOf(false) }
@@ -405,7 +418,7 @@ fun MainShell(api: Api, activity: MainActivity, themeDark: Boolean, toggleTheme:
                     users = JSONArray()
                 }
                 error = null
-            } catch (e: Exception) { error = e.message ?: "تعذر تحميل البيانات" }
+            } catch (e: Exception) { error = authError(e.message ?: "تعذر تحميل البيانات") }
             finally { refreshing = false }
         }
     }
@@ -482,13 +495,16 @@ fun MainShell(api: Api, activity: MainActivity, themeDark: Boolean, toggleTheme:
                         6 -> ReportsPage(api)
                         7 -> SecurityPage(api)
                         8 -> NetworkPage(api, selected)
-                        9 -> SettingsPage(themeDark, toggleTheme, api.base, { newUrl -> api.base = newUrl; sessionPrefs.edit().putString("api_base_url", newUrl).apply(); refresh() }, onLogout)
+                        9 -> SettingsPage(api, themeDark, toggleTheme, onLogout)
                         10 -> HotspotEditorPage(api, selected)
                         11 -> TerminalPage(api, selected)
                         12 -> DesignStudioPage(api, selected, activity, chosenTemplate)
                         13 -> HotspotVisualEditorPage(api, selected)
                         14 -> SmartControlPage(api, selected, { page = 11 }, { page = 8 }, { page = 3 })
                         15 -> CardReportsPage(api, routers, selected)
+                        16 -> LoginTemplatesPage(api, selected, sessionPrefs)
+                        17 -> HotspotUsersPage(api, selected)
+                        18 -> NetworkMapPage(api, selected)
                     }
                 }
             }
@@ -511,10 +527,10 @@ fun MainShell(api: Api, activity: MainActivity, themeDark: Boolean, toggleTheme:
     if (moreOpen) ModalBottomSheet(onDismissRequest = { moreOpen = false }, containerColor = colors.surface) {
         Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 30.dp), verticalArrangement = Arrangement.spacedBy(15.dp)) {
             PageHeading("مركز العمليات", "كل الأدوات", "انتقل بسرعة إلى أي جزء من النظام")
-            val extra = listOf(nav[2], nav[5], nav[6], nav[15], nav[12], nav[13], nav[14], nav[8], nav[7], nav[10], nav[11], nav[9])
+            val extra = listOf(nav[2], nav[5], nav[6], nav[15], nav[17], nav[18], nav[12], nav[13], nav[14], nav[8], nav[7], nav[10], nav[16], nav[11], nav[9])
             extra.chunked(3).forEach { row ->
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                    row.forEach { item -> ActionTile(item.icon, item.title, when (item.page) { 5 -> Link; 12, 13 -> Violet; 6 -> Activity; 7 -> Fault; 8 -> DataBlue; else -> Signal }, Modifier.weight(1f)) { page = item.page; moreOpen = false } }
+                    row.forEach { item -> ActionTile(item.icon, item.title, when (item.page) { 5 -> Link; 12, 13, 16 -> Violet; 6 -> Activity; 7 -> Fault; 8 -> DataBlue; else -> Signal }, Modifier.weight(1f)) { page = item.page; moreOpen = false } }
                     repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
                 }
             }
@@ -543,7 +559,8 @@ fun DashboardPage(
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 17.dp),
         verticalArrangement = Arrangement.spacedBy(17.dp), contentPadding = PaddingValues(top = 17.dp, bottom = 30.dp)) {
         item { DashboardHeader() }
-        error?.let { item { ErrorCard(it) } }
+        // Local onboarding must remain usable even when the cloud DNS is unavailable.
+        if (routers.length() > 0) error?.let { item { ErrorCard(it) } }
         item { if (selected != null && dash != null) RouterHeroCard(selected, resource, cpu, ram, storage, dash) else EmptyRouterCard(add) }
         if (selected != null) item { InsightsPanel(dash) { openPage(8) } }
         if (selected != null && dash != null) {
@@ -739,7 +756,7 @@ fun CardPreviewDialog(c: JSONObject, close: () -> Unit, print: (Bitmap) -> Unit)
 
 fun generateCode(value:String,format:BarcodeFormat,w:Int,h:Int):Bitmap?{return try{val hints=mapOf(EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,EncodeHintType.MARGIN to 1);val m:BitMatrix=MultiFormatWriter().encode(value,format,w,h,hints);val bmp=Bitmap.createBitmap(w,h,Bitmap.Config.ARGB_8888);for(x in 0 until w)for(y in 0 until h)bmp.setPixel(x,y,if(m[x,y])android.graphics.Color.BLACK else android.graphics.Color.WHITE);bmp}catch(_:Exception){null}}
 
-fun MainActivity.printBitmap(bitmap:Bitmap){try{androidx.print.PrintHelper(this).apply{scaleMode=androidx.print.PrintHelper.SCALE_MODE_FIT}.printBitmap("MICRO-MAX Card",bitmap)}catch(e:Exception){Toast.makeText(this,e.message?:"تعذر فتح الطباعة",Toast.LENGTH_LONG).show()}}
+fun MainActivity.printBitmap(bitmap:Bitmap){try{androidx.print.PrintHelper(this).apply{scaleMode=androidx.print.PrintHelper.SCALE_MODE_FIT}.printBitmap("MICROMAX Card",bitmap)}catch(e:Exception){Toast.makeText(this,e.message?:"تعذر فتح الطباعة",Toast.LENGTH_LONG).show()}}
 
 fun composeCardBitmap(c:JSONObject):Bitmap?{val qr=generateCode(c.optString("qrContent"),BarcodeFormat.QR_CODE,520,520)?:return null;val bar=generateCode(c.optString("username"),BarcodeFormat.CODE_128,700,150)?:return null;val out=Bitmap.createBitmap(900,900,Bitmap.Config.ARGB_8888);val canvas=android.graphics.Canvas(out);canvas.drawColor(android.graphics.Color.WHITE);val p=android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);p.color=android.graphics.Color.BLACK;p.typeface=android.graphics.Typeface.DEFAULT_BOLD;p.textSize=30f;canvas.drawText(c.optString("profile",c.optString("plan","WiFi Access")),40f,65f,p);p.strokeWidth=2f;canvas.drawRect(40f,84f,860f,87f,p);p.typeface=android.graphics.Typeface.DEFAULT;p.textSize=24f;val pinM=c.optString("passwordMode")=="pin";canvas.drawText("${if(pinM)"الكود" else "اسم المستخدم"}  ${c.optString("username")}",40f,135f,p);if(!pinM)canvas.drawText("كلمة المرور  ${c.optString("password")}",40f,175f,p);val wqr=c.optString("wifiQr").let{if(it.isBlank())null else generateCode(it,BarcodeFormat.QR_CODE,520,520)};if(wqr!=null){p.textSize=22f;canvas.drawText("1) اتصال بالشبكة",60f,205f,p);canvas.drawText("2) تسجيل الدخول",480f,205f,p);canvas.drawBitmap(wqr,null,android.graphics.Rect(60,220,420,580),p);canvas.drawBitmap(qr,null,android.graphics.Rect(480,220,840,580),p)}else{canvas.drawBitmap(qr,null,android.graphics.Rect(190,220,710,740),p)};canvas.drawBitmap(bar,null,android.graphics.Rect(100,765,800,850),p);return out}
 
@@ -763,24 +780,6 @@ fun SecurityPage(api: Api) {
         LazyColumn(Modifier.fillMaxSize(),verticalArrangement=Arrangement.spacedBy(8.dp),contentPadding=PaddingValues(top=12.dp)){items((0 until data.length()).map{data.getJSONObject(it)}){o->GlassCard{Text(if(tab==0)o.optString("email","-") else o.optString("action","-"),fontWeight=FontWeight.Bold);Text(if(tab==0)o.optString("role","staff") else "${o.optString("entity")} • ${o.optString("created_at")}",color=TextMuted)}}}
     }
 }
-
-@Composable
-fun NetworkPage(api: Api, router: JSONObject?) {
-    var tab by remember { mutableIntStateOf(0) }
-    var data by remember { mutableStateOf(JSONArray()) }
-    var err by remember { mutableStateOf<String?>(null) }
-    val scope=rememberCoroutineScope()
-    val names=listOf("Interfaces","DHCP","ARP","DNS","IP","Routes","Firewall","Queues","Logs","IP Bindings")
-    val paths=listOf("interfaces","dhcp-leases","arp","dns-static","ip-addresses","routes","firewall","queues","logs","ip-bindings")
-    LaunchedEffect(router?.optString("id"),tab){ if(router!=null) scope.launch{ try{val o=JSONObject(api.get("/api/routers/${router.optString("id")}/network/${paths[tab]}"));data=o.optJSONArray("items")?:JSONArray();err=null}catch(e:Exception){err=e.message}} }
-    Column(Modifier.fillMaxSize().padding(12.dp)){
-        Text("أدوات الشبكة",fontSize=27.sp,fontWeight=FontWeight.Black); Text(router?.optString("name")?:"اختر راوتر",color=TextMuted)
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)){names.forEachIndexed{i,n->FilterChip(tab==i,{tab=i},{Text(n,fontSize=11.sp)})}}
-        err?.let{ErrorCard(it)}
-        LazyColumn(Modifier.fillMaxSize(),verticalArrangement=Arrangement.spacedBy(8.dp),contentPadding=PaddingValues(vertical=10.dp)){items((0 until data.length()).map{data.getJSONObject(it)}){o->GlassCard{val title=o.optString("name",o.optString("address",o.optString("dst-address",o.optString("message","-"))));Text(title,fontWeight=FontWeight.Bold);Text(o.toString().removePrefix("{").removeSuffix("}").take(260),fontSize=11.sp,color=TextMuted)}}}
-    }
-}
-
 
 @Composable
 fun TerminalPage(api: Api, router: JSONObject?) {
@@ -849,21 +848,100 @@ fun HotspotEditorPage(api: Api, router: JSONObject?) {
     }
 }
 
-@Composable fun SettingsPage(dark:Boolean,toggle:()->Unit,apiBase:String,onApiChange:(String)->Unit,onLogout:()->Unit){
-    var newApi by remember(apiBase){mutableStateOf(apiBase)}
+@Composable fun SettingsPage(api: Api, dark:Boolean,toggle:()->Unit,onLogout:()->Unit){
     val cs=MaterialTheme.colorScheme
+    var account by remember { mutableStateOf<JSONObject?>(null) }
+    var features by remember { mutableStateOf<JSONObject?>(null) }
+    var store by remember { mutableStateOf(JSONArray()) }
+    var owned by remember { mutableStateOf(JSONArray()) }
+    var loading by remember { mutableStateOf(true) }
+    var busyItem by remember { mutableStateOf<String?>(null) }
+    var accountError by remember { mutableStateOf<String?>(null) }
+    val scope=rememberCoroutineScope()
+    fun loadAccount() {
+        scope.launch {
+            loading=true; accountError=null
+            try {
+                account=JSONObject(api.get("/api/me"))
+                val featureResponse=JSONObject(api.get("/api/features"))
+                features=featureResponse
+                store=JSONObject(api.get("/api/store")).optJSONArray("items") ?: JSONArray()
+                owned=JSONObject(api.get("/api/store/my")).optJSONArray("items") ?: JSONArray()
+            } catch(e:Exception) { accountError=authError(e.message ?: "تعذر تحميل بيانات الحساب") }
+            finally { loading=false }
+        }
+    }
+    LaunchedEffect(Unit) { loadAccount() }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal=16.dp,vertical=8.dp),verticalArrangement=Arrangement.spacedBy(14.dp)){
-        PageHeading("الحساب","الإعدادات","المظهر والخادم والجلسة")
-        GlassCard{
-            Row(verticalAlignment=Alignment.CenterVertically){SymbolTile(MmIcons.Moon,Violet,size=40.dp);Spacer(Modifier.width(12.dp));Column(Modifier.weight(1f)){Text("الوضع الداكن",style=MaterialTheme.typography.titleMedium);Text("يريح العين في الإضاءة المنخفضة",style=MaterialTheme.typography.bodySmall,color=cs.onSurfaceVariant)};Switch(dark,{toggle()})}
+        PageHeading("الحساب","الإعدادات","الجلسة والحماية ومزايا MICROMAX")
+        GlassCard {
+            Row(verticalAlignment=Alignment.CenterVertically) {
+                SymbolTile(MmIcons.Person, Signal, size=40.dp)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(account?.optString("display_name").orEmpty().ifBlank { account?.optString("email", "حساب MICROMAX") ?: "حساب MICROMAX" }, style=MaterialTheme.typography.titleMedium)
+                    Text(account?.optString("email", "جارٍ تحميل الحساب…") ?: "جارٍ تحميل الحساب…", style=MaterialTheme.typography.bodySmall, color=cs.onSurfaceVariant)
+                }
+                StatusPill(if(loading) "جاري التحقق" else "نشط", !loading)
+            }
+            accountError?.let { Text(it, color=Fault, style=MaterialTheme.typography.bodySmall) }
+            TextButton(onClick={loadAccount()}, enabled=!loading, modifier=Modifier.align(Alignment.End)) { Text("تحديث بيانات الحساب") }
+        }
+        GlassCard {
+            Row(verticalAlignment=Alignment.CenterVertically) {
+                SymbolTile(MmIcons.Store, Violet, size=40.dp)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    val required=features?.optBoolean("subscriptionRequired", false) ?: false
+                    Text("الاشتراك والمزايا", style=MaterialTheme.typography.titleMedium)
+                    Text(if(required) "يتطلب هذا الحساب خطة مفعّلة للوصول إلى بعض المزايا." else "الوصول الحالي مجاني ولا يتطلب اشتراكًا مدفوعًا.", style=MaterialTheme.typography.bodySmall, color=cs.onSurfaceVariant)
+                }
+                StatusPill(if(features?.optBoolean("paymentsEnabled", false)==true) "الدفع متاح" else "مجاني", true)
+            }
+            HorizontalDivider(color=cs.outlineVariant)
+            val flags=features?.optJSONObject("features")
+            listOf(
+                "إدارة الراوترات" to (flags?.optBoolean("routerManagement", false) ?: false),
+                "توليد الكروت وQR" to (flags?.optBoolean("hotspotCards", false) ?: false),
+                "محرر login.html وstatus.html" to (flags?.optBoolean("hotspotLoginEditor", false) ?: false),
+                "التقارير والنسخ الاحتياطي" to (flags?.optBoolean("reports", false) ?: false)
+            ).forEach { (label, enabled) ->
+                Row(verticalAlignment=Alignment.CenterVertically) {
+                    Icon(if(enabled) MmIcons.Check else Icons.Outlined.Lock, null, Modifier.size(17.dp), tint=if(enabled) Link else cs.onSurfaceVariant)
+                    Spacer(Modifier.width(8.dp)); Text(label, style=MaterialTheme.typography.bodySmall, color=cs.onSurfaceVariant)
+                }
+            }
+        }
+        if (store.length() > 0) {
+            GlassCard {
+                Text("Store Max", style=MaterialTheme.typography.titleMedium)
+                Text("فعّل القوالب والإضافات داخل حسابك. التفعيل الحالي لا ينفذ دفعًا.", style=MaterialTheme.typography.bodySmall, color=cs.onSurfaceVariant)
+                for(i in 0 until store.length()) {
+                    val item=store.optJSONObject(i) ?: continue
+                    val id=item.optString("id")
+                    val isOwned=(0 until owned.length()).any { owned.optJSONObject(it)?.optString("id")==id }
+                    Row(verticalAlignment=Alignment.CenterVertically, modifier=Modifier.fillMaxWidth()) {
+                        Column(Modifier.weight(1f)) { Text(item.optString("name", "إضافة"), fontWeight=FontWeight.Bold); Text(item.optString("description"), style=MaterialTheme.typography.bodySmall, color=cs.onSurfaceVariant, maxLines=2, overflow=TextOverflow.Ellipsis) }
+                        if(isOwned) StatusPill("مفعّل", true) else Button(onClick={
+                            scope.launch { busyItem=id; try { api.post("/api/store/$id/activate"); loadAccount() } catch(e:Exception) { accountError=authError(e.message ?: "تعذر التفعيل") } finally { busyItem=null } }
+                        }, enabled=busyItem==null, contentPadding=PaddingValues(horizontal=12.dp, vertical=6.dp)) { Text(if(busyItem==id) "…" else "تفعيل") }
+                    }
+                }
+            }
         }
         GlassCard{
-            Row(verticalAlignment=Alignment.CenterVertically){SymbolTile(MmIcons.Cloud,Signal,size=40.dp);Spacer(Modifier.width(12.dp));Column(Modifier.weight(1f)){Text("خادم MICRO-MAX",style=MaterialTheme.typography.titleMedium);Text("يجب أن يبدأ الرابط بـ https",style=MaterialTheme.typography.bodySmall,color=cs.onSurfaceVariant)}}
-            OutlinedTextField(newApi,{newApi=it},label={Text("رابط الخادم")},singleLine=true,modifier=Modifier.fillMaxWidth(),shape=RoundedCornerShape(16.dp),colors=fieldColors())
-            Button(onClick={val clean=newApi.trim().trimEnd('/');if(clean.startsWith("http://")||clean.startsWith("https://"))onApiChange(clean)},modifier=Modifier.fillMaxWidth().height(50.dp),shape=RoundedCornerShape(16.dp)){Icon(MmIcons.Check,null,Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text("حفظ واختبار الخادم")}
+            Row(verticalAlignment=Alignment.CenterVertically){
+                SymbolTile(if(dark) MmIcons.Moon else Icons.Outlined.LightMode,Violet,size=40.dp)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)){Text(if(dark) "الوضع الداكن" else "الوضع الفاتح",style=MaterialTheme.typography.titleMedium);Text("يمكنك التبديل من هنا، والوضع الداكن هو الافتراضي.",style=MaterialTheme.typography.bodySmall,color=cs.onSurfaceVariant)}
+                Switch(checked=dark,onCheckedChange={toggle()})
+            }
         }
         GlassCard{
-            Row(verticalAlignment=Alignment.CenterVertically){NetworkBadge(size=40.dp);Spacer(Modifier.width(12.dp));Column(Modifier.weight(1f)){Text("MICRO-MAX",style=MaterialTheme.typography.titleMedium);Text("إدارة MikroTik عبر RouterOS API / API-SSL",style=MaterialTheme.typography.bodySmall,color=cs.onSurfaceVariant)}}
+            Row(verticalAlignment=Alignment.CenterVertically){SymbolTile(MmIcons.Cloud,Signal,size=40.dp);Spacer(Modifier.width(12.dp));Column(Modifier.weight(1f)){Text("الخدمة السحابية",style=MaterialTheme.typography.titleMedium);Text("اتصال آمن مُدار تلقائيًا — لا حاجة لإظهار الرابط",style=MaterialTheme.typography.bodySmall,color=cs.onSurfaceVariant)};StatusPill("محمي")}
+        }
+        GlassCard{
+            Row(verticalAlignment=Alignment.CenterVertically){NetworkBadge(size=40.dp);Spacer(Modifier.width(12.dp));Column(Modifier.weight(1f)){Text("MICROMAX",style=MaterialTheme.typography.titleMedium);Text("إدارة MikroTik عبر RouterOS API / API-SSL",style=MaterialTheme.typography.bodySmall,color=cs.onSurfaceVariant)}}
             HorizontalDivider(color=cs.outlineVariant)
             listOf("عدة راوترات وربط بنقرة من الهاتف","Profiles وباقات وأسعار","كروت QR تتصل تلقائيًا + طباعة A4","متجر قوالب ومحرر HotSpot","مبيعات وتقارير وأمان وتدقيق").forEach{Row(verticalAlignment=Alignment.CenterVertically){Icon(MmIcons.Check,null,Modifier.size(16.dp),tint=Link);Spacer(Modifier.width(8.dp));Text(it,style=MaterialTheme.typography.bodySmall,color=cs.onSurfaceVariant)}}
         }
@@ -873,7 +951,7 @@ fun HotspotEditorPage(api: Api, router: JSONObject?) {
 
 @Composable
 fun AddRouterDialog(api:Api,onSaved:()->Unit,onCancel:()->Unit,initialMode:String="local"){val ctx=LocalContext.current;
-    var step by remember{mutableIntStateOf(0)};var mode by remember{mutableStateOf(initialMode)};var name by remember{mutableStateOf("")};var host by remember{mutableStateOf(if(initialMode=="local")"192.168.88.1" else "")};var port by remember{mutableStateOf(if(initialMode=="public")"8729" else "8728")};var user by remember{mutableStateOf("admin")};var pass by remember{mutableStateOf("")};var tls by remember{mutableStateOf(initialMode=="public")};var packageName by remember{mutableStateOf("اقتصادية")};var download by remember{mutableStateOf("2M")};var upload by remember{mutableStateOf("1M")};var duration by remember{mutableStateOf("60")};var packagePrice by remember{mutableStateOf("500")};var sharedUsers by remember{mutableStateOf("1")};var busy by remember{mutableStateOf(false)};var diagnostic by remember{mutableStateOf<String?>(null)};var discovered by remember{mutableStateOf<List<String>>(emptyList())};var tested by remember{mutableStateOf(false)};var err by remember{mutableStateOf<String?>(null)};val scope=rememberCoroutineScope()
+    var step by remember{mutableIntStateOf(0)};var protocol by remember{mutableStateOf("api")};var mode by remember{mutableStateOf(initialMode)};var name by remember{mutableStateOf("")};var host by remember{mutableStateOf(if(initialMode=="local")"192.168.88.1" else "")};var port by remember{mutableStateOf(if(initialMode=="public")"8729" else "8728")};var user by remember{mutableStateOf("admin")};var pass by remember{mutableStateOf("")};var tls by remember{mutableStateOf(initialMode=="public")};var packageName by remember{mutableStateOf("اقتصادية")};var download by remember{mutableStateOf("2M")};var upload by remember{mutableStateOf("1M")};var duration by remember{mutableStateOf("60")};var packagePrice by remember{mutableStateOf("500")};var sharedUsers by remember{mutableStateOf("1")};var busy by remember{mutableStateOf(false)};var diagnostic by remember{mutableStateOf<String?>(null)};var discovered by remember{mutableStateOf<List<String>>(emptyList())};var tested by remember{mutableStateOf(false)};var err by remember{mutableStateOf<String?>(null)};val scope=rememberCoroutineScope()
     fun payload()=JSONObject().put("name",name.trim()).put("host",host.trim()).put("port",port.toIntOrNull()?:8728).put("username",user.trim()).put("password",pass).put("tls",tls)
     val canContinue = when(step){0 -> name.isNotBlank(); 1 -> host.isNotBlank()&&user.isNotBlank()&&pass.isNotBlank(); 2 -> packageName.isNotBlank()&&download.isNotBlank()&&upload.isNotBlank()&&duration.toIntOrNull()!=null; else -> tested}
     AlertDialog(onDismissRequest=onCancel, containerColor=MaterialTheme.colorScheme.surface, shape=RoundedCornerShape(28.dp), title={
@@ -885,15 +963,15 @@ fun AddRouterDialog(api:Api,onSaved:()->Unit,onCancel:()->Unit,initialMode:Strin
         Text("الخطوة ${step+1} من 4",fontSize=11.sp,color=Accent,fontWeight=FontWeight.Bold)
         when(step){
             0->{Text("سمِّ الراوتر",style=MaterialTheme.typography.titleMedium);Text("سيظهر هذا الاسم في لوحة التحكم وقائمة الراوترات.",fontSize=12.sp,color=TextMuted);AppField(name,{name=it},"اسم واضح، مثل الفرع الرئيسي",MmIcons.Tag)}
-            1->{Text("كيف سيتصل التطبيق؟",style=MaterialTheme.typography.titleMedium);Text("اختر نوع الشبكة ثم أدخل بيانات RouterOS. لا يتم حفظ كلمة المرور إلا داخل الخادم.",fontSize=12.sp,color=TextMuted);Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilterChip(selected=mode=="local",onClick={mode="local";if(host.isBlank())host="192.168.88.1"},label={Text("شبكة محلية")},leadingIcon={Icon(MmIcons.Home,null)});FilterChip(selected=mode=="public",onClick={mode="public";if(host=="192.168.88.1")host=""},label={Text("عنوان عام")},leadingIcon={Icon(MmIcons.Cloud,null)})};if(mode=="local"){Text("تنبيه: هذا الخيار يعمل فقط إذا كان الـ Backend نفسه داخل شبكة الراوتر. خادم Render لا يصل إلى 192.168.x.x. للراوتر البعيد ارجع واختر Agent.",fontSize=11.sp,color=Activity);OutlinedButton(onClick={scope.launch{diagnostic="جاري اكتشاف MikroTik من Backend…";try{val o=JSONObject(api.post("/api/routers/discover",JSONObject().put("network","192.168.88.0/24").toString()));val a=o.optJSONArray("routers");discovered=(0 until (a?.length()?:0)).map{a!!.getJSONObject(it).optString("host")+":"+a.getJSONObject(it).optInt("port")};diagnostic=if(discovered.isEmpty())"لم يتم العثور على API في 192.168.88.0/24" else "تم العثور على ${discovered.size} جهاز MikroTik"}catch(e:Exception){diagnostic=routerConnectionMessage(e.message?:"فشل الاكتشاف")}}},enabled=!busy,modifier=Modifier.fillMaxWidth()){Icon(Icons.Outlined.Radar,null);Spacer(Modifier.width(6.dp));Text("اكتشاف MikroTik تلقائيًا")};discovered.forEach{found->FilterChip(selected=host==found.substringBefore(":"),onClick={host=found.substringBefore(":");port=found.substringAfter(":");tls=port=="8729"},label={Text("راوتر $found")},leadingIcon={Icon(MmIcons.Router,null)})}};AppField(host,{host=it},if(mode=="local")"IP الراوتر، مثال 192.168.88.1" else "Hostname أو IP عام",MmIcons.Cloud);Text("المنفذ",fontSize=12.sp,color=TextMuted,fontWeight=FontWeight.Bold);Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilterChip(selected=port=="8729",onClick={port="8729";tls=true},label={Text("8729 • API-SSL")});FilterChip(selected=port=="8728",onClick={port="8728";tls=false},label={Text("8728 • API")})};OutlinedTextField(user,{user=it},label={Text("اسم المستخدم")},leadingIcon={Icon(MmIcons.Person,null)},keyboardOptions=KeyboardOptions(capitalization=KeyboardCapitalization.None,autoCorrectEnabled=false,keyboardType=KeyboardType.Ascii),modifier=Modifier.fillMaxWidth(),singleLine=true,shape=RoundedCornerShape(16.dp),colors=fieldColors());OutlinedTextField(pass,{pass=it},label={Text("كلمة مرور MikroTik")},leadingIcon={Icon(MmIcons.Lock,null)},keyboardOptions=KeyboardOptions(capitalization=KeyboardCapitalization.None,autoCorrectEnabled=false,keyboardType=KeyboardType.Password),shape=RoundedCornerShape(16.dp),visualTransformation=PasswordVisualTransformation(),modifier=Modifier.fillMaxWidth(),singleLine=true,colors=fieldColors());Row(verticalAlignment=Alignment.CenterVertically){Checkbox(tls,{tls=it;port=if(it)"8729" else "8728"});Text("تشفير API-SSL موصى به للإنتاج")};OutlinedButton(onClick={scope.launch{diagnostic="جاري الفحص من Backend…";try{diagnostic=formatRouterDiagnostic(JSONObject(api.post("/api/routers/diagnose",payload().toString())))}catch(e:Exception){diagnostic=routerConnectionMessage(e.message?:"فشل التشخيص")}}},enabled=!busy,modifier=Modifier.fillMaxWidth()){Icon(Icons.Outlined.NetworkCheck,null);Spacer(Modifier.width(6.dp));Text("تشخيص الشبكة من Backend")};diagnostic?.let{Text(it,fontSize=11.sp,color=if(it.startsWith("نجح"))Green else Amber)};if(tested) Text("تم اختبار الاتصال بنجاح",color=Green,fontWeight=FontWeight.Bold)}
-            2->{Text("أنشئ أول باقة",style=MaterialTheme.typography.titleMedium);Text("سيتم إنشاء Profile في MikroTik وPlan للبيع داخل MICRO-MAX.",fontSize=12.sp,color=TextMuted);AppField(packageName,{packageName=it},"اسم الباقة، مثل اقتصادية أو VIP",MmIcons.Tag);Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){Box(Modifier.weight(1f)){AppField(download,{download=it},"Download، مثال 2M",MmIcons.Download)};Box(Modifier.weight(1f)){AppField(upload,{upload=it},"Upload، مثال 1M",Icons.Outlined.Upload)}};Text("سرعات جاهزة",fontSize=12.sp,color=TextMuted,fontWeight=FontWeight.Bold);Row(horizontalArrangement=Arrangement.spacedBy(6.dp)){listOf("1M/512K","2M/1M","5M/2M","10M/5M").forEach{speed->FilterChip(selected=download+"/"+upload==speed,onClick={val p=speed.split("/");download=p[0];upload=p[1]},label={Text(speed)})}};Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){Box(Modifier.weight(1f)){AppField(duration,{duration=it.filter(Char::isDigit)},"المدة بالدقائق",MmIcons.Timer)};Box(Modifier.weight(1f)){AppField(packagePrice,{packagePrice=it.filter(Char::isDigit)},"السعر XOF",MmIcons.Money)}};AppField(sharedUsers,{sharedUsers=it.filter(Char::isDigit)},"عدد الأجهزة المسموحة",MmIcons.Users)}
+            1->{Text("كيف سيتصل التطبيق؟",style=MaterialTheme.typography.titleMedium);Text("اختر نوع الشبكة والبروتوكول ثم أدخل بيانات RouterOS.",fontSize=12.sp,color=TextMuted);Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(4.dp)){listOf("api" to "API", "rest" to "REST API", "ssh" to "SSH").forEach{(key,label)->FilterChip(selected=protocol==key,onClick={protocol=key;port=when(key){"rest"->"443";"ssh"->"22";else->if(tls)"8729" else "8728"}},label={Text(label,fontSize=11.sp)},modifier=Modifier.weight(1f))}};if(protocol!="api"){Text(if(protocol=="rest")"REST API عبر HTTPS (443) — تأكد من تفعيل www-ssl/WebFig في RouterOS." else "SSH (22) — يستخدم للأوامر المتقدمة من طرفية RouterOS.",fontSize=11.sp,color=Amber)};Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilterChip(selected=mode=="local",onClick={mode="local";if(host.isBlank())host="192.168.88.1"},label={Text("شبكة محلية")},leadingIcon={Icon(MmIcons.Home,null)});FilterChip(selected=mode=="public",onClick={mode="public";if(host=="192.168.88.1")host=""},label={Text("عنوان عام")},leadingIcon={Icon(MmIcons.Cloud,null)})};if(mode=="local"){Text("تنبيه: هذا الخيار يعمل فقط إذا كان الـ Backend نفسه داخل شبكة الراوتر. خادم Render لا يصل إلى 192.168.x.x. للراوتر البعيد ارجع واختر Agent.",fontSize=11.sp,color=Activity);OutlinedButton(onClick={scope.launch{diagnostic="جاري اكتشاف MikroTik من Backend…";try{val o=JSONObject(api.post("/api/routers/discover",JSONObject().put("network","192.168.88.0/24").toString()));val a=o.optJSONArray("routers");discovered=(0 until (a?.length()?:0)).map{a!!.getJSONObject(it).optString("host")+":"+a.getJSONObject(it).optInt("port")};diagnostic=if(discovered.isEmpty())"لم يتم العثور على API في 192.168.88.0/24" else "تم العثور على ${discovered.size} جهاز MikroTik"}catch(e:Exception){diagnostic=routerConnectionMessage(e.message?:"فشل الاكتشاف")}}},enabled=!busy,modifier=Modifier.fillMaxWidth()){Icon(Icons.Outlined.Radar,null);Spacer(Modifier.width(6.dp));Text("اكتشاف MikroTik تلقائيًا")};discovered.forEach{found->FilterChip(selected=host==found.substringBefore(":"),onClick={host=found.substringBefore(":");port=found.substringAfter(":");tls=port=="8729"},label={Text("راوتر $found")},leadingIcon={Icon(MmIcons.Router,null)})}};AppField(host,{host=it},if(mode=="local")"IP الراوتر، مثال 192.168.88.1" else "Hostname أو IP عام",MmIcons.Cloud);Text("المنفذ",fontSize=12.sp,color=TextMuted,fontWeight=FontWeight.Bold);Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilterChip(selected=port=="8729",onClick={port="8729";tls=true},label={Text("8729 • API-SSL")});FilterChip(selected=port=="8728",onClick={port="8728";tls=false},label={Text("8728 • API")})};OutlinedTextField(user,{user=it},label={Text("اسم المستخدم")},leadingIcon={Icon(MmIcons.Person,null)},keyboardOptions=KeyboardOptions(capitalization=KeyboardCapitalization.None,autoCorrectEnabled=false,keyboardType=KeyboardType.Ascii),modifier=Modifier.fillMaxWidth(),singleLine=true,shape=RoundedCornerShape(16.dp),colors=fieldColors());OutlinedTextField(pass,{pass=it},label={Text("كلمة مرور MikroTik")},leadingIcon={Icon(MmIcons.Lock,null)},keyboardOptions=KeyboardOptions(capitalization=KeyboardCapitalization.None,autoCorrectEnabled=false,keyboardType=KeyboardType.Password),shape=RoundedCornerShape(16.dp),visualTransformation=PasswordVisualTransformation(),modifier=Modifier.fillMaxWidth(),singleLine=true,colors=fieldColors());Row(verticalAlignment=Alignment.CenterVertically){Checkbox(tls,{tls=it;port=if(it)"8729" else "8728"});Text("تشفير API-SSL موصى به للإنتاج")};OutlinedButton(onClick={scope.launch{diagnostic="جاري الفحص من Backend…";try{diagnostic=formatRouterDiagnostic(JSONObject(api.post("/api/routers/diagnose",payload().toString())))}catch(e:Exception){diagnostic=routerConnectionMessage(e.message?:"فشل التشخيص")}}},enabled=!busy,modifier=Modifier.fillMaxWidth()){Icon(Icons.Outlined.NetworkCheck,null);Spacer(Modifier.width(6.dp));Text("تشخيص الشبكة من Backend")};diagnostic?.let{Text(it,fontSize=11.sp,color=if(it.startsWith("نجح"))Green else Amber)};if(tested) Text("تم اختبار الاتصال بنجاح",color=Green,fontWeight=FontWeight.Bold)}
+            2->{Text("أنشئ أول باقة",style=MaterialTheme.typography.titleMedium);Text("سيتم إنشاء Profile في MikroTik وPlan للبيع داخل MICROMAX.",fontSize=12.sp,color=TextMuted);AppField(packageName,{packageName=it},"اسم الباقة، مثل اقتصادية أو VIP",MmIcons.Tag);Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){Box(Modifier.weight(1f)){AppField(download,{download=it},"Download، مثال 2M",MmIcons.Download)};Box(Modifier.weight(1f)){AppField(upload,{upload=it},"Upload، مثال 1M",Icons.Outlined.Upload)}};Text("سرعات جاهزة",fontSize=12.sp,color=TextMuted,fontWeight=FontWeight.Bold);Row(horizontalArrangement=Arrangement.spacedBy(6.dp)){listOf("1M/512K","2M/1M","5M/2M","10M/5M").forEach{speed->FilterChip(selected=download+"/"+upload==speed,onClick={val p=speed.split("/");download=p[0];upload=p[1]},label={Text(speed)})}};Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){Box(Modifier.weight(1f)){AppField(duration,{duration=it.filter(Char::isDigit)},"المدة بالدقائق",MmIcons.Timer)};Box(Modifier.weight(1f)){AppField(packagePrice,{packagePrice=it.filter(Char::isDigit)},"السعر XOF",MmIcons.Money)}};AppField(sharedUsers,{sharedUsers=it.filter(Char::isDigit)},"عدد الأجهزة المسموحة",MmIcons.Users)}
             else->{Text("جاهز للحفظ",style=MaterialTheme.typography.titleMedium);Text("راجع الاتصال والباقة قبل إنشاء الإعدادات.",fontSize=12.sp,color=TextMuted);GlassCard{Text(name.ifBlank{"بدون اسم"},fontSize=17.sp,fontWeight=FontWeight.Bold);Text("${host.ifBlank{"-"}}:${port.ifBlank{"8729"}}",color=Accent);Text("${user.ifBlank{"-"}} • ${if(tls)"API-SSL آمن" else "API"}",color=TextMuted);HorizontalDivider();Text("الباقة: $packageName",fontWeight=FontWeight.Bold);Text("سرعة: $download تنزيل / $upload رفع • مدة: $duration دقيقة",color=Accent);Text("السعر: $packagePrice XOF • أجهزة: $sharedUsers",color=TextMuted);Text("سيتم اختبار الراوتر ثم إنشاء Profile وPlan تلقائيًا.",fontSize=12.sp,color=TextMuted)}}
         }
         err?.let{ErrorCard(routerConnectionMessage(it))}
     }},confirmButton={
         Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
             if(step>0)OutlinedButton({step--;err=null}){Text("رجوع")}
-            Button({scope.launch{busy=true;err=null;try{if(step==1){api.post("/api/routers/test",payload().toString());tested=true;step++}else if(step==3){val created=JSONObject(api.post("/api/routers",payload().toString()));val id=created.optString("id");try{val rate="$download/$upload";api.post("/api/routers/$id/hotspot-profiles",JSONObject().put("name",packageName).put("durationMinutes",duration.toIntOrNull()?:60).put("rateLimit",rate).put("sharedUsers",sharedUsers.toIntOrNull()?:1).toString());api.post("/api/routers/$id/plans",JSONObject().put("profileName",packageName).put("name",packageName).put("price",packagePrice.toDoubleOrNull()?:0.0).put("currency","XOF").toString())}catch(pe:Exception){Toast.makeText(ctx,"تم حفظ الراوتر، لكن تعذر إنشاء الباقة. أضفها من صفحة الباقات. (${pe.message?:""})",Toast.LENGTH_LONG).show()};onSaved()}else step++}catch(e:Exception){err=e.message?:"تعذر الاتصال أو إنشاء الباقة"}finally{busy=false}}},enabled=!busy && canContinue){Text(if(busy)"جاري التحقق…" else if(step==3)"حفظ الراوتر والباقة" else if(step==1)"اختبار الاتصال" else "متابعة")}
+            Button({scope.launch{busy=true;err=null;try{if(step==1){if(protocol!="api")throw IllegalStateException("اختبار REST وSSH يحتاج موصلًا مباشرًا مخصصًا؛ استخدم API أو افتح طرفية RouterOS من الخدمات.");api.post("/api/routers/test",payload().toString());tested=true;step++}else if(step==3){val created=JSONObject(api.post("/api/routers",payload().toString()));val id=created.optString("id");try{val rate="$download/$upload";api.post("/api/routers/$id/hotspot-profiles",JSONObject().put("name",packageName).put("durationMinutes",duration.toIntOrNull()?:60).put("rateLimit",rate).put("sharedUsers",sharedUsers.toIntOrNull()?:1).toString());api.post("/api/routers/$id/plans",JSONObject().put("profileName",packageName).put("name",packageName).put("price",packagePrice.toDoubleOrNull()?:0.0).put("currency","XOF").toString())}catch(pe:Exception){Toast.makeText(ctx,"تم حفظ الراوتر، لكن تعذر إنشاء الباقة. أضفها من صفحة الباقات. (${pe.message?:""})",Toast.LENGTH_LONG).show()};onSaved()}else step++}catch(e:Exception){err=e.message?:"تعذر الاتصال أو إنشاء الباقة"}finally{busy=false}}},enabled=!busy && canContinue){Text(if(busy)"جاري التحقق…" else if(step==3)"حفظ الراوتر والباقة" else if(step==1)"اختبار الاتصال" else "متابعة")}
         }
     },dismissButton={TextButton(onCancel){Text("إلغاء")}})
 }
@@ -920,7 +998,18 @@ fun formatRouterDiagnostic(o: JSONObject): String {
 
 fun routerConnectionMessage(raw: String): String {
     val s = raw.trim()
-    return when { s.contains("HOST_NOT_ALLOWED") -> "الخادم لا يستطيع الوصول إلى هذا العنوان (عنوان خاص أو محجوب). للراوتر داخل شبكتك استخدم «راوتر عن بعد — Agent»."; s.contains("PORT_NOT_ALLOWED") -> "المنفذ غير مسموح. المسموح 8728 و8729 فقط."; s.contains("CERT_PIN_MISMATCH") -> "بصمة شهادة الراوتر لا تطابق المحفوظة. إن غيّرت الشهادة أعد إضافة الراوتر ببصمة جديدة."; s.contains("PUBLIC_BASE_URL_REQUIRED") -> "لم يضبط PUBLIC_BASE_URL على الخادم (Render ← Environment)."; s.contains("timeout", true) && s.contains("connect", true) -> "تعذر الوصول إلى الخادم. الخطة المجانية في Render تنام بعد خمول، انتظر دقيقة ثم أعد المحاولة."; s.contains("404", true) -> "الـBackend يعمل بنسخة قديمة: أعد نشر Backend من GitHub ثم جرّب مرة أخرى."; s.contains("ECONNREFUSED", true) -> "رفض الراوتر الاتصال: فعّل خدمة API على 8728 وتأكد من IP والجدار الناري."; s.contains("ETIMEDOUT", true) || s.contains("TIMEOUT", true) -> "انتهت مهلة الاتصال: الهاتف والـBackend والراوتر يجب أن يكونوا على شبكة قابلة للوصول."; s.contains("AUTH", true) -> { val rm = Regex("\"routerMessage\"\\s*:\\s*\"([^\"]*)\"").find(s)?.groupValues?.get(1); "الراوتر رفض تسجيل الدخول" + (if (rm.isNullOrBlank()) "" else " (${rm})") + ". تأكد من اسم المستخدم كما هو في Winbox بالضبط، وأن مجموعته تملك سياسة api وأن حقل Address للمستخدم لا يحجب الخادم. سجل الراوتر (System ← Logs) يعرض سبب الرفض." }; s.contains("certificate", true) || s.contains("TLS", true) -> "خطأ شهادة TLS: استخدم API 8728 للاختبار المحلي أو ثبّت شهادة API-SSL."; else -> s }
+    return when {
+        s.contains("HOST_NOT_ALLOWED") -> "هذا عنوان محلي أو محجوب عن الخادم. إذا كنت على Wi‑Fi الراوتر اختر «اتصال محلي مثل WinBox» واستخدم عنوان Gateway؛ للراوتر البعيد استخدم Agent."
+        s.contains("PORT_NOT_ALLOWED") -> "المنفذ غير مسموح. المسموح 8728 و8729 فقط."
+        s.contains("CERT_PIN_MISMATCH") -> "بصمة شهادة TLS لا تطابق المحفوظة. أعد إضافة الراوتر بعد تغيير الشهادة."
+        s.contains("PUBLIC_BASE_URL_REQUIRED") -> "إعداد الخادم العام ناقص. يجب ضبط PUBLIC_BASE_URL في Backend."
+        s.contains("ETIMEDOUT", true) || s.contains("TIMEOUT", true) -> "انتهت مهلة TCP قبل تسجيل الدخول؛ هذه ليست مشكلة اسم مستخدم أو كلمة مرور. لم يصل الطلب إلى الراوتر. إذا كان الراوتر قريبًا استخدم اتصال محلي مثل WinBox وعنوان 192.168.x.x. إذا كان بعيدًا استخدم Agent. للاتصال العام تحقق من IP العام، وفتح 8729 في Firewall، وAddress داخل IP → Services."
+        s.contains("ECONNREFUSED", true) -> "تم الوصول إلى العنوان لكن الراوتر رفض المنفذ؛ فعّل API أو API‑SSL وتحقق من المنفذ 8728/8729. إذا كانت الخدمة مفعلة فعلاً: الواي فاي بلا إنترنت فيمرّر أندرويد الاتصال عبر بيانات الجوال؛ أوقف بيانات الجوال مؤقتاً وأعد المحاولة. هذه ليست مشكلة كلمة مرور."
+        s.contains("404", true) -> "الخادم يعمل بنسخة قديمة؛ أعد نشر Backend ثم جرّب مرة أخرى."
+        s.contains("AUTH", true) -> { val rm = Regex("\"routerMessage\"\\s*:\\s*\"([^\"]*)\"").find(s)?.groupValues?.get(1); "تم الوصول إلى MikroTik لكن الراوتر رفض تسجيل الدخول" + (if (rm.isNullOrBlank()) "" else " (${rm})") + ". أسماء المستخدمين حساسة لحالة الأحرف؛ جرّب admin بحروف صغيرة إذا كان الحساب الافتراضي. تأكد من كلمة المرور، وأن المستخدم لديه سياسة api، وأن API مفعّل على 8728 أو API-SSL على 8729.\n\nتفاصيل الراوتر: " + s.take(300) }
+        s.contains("certificate", true) || s.contains("TLS", true) -> "خطأ شهادة TLS؛ استخدم API 8728 للاختبار المحلي أو ثبّت شهادة API‑SSL صحيحة."
+        else -> s
+    }
 }
 
 @Composable fun EmptyCard(s:String){Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant,RoundedCornerShape(18.dp)).padding(20.dp),contentAlignment=Alignment.Center){Text(s,style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}}
