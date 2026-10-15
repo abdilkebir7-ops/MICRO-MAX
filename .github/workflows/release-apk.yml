@@ -1,0 +1,65 @@
+name: MICRO-MAX Release APK
+# Push a tag like v3.2.0 (or run manually) → builds the APK, attaches it to a GitHub Release,
+# and (optionally) registers it on the website so it appears on /download.html and update-check.
+# Optional secrets: MICROMAX_API_BASE_URL, MICROMAX_ADMIN_EMAIL, MICROMAX_ADMIN_PASSWORD
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 3.2.0)'
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      API: ${{ secrets.MICROMAX_API_BASE_URL || 'https://micro-max-api.onrender.com' }}
+      HAS_ADMIN: ${{ secrets.MICROMAX_ADMIN_EMAIL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17', cache: gradle }
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+      - name: Resolve version
+        id: v
+        run: |
+          V="${{ github.event.inputs.version }}"; [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Build APK (debug-signed, installable)
+        env:
+          MICROMAX_API_BASE_URL: ${{ env.API }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+          cp app/build/outputs/apk/debug/*.apk "micromax-${{ steps.v.outputs.version }}.apk"
+          sha256sum "micromax-${{ steps.v.outputs.version }}.apk" | tee sha256.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.v.outputs.version }}
+          files: |
+            micromax-${{ steps.v.outputs.version }}.apk
+            sha256.txt
+          generate_release_notes: true
+      - name: Register on the website (optional)
+        if: env.HAS_ADMIN == 'true'
+        env:
+          EMAIL: ${{ secrets.MICROMAX_ADMIN_EMAIL }}
+          PASS: ${{ secrets.MICROMAX_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.version }}"; F="micromax-$V.apk"
+          TOKEN=$(curl -fsS -X POST "$API/api/auth/login" -H 'content-type: application/json' \
+            -d "$(jq -n --arg e "$EMAIL" --arg p "$PASS" '{email:$e,password:$p}')" | jq -r .token)
+          SIZE=$(du -m "$F" | cut -f1); SHA=$(sha256sum "$F" | cut -d' ' -f1)
+          URL="https://github.com/${{ github.repository }}/releases/download/v$V/$F"
+          curl -fsS -X POST "$API/api/admin/releases" -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+            -d "$(jq -n --arg v "$V" --arg u "$URL" --arg s "$SHA" --argjson z "$SIZE" '{version:$v,apkUrl:$u,sha256:$s,sizeMb:$z,notes:"إصدار جديد"}')"

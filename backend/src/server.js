@@ -9,6 +9,9 @@ import crypto from "crypto";
 import net from "net";
 import tls from "tls";
 import dns from "dns";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 import rateLimit from "express-rate-limit";
 import { OAuth2Client } from "google-auth-library";
 import PDFDocument from "pdfkit";
@@ -20,10 +23,12 @@ import { mapRouterProfile } from "./profiles.js";
 import { auditSecurity } from "./security.js";
 import { fleetSummary, configDoctor } from "./fleet.js";
 import { buildInsights } from "./insights.js";
+import { diagnose } from "./troubleshoot.js";
+import { buildSetupPlan, applyPlan } from "./wizard.js";
 import { assertRouterTarget, guardedLookup, netConfigFromEnv, safeGet, isAddressAllowed } from "./netguard.js";
 import { agentSource, AGENT_POLICY, newAgentToken, hashToken, renderJobScript, parseReport, buildEnrollScript, buildDirectSetupScript, generateCredentials, rosSafe } from "./agent.js";
 import { binancePayConfigured, createBinancePayOrder, queryBinancePayOrder, verifyBinancePayNotification } from "./binancePay.js";
-
+import { registerSiteRoutes, SITE_SCHEMA } from "./site.js";
 dotenv.config();
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -128,7 +133,8 @@ ALTER TABLE cards ADD COLUMN IF NOT EXISTS batch_id UUID;
  INSERT INTO store_items(id,name,description,category,price,active)
  SELECT gen_random_uuid(),'QR / Barcode Pack','أدوات إنشاء QR وBarcode للكروت بدون اشتراك','tools',0,true
  WHERE NOT EXISTS (SELECT 1 FROM store_items WHERE name='QR / Barcode Pack');
- CREATE TABLE IF NOT EXISTS store_entitlements(id UUID PRIMARY KEY,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,item_id UUID NOT NULL REFERENCES store_items(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(user_id,item_id));`);
+ CREATE TABLE IF NOT EXISTS store_entitlements(id UUID PRIMARY KEY,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,item_id UUID NOT NULL REFERENCES store_items(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(user_id,item_id));
+ ${SITE_SCHEMA}`);
 }
 
 app.get("/health",(_,res)=>res.json({ok:true,service:"MICRO-MAX API",version:"2.0.0"}));
@@ -219,7 +225,36 @@ app.delete("/api/routers/:id",auth,role("admin","owner"),async(req,res)=>{await 
 async function getRouter(req,id){const r=await pool.query("SELECT * FROM routers WHERE id=$1 AND user_id=$2",[id,req.user.sub]);if(!r.rowCount)throw Error("ROUTER_NOT_FOUND");return r.rows[0];}
 async function withRos(req,id,fn){const router=await getRouter(req,id);const ros=rosFor(router);try{return await fn(ros,router);}finally{await ros.close().catch(()=>{});}}
 app.get("/api/routers/:id/hotspot/users",auth,async(req,res)=>{try{const items=await withRos(req,req.params.id,async ros=>await ros.command("/ip/hotspot/user/print",[]));res.json(items);}catch(e){res.status(502).json({error:"HOTSPOT_USERS_QUERY_FAILED",detail:e.message});}});
+app.get("/api/routers/:id/hotspot/live",auth,async(req,res)=>{let ros;try{const r=await getRouter(req,req.params.id);if(r.mode==="agent")return res.status(409).json({error:"AGENT_LIVE_USERS_NOT_REPORTED",detail:"يحتاج Agent إلى إصدار يرسل تفاصيل الجلسات، استخدم الاتصال المباشر لعرض الاستهلاك اللحظي."});ros=rosFor(r);await ros.connect();const [users,active]=await Promise.all([ros.command("/ip/hotspot/user/print",[]),ros.command("/ip/hotspot/active/print",[])]);const byName=new Map(active.map(x=>[String(x.user||x.name||""),x]));const merged=users.map(u=>{const a=byName.get(String(u.name||""));return {...u,online:!!a,active:a||null};});const sum=(key)=>active.reduce((n,x)=>n+(Number(String(x[key]||"0").replace(/[^0-9.]/g,""))||0),0);res.json({live:true,updatedAt:new Date().toISOString(),users:merged,active,stats:{totalUsers:users.length,activeUsers:active.length,downloadBytes:sum("bytes-out"),uploadBytes:sum("bytes-in"),sessions:active.length}});}catch(e){res.status(502).json({error:"HOTSPOT_LIVE_QUERY_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
+app.post("/api/routers/:id/hotspot/users/disconnect",auth,async(req,res)=>{let ros;try{const username=String(req.body?.username||"").trim();if(!username||username.length>64||/[\r\n]/.test(username))return res.status(400).json({error:"INVALID_HOTSPOT_USERNAME"});const r=await getRouter(req,req.params.id);if(r.mode==="agent")return res.status(409).json({error:"AGENT_DISCONNECT_NOT_READY"});ros=rosFor(r);await ros.connect();const active=await ros.command("/ip/hotspot/active/print",[`?user=${username}`]);let disconnected=0;for(const row of active){if(row[".id"]){await ros.command("/ip/hotspot/active/remove",[`=.id=${row[".id"]}`]);disconnected++;}}await audit(req.user.sub,"DISCONNECT","hotspot_user",req.params.id,{username,disconnected});res.json({ok:true,username,disconnected});}catch(e){res.status(502).json({error:"HOTSPOT_DISCONNECT_FAILED",detail:e.message});}finally{try{await ros?.close();}catch{}}});
 app.get("/api/routers/:id/network/:kind",auth,async(req,res)=>{const commands={interfaces:"/interface/print","dhcp-leases":"/ip/dhcp-server/lease/print",arp:"/ip/arp/print","dns-static":"/ip/dns/static/print","ip-addresses":"/ip/address/print",routes:"/ip/route/print",firewall:"/ip/firewall/filter/print",queues:"/queue/simple/print",logs:"/log/print"};const cmd=commands[req.params.kind];if(!cmd)return res.status(404).json({error:"NETWORK_KIND_NOT_FOUND"});try{const items=await withRos(req,req.params.id,async ros=>await ros.command(cmd,[]));res.json({kind:req.params.kind,items});}catch(e){res.status(502).json({error:"NETWORK_QUERY_FAILED",detail:e.message});}});
+app.get("/api/routers/:id/network-map",auth,async(req,res)=>{
+  try{
+    const router=await getRouter(req,req.params.id);
+    if(router.mode==="agent") return res.status(409).json({error:"NETWORK_MAP_AGENT_UNAVAILABLE",detail:"خريطة الشبكة تحتاج تقرير Agent موسعاً أو اتصالاً مباشراً بالراوتر."});
+    const data=await withRos(req,req.params.id,async ros=>{
+      const safe=async(path,args=[])=>{try{return await ros.command(path,args);}catch{return [];}};
+      const [neighbors,interfaces,arp,leases,registration,wifiRegistration,resource]=await Promise.all([
+        safe("/ip/neighbor/print"),safe("/interface/print"),safe("/ip/arp/print"),safe("/ip/dhcp-server/lease/print"),
+        safe("/interface/wireless/registration-table/print"),safe("/interface/wifi/registration-table/print"),safe("/system/resource/print")
+      ]);
+      const wirelessInterfaces=interfaces.filter(x=>/wlan|wifi|wireless/i.test(String(x.type||x.name||"")));
+      const regs=[...registration,...wifiRegistration];
+      const apPattern=/ruijie|access.?point|wireless|wifi|wlan|ubiquiti|unifi|cisco|mikrotik/i;
+      const apRows=neighbors.filter(x=>String(x.identity||x.platform||x.board||x["device-type"]||"").match(apPattern));
+      const seen=new Set();
+      const nodes=[{id:"router",type:"router",label:String(router.name||"MICROMAX Router"),subtitle:String(router.host||""),online:true}];
+      const add=(n)=>{if(!seen.has(n.id)){seen.add(n.id);nodes.push(n);}};
+      apRows.forEach((x,i)=>add({id:`ap-${i}-${String(x["mac-address"]||x.identity||i)}`,type:"access_point",label:String(x.identity||x.platform||"Access Point"),subtitle:String(x.address||x["mac-address"]||x.interface||""),online:true,interface:String(x.interface||"")}));
+      wirelessInterfaces.forEach((x,i)=>add({id:`radio-${i}-${String(x.name||i)}`,type:"access_point",label:String(x.name||"Wireless AP"),subtitle:String(x.ssid||x.mode||"راديو MikroTik"),online:String(x.running)!=="false",interface:String(x.name||"")}));
+      regs.forEach((x,i)=>add({id:`client-${i}-${String(x["mac-address"]||i)}`,type:"client",label:String(x["mac-address"]||x.user||"عميل لاسلكي"),subtitle:`${String(x.interface||"")} • ${String(x["signal-strength"]||x["rx-rate"]||"")}`,online:true,interface:String(x.interface||"")}));
+      const onlineAps=nodes.filter(x=>x.type==="access_point"&&x.online).length;
+      const clients=nodes.filter(x=>x.type==="client").length;
+      return {updatedAt:new Date().toISOString(),source:"routeros",router:{id:"router",name:router.name,host:router.host,resource:resource[0]||{}},nodes,edges:nodes.filter(x=>x.id!=="router").map(x=>({from:"router",to:x.id})),stats:{connectedDevices:clients,accessPoints:onlineAps,offlineDevices:0,neighbors:apRows.length,wirelessClients:regs.length},raw:{interfaces:interfaces.length,arp:arp.length,leases:leases.length}};
+    });
+    res.json(data);
+  }catch(e){res.status(502).json({error:"NETWORK_MAP_QUERY_FAILED",detail:String(e.code||e.message||"UNKNOWN").slice(0,240)});}
+});
 app.post("/api/routers/:id/terminal",auth,role("admin","owner"),async(req,res)=>{
   const command=String(req.body.command||"").trim();
   if(!command||command.length>1000)return res.status(400).json({error:"INVALID_COMMAND"});
@@ -1144,6 +1179,95 @@ app.get("/api/routers/:id/security-audit",auth,async(req,res)=>{
   }finally{ if(ros)await ros.close().catch(()=>{}); }
 });
 
+
+// ================= Troubleshooter (20 checks, safe auto-fix + backup + rollback) and new-network wizard =================
+const FIX_ALLOW=[
+  [/^\/ip\/dns\/set$/,/^=(servers|allow-remote-requests)=[0-9a-z.,\-]*$/],
+  [/^\/ip\/(hotspot|dhcp-server)\/(enable|disable)$/,/^=numbers=\*[0-9A-Fa-f]+$/],
+  [/^\/ip\/service\/(enable|disable)$/,/^=numbers=\*[0-9A-Fa-f]+$/],
+  [/^\/system\/ntp\/client\/set$/,/^=(enabled|servers)=[0-9a-z.,\-]+$/]
+];
+const fixAllowed=(path,args)=>FIX_ALLOW.some(([p,a])=>p.test(path)&&Array.isArray(args)&&args.every(x=>typeof x==="string"&&a.test(x)));
+async function collectTroubleshootData(ros){
+  const safe=async path=>{try{return await ros.command(path,[]);}catch{return null;}};
+  const one=async path=>(await safe(path))?.[0]||null;
+  return {
+    resource:await one("/system/resource/print"),routes:await safe("/ip/route/print"),dns:await one("/ip/dns/print"),
+    nat:await safe("/ip/firewall/nat/print"),hotspotServers:await safe("/ip/hotspot/print"),dhcpServers:await safe("/ip/dhcp-server/print"),
+    pools:await safe("/ip/pool/print"),leases:await safe("/ip/dhcp-server/lease/print"),interfaces:await safe("/interface/print"),
+    services:await safe("/ip/service/print"),clock:await one("/system/clock/print"),files:await safe("/file/print"),
+    queues:await safe("/queue/simple/print"),ipAddresses:await safe("/ip/address/print")
+  };
+}
+const routerErr=(res,e,code)=>{const c=e.message==="ROUTER_NOT_FOUND"?404:e.message==="ROUTER_IS_AGENT_MODE"?400:502;res.status(c).json({error:c===502?code:e.message,detail:String(e?.code||e?.message||"").slice(0,200)});};
+app.get("/api/routers/:id/troubleshoot",auth,async(req,res)=>{
+  let ros;
+  try{
+    const r=await getRouter(req,req.params.id);ros=rosFor(r);await ros.connect();
+    const out=diagnose(await collectTroubleshootData(ros));
+    await audit(req.user.sub,"TROUBLESHOOT_SCAN","router",r.id,{issues:out.issues.length});
+    res.json({routerId:r.id,name:r.name,readOnly:true,...out,issues:out.issues.map(i=>({...i,fix:i.fix?{auto:true,steps:i.fix.commands.length}:null}))});
+  }catch(e){routerErr(res,e,"TROUBLESHOOT_FAILED");}
+  finally{if(ros)await ros.close().catch(()=>{});}
+});
+app.post("/api/routers/:id/troubleshoot/fix",auth,role("admin","owner"),async(req,res)=>{
+  let ros;
+  try{
+    if(req.body?.confirmImpact!=="APPLY SAFE FIXES")return res.status(400).json({error:"CONFIRM_IMPACT_REQUIRED",required:"APPLY SAFE FIXES"});
+    const ids=Array.isArray(req.body?.ids)?req.body.ids.map(String).slice(0,20):[];
+    if(!ids.length)return res.status(400).json({error:"NO_FIX_IDS"});
+    const r=await getRouter(req,req.params.id);ros=rosFor(r);await ros.connect();
+    const found=diagnose(await collectTroubleshootData(ros)).issues.filter(i=>ids.includes(i.id)&&i.fix);
+    if(!found.length)return res.status(409).json({error:"NOTHING_TO_FIX"});
+    const backup=`micromax-fix-${Date.now()}`;
+    await ros.command("/system/backup/save",[`=name=${backup}`]);
+    const applied=[],undo=[];let failed=null;
+    for(const i of found){
+      try{
+        for(const [path,args] of i.fix.commands){ if(!fixAllowed(path,args))throw Error("FIX_NOT_ALLOWED"); await ros.command(path,args); }
+        applied.push(i.id);undo.push(...i.fix.undo);
+      }catch(e){failed={id:i.id,error:String(e?.message||e).slice(0,160)};break;}
+    }
+    const logId=crypto.randomUUID();
+    await pool.query("INSERT INTO audit_logs(id,user_id,action,entity,entity_id,details) VALUES($1,$2,'TROUBLESHOOT_FIX','router',$3,$4)",[logId,req.user.sub,r.id,JSON.stringify({applied,undo,backup,failed})]);
+    res.status(failed?207:200).json({backup:`${backup}.backup`,applied,failed,auditId:logId,canRollback:undo.length>0});
+  }catch(e){routerErr(res,e,"FIX_FAILED");}
+  finally{if(ros)await ros.close().catch(()=>{});}
+});
+app.post("/api/routers/:id/troubleshoot/rollback",auth,role("admin","owner"),async(req,res)=>{
+  let ros;
+  try{
+    const r=await getRouter(req,req.params.id);
+    const q=await pool.query("SELECT details FROM audit_logs WHERE id=$1 AND user_id=$2 AND action='TROUBLESHOOT_FIX' AND entity_id=$3",[String(req.body?.auditId||""),req.user.sub,r.id]);
+    if(!q.rowCount)return res.status(404).json({error:"FIX_RECORD_NOT_FOUND"});
+    const undo=Array.isArray(q.rows[0].details?.undo)?q.rows[0].details.undo:[];
+    if(!undo.every(([p,a])=>fixAllowed(p,a)))return res.status(400).json({error:"UNDO_NOT_ALLOWED"});
+    ros=rosFor(r);await ros.connect();
+    for(const [path,args] of [...undo].reverse())await ros.command(path,args);
+    await audit(req.user.sub,"TROUBLESHOOT_ROLLBACK","router",r.id,{auditId:req.body.auditId,steps:undo.length});
+    res.json({rolledBack:undo.length});
+  }catch(e){routerErr(res,e,"ROLLBACK_FAILED");}
+  finally{if(ros)await ros.close().catch(()=>{});}
+});
+app.post("/api/routers/:id/wizard/plan",auth,async(req,res)=>{
+  const plan=buildSetupPlan(req.body||{});
+  if(!plan.ok)return res.status(400).json({error:"WIZARD_INVALID",errors:plan.errors});
+  res.json({dryRun:true,values:plan.values,steps:plan.steps.map(s=>({title:s.title,command:s.path,args:s.args}))});
+});
+app.post("/api/routers/:id/wizard/apply",auth,role("admin","owner"),async(req,res)=>{
+  let ros;
+  try{
+    if(req.body?.confirm!==true||req.body?.confirmText!=="APPLY MICROMAX WIZARD")return res.status(400).json({error:"CONFIRM_REQUIRED",required:"APPLY MICROMAX WIZARD"});
+    const plan=buildSetupPlan(req.body);
+    if(!plan.ok)return res.status(400).json({error:"WIZARD_INVALID",errors:plan.errors});
+    const r=await getRouter(req,req.params.id);ros=rosFor(r);await ros.connect();
+    const report=await applyPlan(ros,plan,{onBackup:async()=>{const n=`micromax-wizard-${Date.now()}`;await ros.command("/system/backup/save",[`=name=${n}`]);return `${n}.backup`;}});
+    await audit(req.user.sub,"WIZARD_APPLY","router",r.id,{values:plan.values,done:report.done,failed:report.failed,rolledBack:report.rolledBack});
+    res.status(report.failed?409:200).json({ok:!report.failed,...report});
+  }catch(e){routerErr(res,e,"WIZARD_FAILED");}
+  finally{if(ros)await ros.close().catch(()=>{});}
+});
+
 app.get("/api/fleet",auth,async(req,res)=>{
   try{
     const q=await pool.query("SELECT id,name,host,port,tls,mode,agent_last_seen,agent_info FROM routers WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200",[req.user.sub]);
@@ -1174,4 +1298,11 @@ function startMonitor(){
   setInterval(tick,60000).unref();
 }
 
+// v12 selective merge: public template store, release/update APIs, announcements, and safe WinBox menus.
+let SITE_STATUS_HTML="";
+try{ SITE_STATUS_HTML=fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),"..","public","tpl","status.html"),"utf8"); }catch{}
+registerSiteRoutes(app,{pool,auth,role,audit,withRos,validateLoginHtml,statusHtml:SITE_STATUS_HTML});
+const PUBLIC_DIR=path.join(path.dirname(fileURLToPath(import.meta.url)),"..","public");
+app.use(express.static(PUBLIC_DIR,{extensions:["html"],maxAge:process.env.NODE_ENV==="production"?"1h":0,setHeaders:(res,fp)=>{if(fp.endsWith(".html"))res.setHeader("Cache-Control","no-cache");}}));
+app.use((req,res,next)=>{ if(req.method!=="GET"||req.path.startsWith("/api/")||req.path==="/health") return next(); res.status(404).sendFile(path.join(PUBLIC_DIR,"404.html"),e=>{ if(e) res.status(404).type("text").send("Not found"); }); });
 const port=Number(process.env.PORT||8080);init().then(()=>{app.listen(port,()=>console.log(`MICRO-MAX API on :${port}`));startMonitor();}).catch(e=>{console.error(e);process.exit(1)});

@@ -32,3 +32,15 @@ test("certificate pinning: wrong pin rejected, right pin accepted", { skip: !c &
   await assert.rejects(unpinned.connect(), e => /self[- ]signed|SELF_SIGNED|UNABLE_TO/i.test(String(e.code || e.message)));
   server.close();
 });
+
+test("concurrent commands on one connection are serialised (no interleaved replies)", async () => {
+  const { startMockRouter } = await import("./helpers/mockros.mjs");
+  const m = await startMockRouter({ tables: { "/a": [{".id":"*1",x:"a1"},{".id":"*2",x:"a2"}], "/b": [{".id":"*3",y:"b1"}], "/c": [] } });
+  const r = new RouterOS({ host:"127.0.0.1", port:m.port, username:"admin", password:"pw" });
+  try {
+    const [a,b,c] = await Promise.all([r.command("/a/print"), r.command("/b/print"), r.command("/c/print")]);
+    assert.deepEqual(a.map(x=>x.x),["a1","a2"]);
+    assert.deepEqual(b.map(x=>x.y),["b1"]);
+    assert.deepEqual(c,[]);
+  } finally { await r.close(); m.close(); }
+});

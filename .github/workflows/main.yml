@@ -6,6 +6,9 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: micromax-release-${{ github.ref }}
+  cancel-in-progress: true
 env:
   MICROMAX_API_BASE_URL: ${{ secrets.MICROMAX_API_BASE_URL }}
   MICROMAX_GOOGLE_WEB_CLIENT_ID: ${{ secrets.MICROMAX_GOOGLE_WEB_CLIENT_ID }}
@@ -17,6 +20,11 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+      - name: Verify HotSpot login templates are up to date
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 hotspot-templates/tools/gen.py --check
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:

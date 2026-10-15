@@ -145,7 +145,7 @@ private fun GenerateDialog(api: Api, routerId: String, profile: JSONObject, canc
                         if (l == sheet) Button({ sheet = l }, Modifier.fillMaxWidth()) { Text(l.label) }
                         else OutlinedButton({ sheet = l }, Modifier.fillMaxWidth()) { Text(l.label) }
                     }
-                    Button({ made?.let { printCardSheet(ctx, it, sheet, "MICRO-MAX ${profile.optString("name")}") } }, Modifier.fillMaxWidth()) {
+                    Button({ made?.let { printCardSheet(ctx, it, sheet, "MICROMAX ${profile.optString("name")}") } }, Modifier.fillMaxWidth()) {
                         Icon(MmIcons.Print, null); Spacer(Modifier.width(8.dp)); Text("طباعة الكروت الآن")
                     }
                     Text("اختر طابعتك أو «حفظ كـ PDF». كل كرت يحمل QR دخول تلقائي.", fontSize = 11.sp, color = TextMuted)

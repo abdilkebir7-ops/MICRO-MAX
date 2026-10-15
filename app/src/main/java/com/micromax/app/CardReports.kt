@@ -1,7 +1,5 @@
 package com.micromax.app
 
-import androidx.compose.material3.MaterialTheme
-
 import android.content.ContentValues
 import android.content.Context
 import android.provider.MediaStore
@@ -29,6 +27,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -219,6 +218,7 @@ private fun BatchReportItem(batch: JSONObject, api: Api) {
     var sheet by remember { mutableStateOf(SheetLayout.NORMAL) }
     var busy by remember { mutableStateOf(false) }
     var msg by remember { mutableStateOf<String?>(null) }
+    var advancedCards by remember { mutableStateOf<JSONArray?>(null) }
     val available = batch.optInt("available")
     GlassCard {
         Text(batch.optString("plan_name", "دفعة كروت"), fontWeight = FontWeight.Bold)
@@ -233,14 +233,26 @@ private fun BatchReportItem(batch: JSONObject, api: Api) {
                     try {
                         val r = JSONObject(api.get("/api/card-batches/${batch.optString("batch_id")}/print-cards"))
                         val cards = r.optJSONArray("cards")
-                        if (cards == null || cards.length() == 0) msg = "لا توجد كروت متاحة للطباعة" else printCardSheet(ctx, cards, sheet, "MICRO-MAX ${batch.optString("plan_name")}")
+                        if (cards == null || cards.length() == 0) msg = "لا توجد كروت متاحة للطباعة" else printCardSheet(ctx, cards, sheet, "MICROMAX ${batch.optString("plan_name")}")
                     } catch (e: Exception) { msg = e.message ?: "تعذر التحضير للطباعة" }
                     busy = false
                 }
             }, enabled = !busy) { Text("طباعة المتاح ($available)", fontSize = 12.sp) }
+            OutlinedButton({
+                scope.launch {
+                    busy = true; msg = null
+                    try {
+                        val r = JSONObject(api.get("/api/card-batches/${batch.optString("batch_id")}/print-cards"))
+                        val cards = r.optJSONArray("cards")
+                        if (cards == null || cards.length() == 0) msg = "لا توجد كروت متاحة للطباعة" else advancedCards = cards
+                    } catch (e: Exception) { msg = e.message ?: "تعذر تجهيز الدفعة" }
+                    busy = false
+                }
+            }, enabled = !busy) { Text("تخصيص المقاس والطباعة", fontSize = 11.sp) }
         }
         msg?.let { Text(it, color = TextMuted, fontSize = 11.sp) }
     }
+    advancedCards?.let { HotspotAdvancedPrintDialog(it) { advancedCards = null } }
 }
 
 @Composable

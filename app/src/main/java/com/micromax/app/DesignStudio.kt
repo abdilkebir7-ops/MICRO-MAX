@@ -103,7 +103,7 @@ private fun CardDesignStudio(api: Api, router: JSONObject?, initialTemplate: Str
             AppField(price, { price = it }, "السعر الظاهر على الكرت", MmIcons.Money)
             if (advanced) { AppField(primary, { primary = it }, "اللون الرئيسي HEX", MmIcons.Palette); Text("خيارات الهوية والطباعة", fontWeight = FontWeight.Bold, color = StudioOrange); Row(verticalAlignment = Alignment.CenterVertically) { Switch(showBrand, { showBrand = it }); Text("إظهار اسم النظام على الكرت", Modifier.weight(1f)) }; Text("مغلق افتراضيًا حتى يكون الكرت محايدًا وقابلًا لإعادة البيع.", fontSize = 10.sp, color = StudioMuted); Row(verticalAlignment = Alignment.CenterVertically) { Switch(monochrome, { monochrome = it }); Text("وضع أبيض وأسود للطباعة", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showPrice, { showPrice = it }); Text("إظهار السعر", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showQr, { showQr = it }); Text("إظهار QR Code", Modifier.weight(1f)) }; Row(verticalAlignment = Alignment.CenterVertically) { Switch(showBarcode, { showBarcode = it }); Text("إظهار Barcode", Modifier.weight(1f)) } }
             message?.let { Text(it, color = if (it.startsWith("تم")) StudioMint else StudioRed, fontSize = 12.sp) }
-            Button(onClick = { if (routerId == null) { message = "اختر راوتر أولاً لحفظ هوية HotSpot"; return@Button }; scope.launch { saving = true; try { api.post("/api/themes/$routerId", JSONObject().put("name", template).put("primaryColor", primary).put("background", "#FFFFFF").put("logoUrl", if (showBrand) "MICRO-MAX" else "").put("title", title).put("subtitle", subtitle).put("price", price).put("showPrice", showPrice).put("showQr", showQr).put("showBarcode", showBarcode).put("showBrand", showBrand).toString()); message = "تم حفظ تصميم $template للراوتر" } catch (e: Exception) { message = e.message } finally { saving = false } } }, enabled = !saving, modifier = Modifier.fillMaxWidth()) { Icon(MmIcons.Check, null); Spacer(Modifier.width(7.dp)); Text(if (saving) "جاري الحفظ…" else "حفظ الهوية والتصميم") }
+            Button(onClick = { if (routerId == null) { message = "اختر راوتر أولاً لحفظ هوية HotSpot"; return@Button }; scope.launch { saving = true; try { api.post("/api/themes/$routerId", JSONObject().put("name", template).put("primaryColor", primary).put("background", "#FFFFFF").put("logoUrl", if (showBrand) "MICROMAX" else "").put("title", title).put("subtitle", subtitle).put("price", price).put("showPrice", showPrice).put("showQr", showQr).put("showBarcode", showBarcode).put("showBrand", showBrand).toString()); message = "تم حفظ تصميم $template للراوتر" } catch (e: Exception) { message = e.message } finally { saving = false } } }, enabled = !saving, modifier = Modifier.fillMaxWidth()) { Icon(MmIcons.Check, null); Spacer(Modifier.width(7.dp)); Text(if (saving) "جاري الحفظ…" else "حفظ الهوية والتصميم") }
         }
     }
 }
@@ -117,7 +117,7 @@ private fun DesignedCardPreview(template: String, title: String, subtitle: Strin
     Card(colors = CardDefaults.cardColors(containerColor = bg), shape = RoundedCornerShape(24.dp), modifier = Modifier.fillMaxWidth()) {
         Box(Modifier.fillMaxWidth().height(260.dp).background(bg, RoundedCornerShape(24.dp)).padding(18.dp)) {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) { if (showBrand) Text("MICRO-MAX", color = fg, fontWeight = FontWeight.Black, fontSize = 14.sp); Spacer(Modifier.weight(1f)); if (showPrice) Text(price, color = color, fontWeight = FontWeight.Black, fontSize = 13.sp) }
+                Row(verticalAlignment = Alignment.CenterVertically) { if (showBrand) Text("MICROMAX", color = fg, fontWeight = FontWeight.Black, fontSize = 14.sp); Spacer(Modifier.weight(1f)); if (showPrice) Text(price, color = color, fontWeight = FontWeight.Black, fontSize = 13.sp) }
                 HorizontalDivider(color = color.copy(alpha = .35f))
                 Text(title, color = fg, fontSize = 23.sp, fontWeight = FontWeight.Black)
                 Text(subtitle, color = color, fontSize = 12.sp)
@@ -181,7 +181,7 @@ private fun HotspotPageStudio(api: Api, router: JSONObject?) {
 private fun HotspotPreview(page: String, content: String) {
     Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("MICRO-MAX", color = Color(0xFF0B5FA5), fontWeight = FontWeight.Black, fontSize = 22.sp)
+            Text("MICROMAX", color = Color(0xFF0B5FA5), fontWeight = FontWeight.Black, fontSize = 22.sp)
             Text(if (page == "login") "اتصل بالإنترنت" else "حالة الاتصال", color = Color(0xFF1F2937), fontWeight = FontWeight.Bold)
             if (page == "login") { Text("أدخل بيانات الكرت", color = Color.Gray, fontSize = 12.sp); OutlinedButton(onClick = {}) { Text("تسجيل الدخول") } }
             else { Text("KMX-482091 • متصل", color = Color(0xFF14804A)); Text("الوقت المتبقي: 58 دقيقة", color = Color.Gray, fontSize = 12.sp) }
@@ -194,66 +194,103 @@ private fun HotspotPreview(page: String, content: String) {
 private fun PrinterStudio(activity: MainActivity) {
     val prefs = remember { activity.getSharedPreferences("micromax_printer", android.content.Context.MODE_PRIVATE) }
     var paper by remember { mutableStateOf(prefs.getString("paper", "A4") ?: "A4") }
+    var paperWidth by remember { mutableStateOf(prefs.getInt("paperWidth", 210).toString()) }
+    var paperHeight by remember { mutableStateOf(prefs.getInt("paperHeight", 297).toString()) }
+    var cardWidth by remember { mutableStateOf(prefs.getInt("cardWidth", 90).toString()) }
+    var cardHeight by remember { mutableStateOf(prefs.getInt("cardHeight", 55).toString()) }
     var columns by remember { mutableStateOf(prefs.getInt("columns", 2).toString()) }
     var rows by remember { mutableStateOf(prefs.getInt("rows", 4).toString()) }
+    var marginX by remember { mutableStateOf(prefs.getInt("marginX", 10).toString()) }
+    var marginY by remember { mutableStateOf(prefs.getInt("marginY", 10).toString()) }
+    var gapX by remember { mutableStateOf(prefs.getInt("gapX", 4).toString()) }
+    var gapY by remember { mutableStateOf(prefs.getInt("gapY", 4).toString()) }
     var copies by remember { mutableStateOf(prefs.getInt("copies", 1).toString()) }
+    var fontSize by remember { mutableStateOf(prefs.getInt("fontSize", 9).toString()) }
+    var lineSpacing by remember { mutableStateOf(prefs.getInt("lineSpacing", 3).toString()) }
+    var autoLayout by remember { mutableStateOf(prefs.getBoolean("autoLayout", true)) }
+    var cutMarks by remember { mutableStateOf(prefs.getBoolean("cutMarks", true)) }
     var saved by remember { mutableStateOf(false) }
+    val pw = (paperWidth.toIntOrNull() ?: 210).coerceAtLeast(20)
+    val ph = (paperHeight.toIntOrNull() ?: 297).coerceAtLeast(20)
+    val cw = (cardWidth.toIntOrNull() ?: 90).coerceAtLeast(10)
+    val ch = (cardHeight.toIntOrNull() ?: 55).coerceAtLeast(10)
+    val mx = (marginX.toIntOrNull() ?: 10).coerceAtLeast(0)
+    val my = (marginY.toIntOrNull() ?: 10).coerceAtLeast(0)
+    val gx = (gapX.toIntOrNull() ?: 4).coerceAtLeast(0)
+    val gy = (gapY.toIntOrNull() ?: 4).coerceAtLeast(0)
+    val autoColumns = ((pw - mx * 2 + gx) / (cw + gx)).coerceAtLeast(1)
+    val autoRows = ((ph - my * 2 + gy) / (ch + gy)).coerceAtLeast(1)
+    val actualColumns = if (autoLayout) autoColumns else (columns.toIntOrNull() ?: 2).coerceIn(1, 12)
+    val actualRows = if (autoLayout) autoRows else (rows.toIntOrNull() ?: 4).coerceIn(1, 20)
+    val capacity = actualColumns * actualRows
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         GlassCard {
-            Text("مركز الطباعة", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-            Text("تحكم في مقاس الورق وعدد الكروت في الورقة. التصميم الافتراضي أبيض وأسود ومناسب لمعظم طابعات A4 والحرارية.", color = StudioMuted, fontSize = 12.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("A4", "80mm Thermal", "Custom").forEach { FilterChip(selected = paper == it, onClick = { paper = it }, label = { Text(it) }) } }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { AppField(columns, { columns = it.filter(Char::isDigit) }, "أعمدة", Icons.Outlined.ViewColumn); AppField(rows, { rows = it.filter(Char::isDigit) }, "صفوف", Icons.Outlined.GridView) }
-            AppField(copies, { copies = it.filter(Char::isDigit) }, "عدد النسخ", MmIcons.Copy)
-            Button(onClick = { prefs.edit().putString("paper", paper).putInt("columns", columns.toIntOrNull() ?: 2).putInt("rows", rows.toIntOrNull() ?: 4).putInt("copies", copies.toIntOrNull() ?: 1).apply(); saved = true }, modifier = Modifier.fillMaxWidth()) { Text(if (saved) "تم حفظ إعدادات الطابعة" else "حفظ إعدادات الطباعة") }
+            Text("مركز الطباعة الاحترافي", fontWeight = FontWeight.Bold, fontSize = 19.sp)
+            Text("صمّم ورقة الطباعة بالملليمتر، وسيحسب MICROMAX عدد الكروت الحقيقي قبل الطباعة.", color = StudioMuted, fontSize = 12.sp)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("A4" to intArrayOf(210, 297, 90, 55), "A4 VIP" to intArrayOf(210, 297, 85, 54), "80mm Thermal" to intArrayOf(80, 200, 72, 45), "مخصص" to intArrayOf(pw, ph, cw, ch)).forEach { (label, v) -> FilterChip(selected = paper == label, onClick = { paper = label; if (label != "مخصص") { paperWidth = v[0].toString(); paperHeight = v[1].toString(); cardWidth = v[2].toString(); cardHeight = v[3].toString() } }, label = { Text(label) }) } }
+            Text("مقاسات الورقة والكرت (mm)", fontWeight = FontWeight.Bold, color = StudioOrange, fontSize = 13.sp)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Box(Modifier.weight(1f)) { AppField(paperWidth, { paperWidth = it.filter(Char::isDigit) }, "عرض الورقة", Icons.Outlined.Straighten) }; Box(Modifier.weight(1f)) { AppField(paperHeight, { paperHeight = it.filter(Char::isDigit) }, "ارتفاع الورقة", Icons.Outlined.Straighten) } }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Box(Modifier.weight(1f)) { AppField(cardWidth, { cardWidth = it.filter(Char::isDigit) }, "عرض الكرت", Icons.Outlined.CreditCard) }; Box(Modifier.weight(1f)) { AppField(cardHeight, { cardHeight = it.filter(Char::isDigit) }, "ارتفاع الكرت", Icons.Outlined.CreditCard) } }
+            Row(verticalAlignment = Alignment.CenterVertically) { Switch(autoLayout, { autoLayout = it }); Text("حساب الأعمدة والصفوف تلقائيًا", Modifier.weight(1f)); Text("${actualColumns} × ${actualRows} = $capacity كرت", color = StudioAccent, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+            if (!autoLayout) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Box(Modifier.weight(1f)) { AppField(columns, { columns = it.filter(Char::isDigit) }, "الأعمدة", Icons.Outlined.ViewColumn) }; Box(Modifier.weight(1f)) { AppField(rows, { rows = it.filter(Char::isDigit) }, "الصفوف", Icons.Outlined.GridView) } }
+            Text("الهوامش والفواصل (mm)", fontWeight = FontWeight.Bold, color = StudioOrange, fontSize = 13.sp)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Box(Modifier.weight(1f)) { AppField(marginX, { marginX = it.filter(Char::isDigit) }, "هامش أفقي", Icons.Outlined.Margin) }; Box(Modifier.weight(1f)) { AppField(marginY, { marginY = it.filter(Char::isDigit) }, "هامش رأسي", Icons.Outlined.Margin) } }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Box(Modifier.weight(1f)) { AppField(gapX, { gapX = it.filter(Char::isDigit) }, "فاصل أفقي", Icons.Outlined.SpaceBar) }; Box(Modifier.weight(1f)) { AppField(gapY, { gapY = it.filter(Char::isDigit) }, "فاصل رأسي", Icons.Outlined.SpaceBar) } }
+            Text("الخط والإخراج", fontWeight = FontWeight.Bold, color = StudioOrange, fontSize = 13.sp)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { Box(Modifier.weight(1f)) { AppField(fontSize, { fontSize = it.filter(Char::isDigit) }, "حجم الخط", Icons.Outlined.FormatSize) }; Box(Modifier.weight(1f)) { AppField(lineSpacing, { lineSpacing = it.filter(Char::isDigit) }, "تباعد السطور", Icons.Outlined.FormatLineSpacing) } }
+            Row(verticalAlignment = Alignment.CenterVertically) { Switch(cutMarks, { cutMarks = it }); Text("علامات قص للطباعة التجارية", Modifier.weight(1f)); AppField(copies, { copies = it.filter(Char::isDigit) }, "عدد النسخ", MmIcons.Copy) }
+            Button(onClick = { prefs.edit().putString("paper", paper).putInt("paperWidth", pw).putInt("paperHeight", ph).putInt("cardWidth", cw).putInt("cardHeight", ch).putInt("columns", actualColumns).putInt("rows", actualRows).putInt("marginX", mx).putInt("marginY", my).putInt("gapX", gx).putInt("gapY", gy).putInt("fontSize", fontSize.toIntOrNull() ?: 9).putInt("lineSpacing", lineSpacing.toIntOrNull() ?: 3).putInt("copies", copies.toIntOrNull() ?: 1).putBoolean("autoLayout", autoLayout).putBoolean("cutMarks", cutMarks).apply(); saved = true }, modifier = Modifier.fillMaxWidth()) { Icon(MmIcons.Check, null); Spacer(Modifier.width(7.dp)); Text(if (saved) "تم حفظ مخطط الطباعة" else "حفظ مخطط الطباعة") }
         }
         GlassCard {
-            Text("معاينة ورقة الطباعة", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-            PrintSheetPreview(columns.toIntOrNull() ?: 2, rows.toIntOrNull() ?: 4)
-            Text("MICRO-MAX يظهر مرة واحدة في أعلى كل كرت • استخدم Actual size / 100% في نافذة الطباعة.", color = StudioMuted, fontSize = 11.sp)
-            Button(onClick = { activity.printBitmap(composePrintSheet(columns.toIntOrNull() ?: 2, rows.toIntOrNull() ?: 4)) }, modifier = Modifier.fillMaxWidth()) { Icon(MmIcons.Print, null); Spacer(Modifier.width(8.dp)); Text("فتح نافذة الطباعة") }
+            Row(verticalAlignment = Alignment.CenterVertically) { Text("معاينة ورقة الطباعة", fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.weight(1f)); Text("$capacity كرت / ورقة", color = StudioMint, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+            PrintSheetPreview(actualColumns, actualRows, gx, gy, cutMarks, fontSize.toIntOrNull() ?: 9)
+            Text("${pw}×${ph} mm • الكرت ${cw}×${ch} mm • الهوامش ${mx}/${my} mm • الفواصل ${gx}/${gy} mm", color = StudioMuted, fontSize = 11.sp)
+            Text("استخدم Actual size / 100% وأوقف Fit to page للحفاظ على المقاس التجاري.", color = StudioMuted, fontSize = 11.sp)
+            Button(onClick = { activity.printBitmap(composePrintSheet(pw, ph, cw, ch, actualColumns, actualRows, mx, my, gx, gy, cutMarks, fontSize.toIntOrNull() ?: 9, lineSpacing.toIntOrNull() ?: 3)) }, modifier = Modifier.fillMaxWidth()) { Icon(MmIcons.Print, null); Spacer(Modifier.width(8.dp)); Text("طباعة ${capacity} كرت بالحجم الحقيقي") }
         }
     }
 }
 
 @Composable
-private fun PrintSheetPreview(columns: Int, rows: Int) {
+private fun PrintSheetPreview(columns: Int, rows: Int, gapX: Int, gapY: Int, cutMarks: Boolean, fontSize: Int) {
     Column(Modifier.fillMaxWidth().background(Color(0xFFEFF3F5), RoundedCornerShape(12.dp)).padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        repeat(rows.coerceIn(1, 6)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) { repeat(columns.coerceIn(1, 4)) { PrintCell(Modifier.weight(1f)) } } }
+        repeat(rows.coerceIn(1, 8)) { r -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy((gapX.coerceIn(0, 20)).dp)) { repeat(columns.coerceIn(1, 6)) { c -> PrintCell(Modifier.weight(1f), cutMarks && (r == 0 || c == 0), fontSize) } } }
     }
 }
 
 @Composable
-private fun PrintCell(modifier: Modifier) {
-    Card(modifier.height(74.dp), colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(7.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Color.Black)) {
+private fun PrintCell(modifier: Modifier, marks: Boolean, fontSize: Int) {
+    Card(modifier.height((74 + (fontSize - 9) * 2).coerceIn(62, 100).dp), colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(7.dp), border = androidx.compose.foundation.BorderStroke(if (marks) 1.5.dp else 1.dp, Color.Black)) {
         Column(Modifier.padding(7.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            Text("WiFi Access", color = Color.Black, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            Text("WiFi Access", color = Color.Black, fontSize = fontSize.sp, fontWeight = FontWeight.Bold)
             HorizontalDivider(color = Color.Black)
-            Text("اسم المستخدم  KMX-482091", color = Color.Black, fontSize = 7.sp)
-            Text("QR + Barcode", color = Color.Black, fontSize = 6.sp)
+            Text("اسم المستخدم  KMX-482091", color = Color.Black, fontSize = (fontSize - 2).coerceAtLeast(5).sp)
+            Text("QR + Barcode", color = Color.Black, fontSize = (fontSize - 3).coerceAtLeast(4).sp)
         }
     }
 }
 
-private fun composePrintSheet(columns: Int, rows: Int): Bitmap {
-    val w = 1200
-    val h = 1700
+private fun composePrintSheet(paperWmm: Int, paperHmm: Int, cardWmm: Int, cardHmm: Int, columns: Int, rows: Int, marginXmm: Int, marginYmm: Int, gapXmm: Int, gapYmm: Int, cutMarks: Boolean, fontSizeMm: Int, lineSpacingMm: Int): Bitmap {
+    val scale = 6
+    val w = (paperWmm * scale).coerceIn(480, 3000)
+    val h = (paperHmm * scale).coerceIn(480, 4200)
     val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(out)
     canvas.drawColor(android.graphics.Color.WHITE)
-    val cols = columns.coerceIn(1, 4); val rws = rows.coerceIn(1, 6)
-    val gap = 22; val cardW = (w - gap * (cols + 1)) / cols; val cardH = (h - gap * (rws + 1)) / rws
-    repeat(rws) { r -> repeat(cols) { c -> drawStudioCard(canvas, gap + c * (cardW + gap), gap + r * (cardH + gap), cardW, cardH) } }
+    val cols = columns.coerceIn(1, 12); val rws = rows.coerceIn(1, 20)
+    val cardW = (cardWmm * scale).coerceAtLeast(40); val cardH = (cardHmm * scale).coerceAtLeast(40); val gx = gapXmm * scale; val gy = gapYmm * scale; val mx = marginXmm * scale; val my = marginYmm * scale
+    repeat(rws) { r -> repeat(cols) { c -> drawStudioCard(canvas, mx + c * (cardW + gx), my + r * (cardH + gy), cardW, cardH, cutMarks, fontSizeMm * scale, lineSpacingMm * scale) } }
     return out
 }
 
-private fun drawStudioCard(canvas: Canvas, x: Int, y: Int, w: Int, h: Int) {
+private fun drawStudioCard(canvas: Canvas, x: Int, y: Int, w: Int, h: Int, cutMarks: Boolean, textSize: Int, lineSpacing: Int) {
     val p = Paint(Paint.ANTI_ALIAS_FLAG); p.style = Paint.Style.FILL; p.color = android.graphics.Color.WHITE; canvas.drawRoundRect(x.toFloat(), y.toFloat(), (x + w).toFloat(), (y + h).toFloat(), 22f, 22f, p)
     p.style = Paint.Style.STROKE; p.strokeWidth = 3f; p.color = android.graphics.Color.BLACK; canvas.drawRoundRect(x.toFloat(), y.toFloat(), (x + w).toFloat(), (y + h).toFloat(), 22f, 22f, p); p.style = Paint.Style.FILL
-    p.textSize = 22f; p.typeface = Typeface.DEFAULT_BOLD; canvas.drawText("WiFi Access", (x + 24).toFloat(), (y + 70).toFloat(), p)
+    if (cutMarks) { p.strokeWidth = 2f; val mark = 18; canvas.drawLine((x - mark).toFloat(), y.toFloat(), (x + 8).toFloat(), y.toFloat(), p); canvas.drawLine(x.toFloat(), (y - mark).toFloat(), x.toFloat(), (y + 8).toFloat(), p); canvas.drawLine((x + w - 8).toFloat(), (y + h).toFloat(), (x + w + mark).toFloat(), (y + h).toFloat(), p); canvas.drawLine((x + w).toFloat(), (y + h - 8).toFloat(), (x + w).toFloat(), (y + h + mark).toFloat(), p) }
+    p.textSize = textSize.toFloat(); p.typeface = Typeface.DEFAULT_BOLD; canvas.drawText("WiFi Access", (x + 24).toFloat(), (y + 70).toFloat(), p)
     p.strokeWidth = 2f; canvas.drawRect((x + 24).toFloat(), (y + 86).toFloat(), (x + w - 24).toFloat(), (y + 88).toFloat(), p)
-    p.textSize = 18f; canvas.drawText("اسم المستخدم  KMX-482091", (x + 24).toFloat(), (y + h - 72).toFloat(), p)
-    p.textSize = 15f; canvas.drawText("كلمة المرور  ••••••", (x + 24).toFloat(), (y + h - 44).toFloat(), p)
+    p.textSize = (textSize - lineSpacing).coerceAtLeast(12).toFloat(); canvas.drawText("اسم المستخدم  KMX-482091", (x + 24).toFloat(), (y + h - 72).toFloat(), p)
+    p.textSize = (textSize - lineSpacing - 2).coerceAtLeast(10).toFloat(); canvas.drawText("كلمة المرور  ••••••", (x + 24).toFloat(), (y + h - 44).toFloat(), p)
     generateCode("https://wifi.micromax.app/login?u=KMX-482091", com.google.zxing.BarcodeFormat.QR_CODE, 260, 260)?.let { canvas.drawBitmap(it, null, android.graphics.Rect(x + w - 150, y + h - 170, x + w - 30, y + h - 50), p) }
 }
 
@@ -270,4 +307,4 @@ private fun templatePreviewBackground(template: String): Color = when (template)
     else -> Color(0xFF0B1624)
 }
 
-private fun defaultHotspotHtml(page: String): String = if (page == "login") """<!doctype html><html><head><meta charset="utf-8"><title>MICRO-MAX Login</title></head><body><form name="login" action="$(link-login-only)" method="post"><input name="username" placeholder="Username"><input name="password" type="password" placeholder="Password"><input type="hidden" name="dst" value="$(link-orig)"><button type="submit">تسجيل الدخول</button></form><p>MICRO-MAX HotSpot</p></body></html>""" else """<!doctype html><html><head><meta charset="utf-8"><title>MICRO-MAX Status</title></head><body><h1>MICRO-MAX</h1><p>مرحباً $(username)</p><p>الوقت المتبقي: $(session-time-left)</p><a href="$(link-logout)">تسجيل الخروج</a></body></html>"""
+private fun defaultHotspotHtml(page: String): String = if (page == "login") """<!doctype html><html><head><meta charset="utf-8"><title>MICROMAX Login</title></head><body><form name="login" action="$(link-login-only)" method="post"><input name="username" placeholder="Username"><input name="password" type="password" placeholder="Password"><input type="hidden" name="dst" value="$(link-orig)"><button type="submit">تسجيل الدخول</button></form><p>MICROMAX HotSpot</p></body></html>""" else """<!doctype html><html><head><meta charset="utf-8"><title>MICROMAX Status</title></head><body><h1>MICROMAX</h1><p>مرحباً $(username)</p><p>الوقت المتبقي: $(session-time-left)</p><a href="$(link-logout)">تسجيل الخروج</a></body></html>"""
